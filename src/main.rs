@@ -18,6 +18,11 @@ mod paper;
 mod server;
 mod ui; // Dioxus UI (Phase 2: rsx App now SSR-rendered source + client fetch reactivity; server uses real dioxus render, no mirror)
 
+// Phase 3.2 smallest skeleton (wiki-first per plan/AGENTS; after all docs/decisions/log prepend).
+// mod strategy declares the new artifact (FusionEngine + processors using exact existing patterns: rust_decimal, anyhow, tracing, journal attribution hooks, heavy risk comments, paper-only).
+// No behavior change to any existing path; unused in this increment (full wiring in follow-ups). #[allow] inside strategy/mod.rs for clean clippy.
+mod strategy;
+
 use crate::config::Config;
 use crate::db::create_pool;
 use crate::ingester::{ingest_tick, ClobPublicClient, GammaClient};

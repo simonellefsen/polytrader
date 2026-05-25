@@ -42,7 +42,7 @@ Guidelines for humans and AI agents working on this codebase.
 │   │       └── hermes.yaml
 │   └── scripts/
 ├── Dockerfile*
-└── README.md, MISSION, AGENTS.md
+└── README.md, AGENTS.md
 ```
 
 ## Coding Standards

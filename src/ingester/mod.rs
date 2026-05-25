@@ -12,6 +12,10 @@ use sqlx::PgPool;
 pub use clob_public::{ClobPublicClient, OrderbookSnapshot, PriceSize};
 pub use gamma::GammaClient;
 
+#[cfg(feature = "clob-ws")]
+#[allow(unused_imports)]
+pub use clob_public::ClobWsClient;
+
 /// One ingestion tick: fetch configured bootstrap markets, upsert to DB + snapshots + mids.
 /// Conservative sleeps between calls to be polite to public endpoints.
 pub async fn ingest_tick(

@@ -6,7 +6,8 @@
 > Never use `--all-namespaces`, `kubectl ... --all`, or broad prune commands.  
 > Always prefer `make k8s-*` targets (see root `Makefile`).
 
-Actionable runbook for making the polytrader dashboard reachable at the public shared tunnel URL `https://unground-uncraftily-vivienne.ngrok-free.dev/polytrader` (and subpaths) using the established AgentEndpoint + NgrokTrafficPolicy pattern.
+Actionable runbook for making the polytrader web UI (currently the axum dashboard serving
+health, /markets, /paper/portfolio, and HTML banner at /) reachable at the public shared tunnel URL `https://unground-uncraftily-vivienne.ngrok-free.dev/polytrader` (and subpaths) using the established AgentEndpoint + NgrokTrafficPolicy pattern.
 
 See also: `deploy/k8s/base/ngrok/polytrader-agentendpoint.yaml` (the authoritative source for the exact patch stanza and discovery history) and `wiki/log.md`.
 
@@ -37,7 +38,7 @@ See also: `deploy/k8s/base/ngrok/polytrader-agentendpoint.yaml` (the authoritati
 
 3. Wait for core components (the script does most of this):
    ```bash
-   kubectl wait --for=condition=ready pod -l cnpg.io/cluster=polytrader-postgres -n polytrader --timeout=300s
+   kubectl wait --for=condition=ready pod -l cnpg.io/cluster=polytrader -n polytrader --timeout=300s
    kubectl rollout status deploy/polytrader -n polytrader --timeout=120s
    ```
 
@@ -107,6 +108,24 @@ See also: `deploy/k8s/base/ngrok/polytrader-agentendpoint.yaml` (the authoritati
   ```
 
 See `wiki/runbooks/k8s-diagnostics.md` for more debugging commands.
+
+## In-app Google OAuth Authentication Flow (dual with edge SSO)
+
+**Added 2026-05-25 (IMPL_ID 5701dfea)**. See full details + commands in the top-level append to `wiki/log.md` ("Next Phase: Auth Flow").
+
+The web UI (Dioxus SSR + Axum) now includes a minimal self-contained Google OAuth2 flow for standalone / local / alternative k8s deploys (works *in addition to* or *independent of* the ngrok edge SSO + allowlist in daytrader-oauth policy).
+
+- **Dual-mode support**: Handlers / UI prefer forwarded identity headers from the ngrok policy (common names: x-auth-request-email, x-forwarded-email, x-forwarded-user, etc. — the policy "add headers" step) when present (edge performed the Google SSO + allowlist). Falls back to in-app session cookie for pure local/dev or other deployments without edge auth.
+- **Flow**: /auth/login (302 to accounts.google.com with state nonce + client_id + redirect_uri), /auth/callback (validate state, exchange code via reqwest to oauth2.googleapis.com/token, fetch email via googleapis.com/oauth2/v2/userinfo, allowlist check or "any for paper", create short-lived in-mem session, set cookie), /auth/logout (expire cookie), /auth/whoami (JSON for client script).
+- **Cookie details** (critical for subpath): HttpOnly, SameSite=Lax (or Strict), Path= normalized SUBPATH_PREFIX or "/", Secure flag configurable (default false for paper dev http; true for prod https). No signing (in-mem uuid lookup); restart clears sessions (acceptable for paper $150).
+- **Config (clap + env, no main change needed)**: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI (MUST be the full public URL e.g. https://.../polytrader/auth/callback for subpath deploys), ALLOWED_EMAILS (comma sep or empty=any in paper mode), AUTH_COOKIE_SECURE.
+- **UI integration (smallest)**: "Login with Google" button / "Signed in as you@example.com | Logout" chip in rsx top area (relative links under <base>); existing client <script> extended to fetch /auth/whoami on load and populate placeholder (fits live fetch pattern exactly; no App props change, no SSR string post-proc for user data).
+- **Preservation**: 100% of prior (SSR rsx source + <base> injection, relative JS fetches, /health public always, JSON endpoints, k8s probes, subpath rewrite compat, paper engine/ingester/hermes/strategy untouched, no Cargo deps added, no migs, fmt/clippy clean).
+- **Security notes (AGENTS/RISK)**: state param prevents CSRF, no secrets logged or in HTML, redirect_uri from config (intent whitelist), manual parse only, dual trust model documented, paper-only (user identity for future personalization of $150 bankroll/journal, not real funds). See heavy comments in src/server.rs + config.rs + ui/app.rs.
+
+This fulfills the "next phase" request for auth flow *within the web UI* so it can stand alone while coexisting with edge protection.
+
+Update this runbook (and the AgentEndpoint comments) when the pattern evolves or a dedicated tunnel is added, or when auth moves to DB sessions table (future wiki PR + migration).
 
 ## Rollback
 - Remove the `/polytrader` rule from the traffic policy (via `kubectl edit` on daytrader-oauth in saxo-rust). The public path will stop forwarding.

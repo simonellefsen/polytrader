@@ -50,6 +50,33 @@ pub struct Config {
     /// The app will serve its UI/API under this prefix while still exposing /health at root for probes.
     #[arg(long, env = "SUBPATH_PREFIX", default_value = "")]
     pub subpath_prefix: String,
+
+    // === AUTH (Next Phase 2026-05-25, IMPL 5701dfea; dual edge+app Google OAuth for UI) ===
+    // RISK (AGENTS + security reviewer): Secrets only via env (never code, never logged).
+    // GOOGLE_REDIRECT_URI *must* be the full public URL including subpath (e.g.
+    // https://unground-...ngrok-free.dev/polytrader/auth/callback) for subpath deploys
+    // behind rewrite; mismatch = open redirect or Google reject. ALLOWED_EMAILS or empty=any
+    // (paper only; $150 personal data exposure risk even in sim for future attribution).
+    // Cookie flags (HttpOnly/SameSite/Path=prefix/Secure opt) critical to mitigate hijack/CSRF
+    // under /polytrader subpath + ngrok edge. Dual trusts ngrok forwarded headers (if present)
+    // else in-app cookie. No new migs/deps. See server.rs for full handlers + extractor.
+    // Credits: AGENTS.md, prior ngrok deploy entries (edge SSO context), no UI auth from 5 repos.
+    #[arg(long, env = "GOOGLE_CLIENT_ID", default_value = "")]
+    pub google_client_id: String,
+
+    #[arg(long, env = "GOOGLE_CLIENT_SECRET", default_value = "")]
+    pub google_client_secret: String,
+
+    #[arg(long, env = "GOOGLE_REDIRECT_URI", default_value = "")]
+    pub google_redirect_uri: String,
+
+    /// Comma-separated allowlist (empty = any email for paper mode only).
+    #[arg(long, env = "AUTH_ALLOWED_EMAILS", default_value = "")]
+    pub allowed_emails: String,
+
+    /// Whether auth cookies should be marked Secure (true for https prod; false ok for local http paper dev).
+    #[arg(long, env = "AUTH_COOKIE_SECURE", default_value_t = false)]
+    pub auth_cookie_secure: bool,
 }
 
 impl Config {
@@ -127,5 +154,22 @@ impl Config {
             p.pop();
         }
         p
+    }
+
+    /// True if Google OAuth creds appear configured (for login route availability).
+    pub fn auth_enabled(&self) -> bool {
+        !self.google_client_id.is_empty() && !self.google_client_secret.is_empty()
+    }
+
+    /// Parse allowed emails to vec (empty vec = any for paper).
+    pub fn allowed_emails_list(&self) -> Vec<String> {
+        if self.allowed_emails.trim().is_empty() {
+            return vec![];
+        }
+        self.allowed_emails
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 }

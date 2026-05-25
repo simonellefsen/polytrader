@@ -3,6 +3,12 @@
 //! (via dioxus SSR in server.rs dashboard_handler). Client live updates via included script +
 //! real fetch to preserved JSON endpoints (relative URLs + <base> for subpath compat).
 //! Follows exact Dioxus 0.7 + existing patterns; no WASM bundle yet (smallest, deploy preserved).
+//!
+//! AUTH (2026-05-25 Next Phase IMPL 5701dfea): smallest static rsx links + chip placeholder
+//!   + enhancement to *existing* client script for /auth/whoami fetch (fits live-fetch pattern
+//!   exactly). No App sig change, no new signals, no SSR string hacks (avoids past brittle issue).
+//!   Links relative so <base> resolves under /polytrader subpath. Foundation for future per-user
+//!   personalization of paper bankroll/journal. Heavy comments. Credits to AGENTS + deploy history.
 
 use dioxus::prelude::*;
 
@@ -48,12 +54,21 @@ pub fn App() -> Element {
         head {
             title { "polytrader — Dioxus Phase 2 (SSR + Gated Hermes)" }
             // base href injected by server layer for /polytrader subpath rewrite compat (preserves Phase 0 verified behavior)
-            style { "body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #0b0c10; color: #eee; }} .banner {{ background: #c00; color: white; padding: 1rem; font-weight: bold; border-radius: 4px; }} .card {{ background: #16181f; padding: 1rem; margin: 1rem 0; border-radius: 6px; }} pre {{ background:#111; padding:0.5rem; }} button {{ padding: 0.5rem 1rem; }} table {{ border-collapse: collapse; }} td,th {{ border:1px solid #333; padding:4px; }}" }
+            style { "body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #0b0c10; color: #eee; }} .banner {{ background: #c00; color: white; padding: 1rem; font-weight: bold; border-radius: 4px; }} .card {{ background: #16181f; padding: 1rem; margin: 1rem 0; border-radius: 6px; }} pre {{ background:#111; padding:0.5rem; }} button {{ padding: 0.5rem 1rem; }} table {{ border-collapse: collapse; }} td,th {{ border:1px solid #333; padding:4px; }} .auth {{ float: right; font-size: 0.9em; }}" }
         }
         body {
             h1 { "polytrader — Phase 2 (Dioxus SSR + Gated Hermes)" }
             div { class: "banner",
                 "⚠️ PAPER TRADING ONLY — REAL MONEY TRADING DISABLED. Simulation using live public Polymarket data. Dioxus skeleton active."
+            }
+
+            // AUTH (Next Phase): smallest static links + placeholder (populated by existing script pattern).
+            // Relative URLs resolve correctly under <base href="/polytrader/">. Dual with edge SSO.
+            // Future: per-user paper bankroll attribution / journal once identity wired.
+            div { class: "auth card",
+                a { href: "/auth/login", "Login with Google" }
+                span { id: "user-chip", style: "margin-left: 1rem;", "" }
+                small { " (in-app Google OAuth, dual with ngrok edge SSO)" }
             }
 
             div { class: "card",
@@ -93,6 +108,7 @@ pub fn App() -> Element {
                     li { "All activity journaled (paper_trading + journal schemas)" }
                     li { "Dioxus 0.7 fullstack SSR (rsx in this file is the rendered source) + client fetch reactivity (Phase 2)" }
                     li { "Hermes richer + autonomous low-risk wiki proposals (gated) in separate deployment" }
+                    li { "In-app Google OAuth (dual with ngrok edge SSO) — foundation for future per-user paper features" }
                 }
             }
 
@@ -104,6 +120,7 @@ pub fn App() -> Element {
             // Does live updates to dashboard cards (targets ids) using the preserved JSON endpoints.
             // Relative URLs + <base> from server wrapper ensure subpath /polytrader/* compat.
             // This delivers "clean client fetch + reactivity" without WASM bundle (smallest viable).
+            // AUTH: also fetches /auth/whoami (new endpoint) to populate #user-chip (fits exact pattern).
             script {
                 r#"
                 let count = 0;
@@ -127,9 +144,23 @@ pub fn App() -> Element {
                         const pnlEl = document.getElementById('pnl-val');
                         if (pnlEl && p && p.unrealized_pnl) pnlEl.textContent = p.unrealized_pnl;
                     }}).catch(() => {{ /* graceful */ }});
+                    // AUTH: populate user chip from whoami (smallest addition, same pattern)
+                    updateAuthChip();
+                }}
+                function updateAuthChip() {{
+                    const chip = document.getElementById('user-chip');
+                    if (!chip) return;
+                    fetch('auth/whoami').then(r => r.json()).then(d => {{
+                        if (d && d.user) {{
+                            chip.innerHTML = 'Signed in as <strong>' + d.user + '</strong> | <a href=\"auth/logout\">Logout</a>';
+                        }} else {{
+                            chip.innerHTML = '<a href=\"auth/login\">Login with Google</a>';
+                        }}
+                    }}).catch(() => {{ chip.innerHTML = '<a href=\"auth/login\">Login with Google</a>'; }});
                 }}
                 // Auto one refresh on load for live feel (non-blocking)
                 setTimeout(refreshDemo, 1200);
+                setTimeout(updateAuthChip, 800);
                 "#
             }
         }
@@ -188,5 +219,6 @@ mod tests {
             "Hermes gated proposal context in safety card"
         );
         // Note: full <base> injection + wrapper tested via integration in server (string post-process); this covers core rsx SSR fidelity.
+        // AUTH note: whoami/login strings are in static rsx + script (tested via presence in full e2e if needed).
     }
 }

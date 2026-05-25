@@ -47,6 +47,18 @@ thiserror = "1"
 dotenvy = "0.15"
 clap = { version = "4", features = ["derive", "env"] }
 
+# Optional resilient WS client for CLOB feeds (orderbook/trades streaming for future reactive tier).
+# STRICTLY gated: feature "clob-ws" (default off) + runtime env POLYTRADER_ENABLE_CLOB_WS=highconviction.
+# Skeleton only (connection mgmt, reconnect, basic msg handling); no activation in poll paths.
+# Follows patterns from transferred repos (see wiki decisions/2026-05-25-data-ingester... + integrations).
+# Paper-only, $150 context: do not enable lightly (complexity/risk vs deliberate 5-min tier).
+# rustls to match existing reqwest tls choice.
+tokio-tungstenite = { version = "0.21", optional = true, features = ["rustls-tls-webpki-roots"] }
+
+[features]
+default = []
+clob-ws = ["dep:tokio-tungstenite"]
+
 [dev-dependencies]
 tokio-test = "0.4"
 

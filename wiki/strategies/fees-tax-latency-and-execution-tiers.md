@@ -122,3 +122,38 @@ This is not a limitation — it is disciplined capital allocation.
 4. (Later) Add optional streaming-reactive execution paths behind strong gates, once Tier 1 has proven itself.
 
 All of this remains fully compatible with the conservative goals and cadences defined in the sister document.
+
+---
+
+## Implementation Status (2026-05-25)
+
+The four concrete next practical steps have been **implemented** as the smallest viable working pieces within the existing architecture (paper-only, ~$150 context, rust_decimal everywhere, no new migrations, jsonb for all new attribution/metrics, heavy risk comments, fmt/clippy clean).
+
+See the top entry in `wiki/log.md` (the 2026-05-25 impl prepend) for full details:
+- Exact files changed, design decisions + rationale + risks (e.g. pessimistic fee defaults, double-gating for WS, no silent calcs/fallbacks).
+- Commands, verification outputs, AGENTS/wiki-first compliance matrix.
+- Proactive handling of past anti-patterns (fidelity via prepend+re-reads, no overclaims on reactive WS ("skeleton; gated; future only; do not enable"), proper stream error handling, doc/impl match).
+- Credits to this page + `goals-and-operational-cadence.md` + 5 transferred repos (via the 3.1 decision + integrations page: BTC-bot websocket_manager.py etc., poly-maker websocket_handlers.py, etc.).
+
+**Summary of delivered (one per step, smallest)**:
+1. `FeeModel` (struct + net calc methods) first-class in `src/paper/` (models + engine); seeded from existing paper_fee_bps legacy config (config/main untouched for smallest compat during transition; full configurable ctor + dedicated envs deferred to wiring inc). Integrated into fill paths + exposed for opportunities. (Replaces simplistic bps with tier-aware model foundation.)
+2. `FusionEngine` extended + new `DecisionReport` (gross + **net edge after fees/gas/slip** + fee_breakdown in attribution json). Primary deliberate tier signal. One path updated in skeleton.
+3. Hermes `do_reflection` now breaks out fee impact, fee-adjusted P&L, per-processor fee attribution, vs goals (daily/weekly net targets from cadence page) — all in existing `journal.reflections.metrics` jsonb + summaries.
+4. Gated WS skeleton (`ClobWsClient` cfg(feature="clob-ws"), reconnect, basic market channel handling) in `src/ingester/clob_public.rs`; optional Cargo dep; runtime env gate; **zero activation**; poll path untouched; errors never silent. Follows exact transferred patterns + ingester style.
+
+**Key constraints honored**:
+- Wiki-first: log prepend + this status append *before* any src edit; re-reads before each search_replace.
+- No over-engineering or new concepts beyond the approved tiers/goals pages.
+- $150 conservative: fee over-estimation baked in; WS explicitly "skeleton for future high-conviction only after Tier 1 proof".
+- Observability: everything via existing journal (fills fee, jsonb decision_context/metrics).
+- No behavior change to verified paths (k8s, hermes cadence, endpoints, ingest polling, paper submit).
+
+**Fidelity Reconciliation Note (Fix Round 1 - 2026-05-25)**:
+Post-delivery review identified doc/impl drift in original claims (anti#1/3):
+- Bullet 1 originally claimed "configurable via extended `Config`": corrected above to accurately reflect smallest viable (legacy paper_fee_bps path only; no Config/main changes beyond required mod; full extension deferred).
+- Similar corrections + full 15-file touched list + pre-dirty context documented in paired amend to `wiki/log.md` top entry (Fidelity Reconciliation Note subsection with timeline, exact mismatches, AGENTS compliance, future gate).
+- Wiki-first order strictly followed for this Fix Round amend (log + this fees Status edit *before* any code nits or review_file updates). Re-read + `git status --porcelain` verified post-edit (only wikis modified at that step). Restores fidelity for Hermes consumption. No scope or behavior change.
+
+**Status**: Complete for this increment. Ready for follow-up wiring (5-min DecisionReport caller, risk gates using net edge, etc.). Update this section + log.md on next steps.
+
+(No new decision file created; used edits to existing pages per "prefer edit" + smallest rule. If design issues had arisen, Status: wontfix with explanation would have been used.)

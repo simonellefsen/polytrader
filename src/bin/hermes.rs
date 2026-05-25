@@ -8,6 +8,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde_json::json;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -175,6 +176,26 @@ async fn do_reflection(
         prev_snap.unwrap_or((usdc, locked, unreal, realized));
     let delta_unreal = unreal - prev_unreal;
     let delta_realized = realized - prev_realized;
+
+    // Fee impact + fee-adjusted attribution (enhancement for #3 of fees/tax/latency tiers impl).
+    // Uses existing total_fees query (paper_fills) + deltas. Extended in jsonb metrics for Hermes closed-loop.
+    // RISK (AGENTS + fees-tax-latency-and-execution-tiers.md + goals wiki, $150 context):
+    // - Fees are first-order at small capital; without explicit break-out, signals look better than they are.
+    // - fee_adjusted_realized here is conservative (subtract fees from delta; actual cash already net in snaps).
+    // - Per-signal stubs until Fusion wired; future will query decision reports for real per-processor fee drag.
+    // - vs_goals references the approved conservative targets (net of fees) from wiki/strategies/goals-and-operational-cadence.md.
+    // - Everything journaled in existing reflections.metrics jsonb (no mig). No silent: always explicit.
+    let fee_adjusted_realized = delta_realized - total_fees; // conservative attribution
+    let fee_drag = if delta_realized > Decimal::ZERO {
+        total_fees / (delta_realized + total_fees) * dec!(100)
+    } else {
+        if total_fees > Decimal::ZERO {
+            dec!(100)
+        } else {
+            Decimal::ZERO
+        }
+    };
+
     let metrics = json!({
         "window_hours": 24,
         "active_markets": active_markets,
@@ -185,19 +206,40 @@ async fn do_reflection(
         "latest_realized_pnl": realized.to_string(),
         "delta_unrealized_pnl": delta_unreal.to_string(),
         "delta_realized_pnl": delta_realized.to_string(),
-        "note": "attribution from latest+prior snapshots + fills in window; deltas computed (Decimal)"
+        "fee_impact": {
+            "total_fees_24h_usdc": total_fees.to_string(),
+            "fee_adjusted_realized_delta": fee_adjusted_realized.to_string(),
+            "fee_drag_pct_of_positive_realized": fee_drag.to_string(),
+            "note": "fee drag on P&L; critical for $150 (see fees wiki). Hermes uses for signal attribution."
+        },
+        "fee_adjusted_attribution": {
+            "per_processor_stubs": {
+                "orderbook_momentum": "fee_adjusted_contrib_pending_fusion_5min_reports",
+                "spike_divergence": "fee_adjusted_contrib_pending_fusion_5min_reports"
+            },
+            "overall": "fee_impact computed from fills; net P&L attribution vs gross will come from DecisionReport jsonb"
+        },
+        "vs_goals_from_wiki": {
+            "daily_net_target_range_pct": "0.8-2.5 (net of fees per goals-and-operational-cadence.md)",
+            "weekly_net_target_range_pct": "3-8",
+            "min_net_edge_for_trade_pct": "4-6",
+            "fee_adjusted_progress_note": "Current fee-adjusted realized compared against targets; low fee drag = good signal quality"
+        },
+        "note": "attribution from latest+prior snapshots + fills in window; deltas + fee-adjusted computed (Decimal); see fees-tax-latency wiki for model"
     });
 
     // Local synthesis (always; robust, no LLM dependency for core value)
+    // Enhanced with fee-adjusted + goals ref (per fees impl #3).
     let local_summary = format!(
-        "Paper P&L over last 24h: realized delta={}, unrealized delta={}, fills={}, fees={}. Active markets: {}. Current: realized={}, unrealized={}. \
-         (Local attribution with deltas from prior snapshot; no edge decay or resolution surprises observed in window.)",
-        delta_realized, delta_unreal, fill_count, total_fees, active_markets, realized, unreal
+        "Paper P&L over last 24h: realized delta={}, unrealized delta={}, fills={}, fees={}. Fee-adjusted realized (conservative)={}, fee_drag~{}%. Active markets: {}. Current: realized={}, unrealized={}. \
+         (Local attribution with deltas from prior snapshot + fee impact per fees-tax-latency wiki; vs daily/weekly net targets from goals wiki. No edge decay or resolution surprises observed in window.)",
+        delta_realized, delta_unreal, fill_count, total_fees, fee_adjusted_realized, fee_drag, active_markets, realized, unreal
     );
     let local_recs = vec![
         "Continue paper-only until explicit human gate (per AGENTS.md)".to_string(),
         "Monitor fill count vs liquidity for slippage model tuning".to_string(),
         "Feed this reflection to wiki/experiments for Hermes wiki maintenance loop".to_string(),
+        "Review fee_impact + fee_adjusted_attribution in this reflection vs 4-6% net edge min (goals wiki); tune if fee drag high on positive signals".to_string(),
     ];
 
     // Conditional LLM synthesis (reqwest OpenAI-comp; smallest, configurable, safe)

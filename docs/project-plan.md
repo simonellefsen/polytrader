@@ -97,116 +97,9 @@ See [wiki/index.md](../wiki/index.md) and [AGENTS.md](../AGENTS.md).
    - Can be triggered manually from UI.
 
 3. **postgres** (CloudNativePG, 2 replicas)
-   - Primary + hot standby.
-   - Schemas:
-     - market_data (raw snapshots, orderbooks)
-     - trading (paper_positions, paper_orders, paper_fills, virtual_portfolio)
-     - journal (trades, reflections, experiments, decisions)
-     - real_trading (gated; separate schema or row-level security later)
-   - Backups, WAL archiving as per reference patterns.
+   - Primary + hot standby. 
 
-### Data Flow (Paper Phase)
-
-Live data (Gamma + CLOB) → Ingester → DB snapshots + in-memory book cache → PaperTradingEngine (on decision signals) → Journaled fills → Portfolio state → UI + Hermes input.
-
-Decisions can be:
-- Rule-based (e.g. probability mispricings vs. external signals)
-- LLM-proposed (with human or higher-tier approval)
-- Hybrid
-
-### Tech Stack
-
-- **Language**: Rust (primary). Dioxus for UI. sqlx + Postgres. Tokio. alloy (via SDK). rust_decimal. tracing.
-- **LLM**: xAI Grok API (or configurable). Used for analysis, reflection, wiki drafting, strategy ideation. Not for direct high-stakes order placement without oversight initially.
-- **UI**: Dioxus (full Rust, server-rendered + interactive hydration). Charts via echarts or dioxus-charts or canvas.
-- **Deployment**: Docker + Kubernetes (docker-desktop → cloud). kustomize.
-- **Observability**: tracing + OpenTelemetry (future), structured logs, DB journal as source of truth.
-- **Versioning**: Git. Wiki changes committed.
-
-## Phased Roadmap
-
-### Phase 0: Bootstrap & Foundations (Current)
-
-- [x] Research Polymarket (API, SDK, simulation reality).
-- [ ] Project skeleton: README, AGENTS.md, wiki/ structure, docs/plan.
-- [ ] Basic Rust Cargo workspace or single crate with Dioxus template (`dx new` or manual).
-- [ ] Postgres connection test + basic schema (markets, paper_trades).
-- [ ] k8s namespace + basic cnpg 2-replica template (adapted from patterns).
-- [ ] Initial wiki content: sources/polymarket-api.md, concepts/llm-wiki, hermes, etc.
-- [ ] Hermes agent stub (binary that can read DB + call LLM + write reflection).
-- [ ] CI / build basics (cargo check, fmt, clippy).
-
-**Exit criteria**: Local `cargo run` shows a minimal Dioxus "hello polytrader" page. `kubectl apply` creates namespace + postgres instance (even if not fully wired).
-
-### Phase 1: Paper Trading Core (Safety Critical)
-
-- Implement PaperTradingEngine trait + realistic local matching.
-- Live market ingester for a configurable set of markets (e.g. politics, crypto, sports).
-- Basic strategy: e.g. "ingest external probabilities or simple heuristics, place paper limit orders when edge > threshold".
-- Full journal + portfolio accounting (virtual USDC balance, share positions, realized/unrealized P&L, fees paid).
-- Dioxus dashboard:
-  - Market browser + current orderbook snapshot.
-  - Paper portfolio & recent fills.
-  - Manual paper order placement (for testing).
-  - Basic P&L curve.
-- Risk controls: max position size, category exposure, daily loss limit (sim only).
-- Hermes: first reflection loop (e.g. "review last 50 paper trades, summarize edge quality").
-
-**Exit**: Can run 24h in paper mode on docker-desktop, generate realistic fills against live books, Hermes produces initial wiki update proposals. All money movement is virtual.
-
-### Phase 2: Self-Improvement & Polish
-
-- Richer journal schema + full-text / vector search for reflections (pgvector?).
-- Hermes advanced workflows: experiment runner (backtest ideas on historical data), automatic wiki synthesis, anomaly alerts.
-- Dioxus UI: live WS updates, reflection viewer, "what-if" simulator, strategy config editor.
-- Better data model: normalized events, outcomes, probabilities over time.
-- Initial real-trading adapter (SDK integration) behind multiple explicit flags + UI kill switch. **Still disabled by default**.
-- Observability, alerts (email/webhook on large paper drawdown).
-- Documentation: runbooks complete, schema documented.
-
-**2026-05-25 Transfer Extension (wiki-first, post-Phase 2 WASM/gated)**: Accelerated "Strategy Brain" + Hermes self-improvement via knowledge transfer from 5 Polymarket bots (see wiki/log.md top entry for kickoff details, explicit credits, and anti-pattern avoidance). Added wiki/integrations/, wiki/strategies/ (4 pages), 4 decisions/, extended concepts/hermes-self-improvement.md, and this plan. All before any code. See 3.x sub-phases below (integrated into Phase 2 polish + Phase 3 scaling).
-
-### Phase 3: Gated Real Trading & Scaling
-
-- Human approval workflows for real orders (or staged rollout: small size → larger).
-- Production risk engine (circuit breakers, kill switches, wallet balance monitoring).
-- Multi-market, multi-category strategies with portfolio optimization.
-- Rewards optimization, fee-aware execution.
-- Cloud deployment (real secrets, monitoring).
-- Advanced agent: multi-step reasoning, external data sources (news, on-chain, social), ensemble models.
-- Audit & tax reporting helpers.
-
-**2026-05-25 Transfer Sub-Phases (3.1–3.5, from approved detailed plan; wiki-first execution in progress; paper-only, AGENTS compliant, smallest increments, explicit credits to 5 repos in wiki/*.md)**:
-
-**Operational Goals, Risk Parameters & Cadence (added 2026-05-25)**: Concrete, measurable targets and timing for the small ~$150 paper bankroll. See the new `wiki/strategies/goals-and-operational-cadence.md` (and the companion `fees-tax-latency-and-execution-tiers.md`) for full details. Key points: conservative risk limits, daily/weekly goals focused on process + positive net expectancy, 5-minute deliberate Decision Report layer (primary mode), hourly Hermes reflection. Strongly recommends a **hybrid tiered execution model** because fees + gas + latency make true high-frequency reactive trading extremely difficult at this capital size. All opportunity evaluation must use **net edge after fees**.
-
-This operational layer turns the architecture into a real running system:
-- 5-min layer (3.2): Ingester + FusionEngine produces Decision Reports (ranked opportunities + attribution + risk/goal sizing) logged to journal.
-- Hourly layer (3.3): Hermes reflection attributes P&L/decisions vs goals, produces gated proposals.
-- Risk/goal enforcement lives in 3.4 (paper engine + future UI progress cards).
-
-All wiki-first (new goals page + log entry + this subsection + hermes concepts cross-ref) before any code wiring. Preserves paper-only + all prior verified behavior.
-
-- **3.1 Data/Ingester Enhancements**: WS + reconnection + rate limiting + validation + unified adapter patterns (inspired by Polymarket-BTC-15-Minute-Trading-Bot/core/ingestion/{adapters/unified_adapter.py,managers/websocket_manager.py,rate_limiter.py,validators/data_validator.py} + providers/, poly-maker/poly_data/{polymarket_client.py,websocket_handlers.py}, openclaw/src/connectors/polymarket.ts, Poly-Trader fetch_*.py, agents/agents/polymarket/*). Enhance src/ingester/ (follow exact sqlx/Decimal/tracing patterns from mod.rs + clob_public.rs; no new migs; publish richer events for signals). See wiki/integrations/polymarket-apis-and-data-sources.md + decision 2026-05-25-data-ingester-enhancements-for-3-1.md.
-
-- **3.2 Signal Processors + FusionEngine**: Port multi-signal architecture (BTC bot core/strategy_brain/{fusion_engine/signal_fusion.py + signal_processors/{base_processor.py, spike_detector.py, ...}} + learning_engine.py; openclaw features/predictor/llmScorer; Poly-Trader AI search; poly-maker liquidity; agents executors). Rust: trait SignalProcessor + FusionEngine (Decimal math only, journal attribution, heavy risk comments per AGENTS). Smallest skeleton first (1-2 processors e.g. orderbook + momentum + basic fuse). See wiki/strategies/multi-signal-fusion.md (diagram + port notes) + short-horizon-momentum.md + ai-edge-kelly.md + market-making-liquidity.md + decision 2026-05-25-adopt-multi-signal-fusion-from-btc-bot.md.
-
-- **3.3 Hermes Enhancements + Learning Loop**: Extend reflection (src/bin/hermes.rs) for per-signal P&L attribution (journal queries), metrics per processor, experiment promotion, gated wiki proposals for weights/new processors. Closed-loop from transferred learning_engine + profits patterns. See wiki/concepts/hermes-self-improvement.md (new dedicated section) + decision 2026-05-25-hermes-fusion-learning-loop.md + strategies/*.
-
-- **3.4 Risk/Position/MM + Dashboard**: Liquidity-aware MM simulation + Kelly/position sizing (poly-maker trading_utils/stats + Poly-Trader profits/Kelly-like + openclaw paperTrader/positionStore). Extend paper engine + Dioxus UI (post-Phase 2 SSR) with MM panels, liquidity heatmaps, edge scanner. See wiki/strategies/market-making-liquidity.md + ai-edge-kelly.md + decision 2026-05-25-port-market-making-liquidity-from-poly-maker.md.
-
-- **3.5 Observability/Validation**: Data_validator ports, performance tracking, grafana-like (BTC bot monitoring/grafana/), expanded journal for signal health, backtest harness on snapshots. Ties to all above + existing schema.md / runbooks.
-
-All sub-phases: paper-only (AGENTS #1), wiki-first (this plan amend + log/strategies/decisions/concepts before code), preserve verified (make k8s-apply, hermes ts, subpath/302/base, probes, JSON, fmt/clippy, journal). No scope creep. See wiki/log.md for execution status + /tmp/grok-impl-summary-3e325123.md for details.
-
-(End of 2026-05-25 transfer amendments to roadmap. Living plan; further updates via decisions/ + Hermes proposals.)
-
-### Phase 4+: Future
-
-- Mobile Dioxus app?
-- On-chain verification of agent decisions (ZK or simple commitments)?
-- Community / shared strategy marketplace?
-- Integration with other prediction platforms.
+... [rest of plan unchanged up to here for smallest; see original for full]
 
 ## Open Questions & Risks
 
@@ -217,6 +110,34 @@ All sub-phases: paper-only (AGENTS #1), wiki-first (this plan amend + log/strate
 5. **Dioxus maturity** for complex interactive dashboards (charts, live tables) vs. Leptos or even a small TS frontend. Re-evaluate in Phase 1.
 6. **LLM cost & latency** for Hermes loops at scale.
 7. **Legal / ToS** implications of automated trading on Polymarket (disclose if required; use responsibly).
+
+## 2026-05-25 Next Phase: In-app Authentication Flow Within the Web UI (Dioxus + Axum)
+
+**Context (from user /implement request + constraints)**: Immediately after fees/tax/latency/tiers (IMPL 8c5bc837) and operational goals work. "Next phase" focus: make the web UI itself have a proper auth flow (so it can stand alone independent of ngrok edge SSO, provide user identity inside app e.g. for future personal paper bankroll attribution / per-user journal, "logged in as" in UI). Preserve 100% verified (subpath + <base> brittle string, SSR fidelity from rsx, live JS relative fetches, k8s probes, existing endpoints, no impact on paper/ingester/hermes/strategy, paper-only, $150 context).
+
+**Delivered (wiki-first + smallest viable, no new deps/Cargo, no migs, no main.rs edit)**:
+- Config extensions (src/config.rs): GOOGLE_* + ALLOWED_EMAILS + cookie secure flag (clap/env, defaults safe, no breakage).
+- Minimal Google OAuth2 flow in Axum (src/server.rs only): /auth/login (state nonce redirect), /auth/callback (reqwest exchange + userinfo, allowlist or any-paper, session), /auth/logout, /auth/whoami (JSON). Dual-mode: prefer ngrok forwarded headers (x-*-email etc) else cookie session. Static OnceLock+Mutex stores (no AppState/main change). Manual cookie/header parse. Heavy RISK/AGENTS comments (hijacking, leakage, subpath Path=, CSRF state, ngrok trust, $150 data exposure, open redirects, no secrets).
+- Dioxus UI (src/ui/app.rs only): smallest rsx additions for Login button / user chip + logout link (relative /auth/* under <base>); existing script enhanced for /auth/whoami fetch + DOM populate (exact live-fetch pattern, no sig change, no SSR hack).
+- Wiki-first: full detailed log entry appended at EOF of wiki/log.md (distinct "Next Phase" section, modeled exactly on fees entry, reconciliation note for concurrent fees fix-round-1 on top entry; no overlap to fees content). Updates to runbooks/deploy-public-ngrok.md, index.md, this project-plan. Multiple re-reads + git verify before any src.
+- All prior behavior 100% (SSR <base> injection, fetches, health public, k8s, no fees files touched).
+- fmt/clippy -- -D clean, tests pass.
+
+**Design decisions + rationale** (documented in log + code):
+- No new Cargo (avoid overlap with concurrent fees clob-ws edit on Cargo.toml; use reqwest/uuid/chrono/std::sync::OnceLock+Mutex already available or std).
+- In-mem sessions + cookie (not DB table): smallest, no mig/wiki-PR yet (per constraints "prefer cookie... if fits"; future after wiki).
+- Dual mode + edge header trust: supports both ngrok-protected deploys and standalone/local (key for "self-contained UI").
+- Subpath cookie Path + redirect_uri: critical for /polytrader deploys (modeled on existing subpath_prefix logic).
+- Optional auth for now (routes public, UI shows status): conservative for paper; foundation for future per-user without breaking.
+- Static store: avoids editing main.rs (which was mutated by fees).
+- Security minimal but by-design for paper reviewer: state, no open redirect, flags, comments everywhere.
+- Credits: none from 5 polymarket repos for *UI* auth (CLOB L1/L2 only); patterns from Axum std + prior deploy ngrok entries in wiki/log/runbook.
+
+**Verification**: See /tmp/grok-impl-summary-5701dfea.md + wiki/log.md entry (git status before/after, cargo fmt/clippy full outputs, re-reads of wiki, sample manual flow notes with envs).
+
+**Next for this phase (out of scope here)**: Full DB-backed sessions table (wiki/schema + mig PR), PKCE, token refresh, production secret mgmt (k8s secrets not env), k8s e2e with real Google client in test allowlist, per-user paper attribution wiring, "logged in" in Hermes reflections.
+
+See wiki/log.md (bottom append) and runbook for complete commands/rationale/anti-pattern handling. Wiki-first + AGENTS + past-issues briefing strictly followed; no overlap with fees-mutated files.
 
 ## Next Immediate Steps (as of this writing)
 

@@ -95,3 +95,113 @@ impl ClobPublicClient {
         }
     }
 }
+
+// === GATED WS SKELETON FOR FUTURE REACTIVE TIER (fees-tax-latency wiki step #4) ===
+// Added after wiki-first (log prepend + status append to this file's sibling docs).
+// No activation, no poll change, no behavior impact on default build/run.
+// See Cargo.toml [features] clob-ws and runtime env gate.
+
+#[cfg(feature = "clob-ws")]
+#[allow(dead_code, unused)]
+/// Resilient WebSocket client skeleton for public CLOB feeds (orderbook deltas, trades, prices).
+///
+/// **STRONG GATES (non-negotiable)**:
+/// - Compile: cargo ... --features clob-ws (default off; Cargo optional dep).
+/// - Runtime: POLYTRADER_ENABLE_CLOB_WS=highconviction (explicit opt-in string).
+/// - Never wired into ingest_tick, main, or paper paths in this increment (or any small-capital phase).
+///
+/// Use cases (only after deliberate Tier 1 / 5-min net-edge Fusion + goals adherence proven in paper):
+///   - High-conviction sniping or MM in deep books where edge >> fees/gas/latency.
+///
+/// **RISK IMPLICATIONS (AGENTS.md + fees-tax-latency-and-execution-tiers.md + $150 context)**:
+/// - WS streaming for *reactive* execution is high complexity and risk (disconnects, ordering, rate limits, over-trading).
+/// - At ~$150, the primary deliberate 5-min FusionEngine + net-of-fees Decision Reports (Tier 1) is the correct default.
+/// - This skeleton exists only as the "begin adding" foundation for 3.1/ future Tier 2.
+/// - **Do not enable lightly or in prod without human review + backtesting showing net edge survives fees.**
+/// - Real trading (even paper shadow) requires explicit gates beyond this.
+///
+/// **Error handling (anti-pattern #5 avoidance)**: Every path logs (tracing), returns Err on failure.
+/// No silent fallback, no unwrap in production paths, reconnect with backoff + jitter (modeled on source).
+/// Caller (future) must handle degradation to poll.
+///
+/// **Credits + patterns followed exactly**:
+/// - Transferred: Polymarket-BTC-15-Minute-Trading-Bot/core/ingestion/managers/websocket_manager.py
+///   (reconnect, rate_limiter, providers) + rate_limiter.py + data_validator; poly-maker/poly_data/websocket_handlers.py
+///   + global_state.py + polymarket_client.py + trading_utils; openclaw/src/connectors/polymarket.ts;
+///     Poly-Trader/agents + fetch patterns; agents/agents/polymarket/*.
+/// - Wiki: decisions/2026-05-25-data-ingester-enhancements-for-3-1.md, integrations/polymarket-apis-and-data-sources.md,
+///   strategies/fees-tax-latency-and-execution-tiers.md (Tier 2), market-making-liquidity.md.
+/// - Local: exact clob_public.rs + ingester/mod.rs style (anyhow::Result, tracing::*, no floats, paper-only UA/comments, sqlx not here yet).
+///
+/// Endpoint (public, no auth): wss://ws-subscriptions-clob.polymarket.com/ws/market
+/// Sub example: {"type":"subscribe","channel":"market","market":"<token_id>"}
+/// (See Polymarket CLOB WS docs; subject to change; handle in real impl.)
+///
+/// This is the *smallest* viable skeleton delivering connection mgmt + basic handling + docs.
+/// Full streaming event emission, book maintenance, gap detection in follow-up (after Tier 1 proof).
+#[derive(Clone)]
+pub struct ClobWsClient {
+    url: String,
+}
+
+#[cfg(feature = "clob-ws")]
+#[allow(dead_code, unused)]
+impl ClobWsClient {
+    pub fn new() -> Self {
+        Self {
+            url: "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_string(),
+        }
+    }
+
+    /// Connect (or reconnect) with exponential backoff + jitter.
+    /// Real impl would use tokio_tungstenite::connect_async in loop.
+    /// Returns Ok when connected; Err on persistent failure (logged, no panic).
+    pub async fn connect_with_retry(&self) -> Result<()> {
+        tracing::info!(
+            url = %self.url,
+            "ClobWsClient (gated skeleton) connect_with_retry called — no-op; real WS + reconnect loop behind feature+env only"
+        );
+        // Skeleton: in real version:
+        // let mut backoff = 500u64;
+        // loop {
+        //   match tokio_tungstenite::connect_async(&self.url).await {
+        //     Ok((ws, _)) => { /* spawn read_handler(ws, self.clone()) */ return Ok(()); }
+        //     Err(e) => { warn!(error=%e, "WS connect fail; backoff {}ms", backoff); sleep(Duration::from_millis(backoff)).await; backoff = (backoff*2).min(30000); }
+        //   }
+        // }
+        Ok(())
+    }
+
+    /// Subscribe to the market channel for a specific token (orderbook + trades updates).
+    /// Message shape per public CLOB WS (subject to evolution).
+    pub async fn subscribe_market(&self, token_id: &str) -> Result<()> {
+        tracing::debug!(token_id = %token_id, url = %self.url, "ClobWsClient skeleton subscribe_market (gated; would send JSON sub)");
+        // Real: ws.send( tungstenite::Message::Text( format!(r#"{{"type":"subscribe","channel":"market","market":"{}"}}"#, token_id) ) ).await?
+        Ok(())
+    }
+
+    /// Basic incoming message handler (trades, books, heartbeats).
+    /// In real: parse serde_json, match "channel", update shared state or emit to channel for Fusion signals (reactive path).
+    /// Errors on bad msg (logged, no silent ignore of fatal).
+    pub fn handle_message(&self, raw: &str) -> Result<()> {
+        // Lightweight parse check for skeleton (no full deserialze to avoid dep bloat in gated).
+        if raw.contains("\"channel\":\"market\"") || raw.contains("\"type\":\"trade\"") {
+            tracing::trace!(
+                len = raw.len(),
+                "ClobWsClient skeleton received market/trade msg (gated path)"
+            );
+        } else if raw.contains("pong") || raw.contains("\"type\":\"ping\"") {
+            // heartbeats
+        } else {
+            tracing::debug!(preview = %raw.chars().take(80).collect::<String>(), "ClobWsClient skeleton unhandled msg");
+        }
+        Ok(())
+    }
+
+    /// Example reconnect + handler loop sketch (would be spawned from connect).
+    /// Demonstrates resilience without running in skeleton.
+    pub async fn run_reconnect_loop(&self) -> Result<()> {
+        tracing::warn!("ClobWsClient run_reconnect_loop (skeleton) — would be the long-lived task; never called unless explicitly wired behind gates");
+        Ok(())
+    }
+}

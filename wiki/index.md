@@ -28,9 +28,9 @@ Start here, then follow links. For full context, also read:
 
 ## Current Status (Summary)
 
-**Phase**: Phase 2 Self-Improvement & Polish + post-Phase 2 WASM prep start + 2026-05-25 wiki-first kickoff of polymarket-github 5-repo transfer (Phase 3 strategy brain subphases 3.1-3.5; see log.md top entry + new integrations/ + strategies/ + 4 decisions/ + hermes concepts extension + project-plan amend).  
+**Phase**: Phase 2 Self-Improvement & Polish + post-Phase 2 WASM prep start + 2026-05-25 wiki-first kickoff of polymarket-github 5-repo transfer (Phase 3 strategy brain subphases 3.1-3.5; see log.md top entry + new integrations/ + strategies/ + 4 decisions/ + hermes concepts extension + project-plan amend). Concurrent/next: 2026-05-25 in-app web UI auth flow (Google OAuth minimal + dual edge+app + user identity in Dioxus SSR/JS; see new log entry at bottom + runbook update; implemented wiki-first before src).  
 **Trading mode**: Paper trading only (mandatory until Phase 3 gates passed).  
-**Key open item**: Full WASM hydration + expanded tests + resolution triggers + deeper autonomous + transfer code increments (see log.md top for gaps + transfer execution; wiki structure for fusion/MM/AI/momentum/ingester now live with credits).
+**Key open item**: Full WASM hydration + expanded tests + resolution triggers + deeper autonomous + transfer code increments (see log.md top for gaps + transfer execution; wiki structure for fusion/MM/AI/momentum/ingester now live with credits). UI now has foundation for per-user personalization via auth.
 
 See [log.md](log.md) for the latest entry and active tasks.
 
@@ -38,4 +38,4 @@ See [log.md](log.md) for the latest entry and active tasks.
 
 This wiki is **LLM-maintained** with human oversight. Hermes agent is responsible for proposing and (in many cases) applying updates. See the llm-wiki concept page.
 
-Last major refresh: 2026-05-25 (post-Phase 2 deploy + fidelity wiki-git alignment fix round).
+Last major refresh: 2026-05-25 (post-Phase 2 deploy + fidelity wiki-git alignment fix round + fees fix-round-1 + next-phase auth wiki-first appends).

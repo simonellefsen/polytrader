@@ -14,7 +14,7 @@ The project requires safe 24/7 autonomous "play" from day one, before any real c
 
 ## Options Considered
 
-1. **Use only real money from the start** (small test wallet) — Rejected. Violates safety mandate in MISSION and AGENTS.md.
+1. **Use only real money from the start** (small test wallet) — Rejected. Violates safety mandate in AGENTS.md.
 2. **Adopt an existing open-source paper trader** (e.g. agent-next/polymarket-paper-trader) as core engine — Rejected for Phase 1. Good for inspiration and techniques, but we need:
    - Deep integration with our Postgres journal + Hermes reflection loops.
    - Rust/Dioxus native (or easily callable).

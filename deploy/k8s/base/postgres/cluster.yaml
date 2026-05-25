@@ -14,7 +14,7 @@ metadata:
   labels:
     app: postgres
 spec:
-  instances: 2          # primary + 1 replica (as per MISSION)
+  instances: 2          # primary + 1 replica (per original architecture)
   imageName: ghcr.io/cloudnative-pg/postgresql:16.4
 
   # Storage (docker-desktop uses local; adjust for prod)
