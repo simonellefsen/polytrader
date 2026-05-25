@@ -1,3 +1,111 @@
+## 2026-05-25 — Fees, tax, latency & execution tiers + updated goals/cadence for small capital (hybrid deliberate vs reactive streaming model; net-of-fees edge mandatory)
+
+**Context**: Follow-up to the just-defined operational goals & cadence. With ~$150 starting capital, fees (taker + gas) and latency realities are first-order constraints, not afterthoughts. True high-frequency reactive trading is extremely difficult at this scale.
+
+**What was done (wiki-first)**:
+- Created new dedicated page `wiki/strategies/fees-tax-latency-and-execution-tiers.md` covering:
+  - Current Polymarket fee structure realities and the absolute requirement to calculate **net edge after fees**.
+  - Tax record-keeping strategy (even in paper mode).
+  - Recommended **tiered execution model**:
+    - Tier 1 (primary): Deliberate 5-min Decision Reports via FusionEngine (most activity).
+    - Tier 2 (selective/future): Reactive streaming (CLOB WS) only for specific high-conviction cases where the edge justifies the costs.
+    - Strong recommendation to stay mostly in Tier 1 while capital is small.
+  - Impact on the transfer plan (especially 3.1 ingester streams, 3.2 fee-aware FusionEngine, 3.4 risk/position sizing, 3.3 Hermes fee-drag attribution).
+- Updated `goals-and-operational-cadence.md` to explicitly reference net-of-fees calculations and point to the new page.
+- Added short note to the top of the previous goals log entry for traceability.
+
+**Design notes**: This does not change the recommended 5-min + hourly cadence for the majority of activity. It adds the necessary discipline around costs and latency tiers so the system doesn't destroy edge on small size. All modeling must live in the PaperTradingEngine and strategy layer from the beginning.
+
+See the new `fees-tax-latency-and-execution-tiers.md` page for full details and recommendations.
+
+**Implemented by**: Grok (direct wiki-first update per AGENTS.md "When Adding Features" and user request to define reasonable goals/cadences on top of the approved 5-repo transfer plan and existing architecture). Paper-only 100%, conservative parameters for tiny capital, followed existing patterns (search_replace prepend using current top header as anchor, write for new dedicated strategy doc, extensions to existing hermes concepts + project-plan via search_replace after reading current state, heavy risk/AGENTS comments in new doc, explicit mapping to 3.2/3.3/3.4 phases, no code changes yet, no new migs, preserved all prior verified behavior).
+
+**Context/Rationale**: Current baseline (post 2026-05-25 transfer kickoff): ~$150 virtual paper bankroll, working journal + paper engine + ingester, Phase 2 Hermes (richer reflection + gated proposals, currently on a ~5–10 min internal tick), new `src/strategy/` skeleton (FusionEngine + attribution design from the BTC-bot transfer), wiki now contains integrations/ + strategies/ (including the new multi-signal-fusion page) + decisions/ + extended hermes concepts. User request: define daily + weekly goals + change Hermes self-improvement/reflection to hourly, with a 5-minute opportunity scan + "decision report" layer. All must fit inside the existing approved plan framework (especially 3.2 FusionEngine for frequent decisions, 3.3 Hermes closed-loop for hourly attribution vs goals, 3.4 risk/position sizing, journal as source of truth, Dioxus UI for visibility). Small capital demands extreme conservatism (learning + consistency >> aggressive returns). This operational layer makes the abstract self-improving system concrete and measurable.
+
+**What was done (strict wiki-first)**:
+- Read current state of relevant docs (hermes-self-improvement.md Phase 3.2/3.3 section, project-plan.md transfer sub-phases, top of log.md for style, AGENTS.md risk philosophy).
+- Created new dedicated page `wiki/strategies/goals-and-operational-cadence.md` (full content: risk limits, daily/weekly goals, 5-min Decision Report loop, hourly Hermes reflection, explicit mapping to the 5 transfer phases + existing components, conservative numbers tailored to $150, implementation notes for smallest next steps).
+- This new detailed log entry prepended via search_replace (using the previous transfer header as anchor; modeled exactly on the 2026-05-25 kickoff entry style/sections).
+- Extended `wiki/concepts/hermes-self-improvement.md` with a short new subsection under the Phase 3.3 extension describing the hourly reflection + goal attribution cadence (with pointer to the new goals page).
+- Updated `docs/project-plan.md` (added "Operational Goals, Risk Parameters & Cadence" subsection under the 2026-05-25 Transfer Extension + cross-references to the new wiki page and 3.x sub-phases).
+- All changes include explicit credits to the transfer plan + previous wiki work, heavy risk commentary, paper-only emphasis, and mapping to the architecture (FusionEngine for 5-min layer, Hermes for hourly layer, journal for everything).
+
+**Commands executed**:
+```bash
+# Context reads
+read_file on hermes-self-improvement.md (Phase 3 section), project-plan.md (transfer sub-phases), log.md top, AGENTS.md risk sections
+
+# WIKI-FIRST
+write wiki/strategies/goals-and-operational-cadence.md   # new comprehensive page
+search_replace wiki/log.md (prepend using previous top header as anchor)
+search_replace wiki/concepts/hermes-self-improvement.md (new cadence subsection)
+search_replace docs/project-plan.md (new operational goals subsection + cross-refs)
+
+# Verification
+grep -r "MISSION" .   # (already clean from prior task)
+git status --porcelain
+```
+
+**Key content highlights** (full details in the new `goals-and-operational-cadence.md`):
+- **Risk limits** (hard, enforced): 1% max risk/trade, 15% max exposure, 5% daily loss limit, 15% weekly drawdown limit, min 4–6% edge after fees/slippage.
+- **Daily goals**: 5–10 logged opportunities, 1–4 disciplined trades, +0.8% to +2.5% target (or positive expectancy + zero limit breaches + complete journaling), 1 high-quality hourly Hermes reflection with goal attribution.
+- **Weekly goals**: +3% to +8% net, win rate ≥55–60% or clear positive expectancy, max DD <12%, ≥2–3 concrete Hermes outputs (weight tweaks, experiments), at least one fusion weight experiment.
+- **5-minute layer**: Ingester/FusionEngine-driven Decision Report (ranked opportunities + per-signal attribution + risk/goal filtered size recommendation). Logged to journal. Natural first real consumer of the strategy skeleton.
+- **Hourly Hermes**: Full reflection with P&L broken down by goals + signals, decision-report vs outcome comparison, gated proposals for goal/weight adjustments. Much calmer cadence than the current ~5–10 min internal tick.
+- Explicit integration points into the approved plan (3.2 for 5-min decisions, 3.3 for hourly closed-loop learning, 3.4 for risk/goal enforcement, UI for visibility).
+
+**Design notes**: Parameters deliberately conservative for tiny capital (process & learning first). Cadences chosen to be actionable (5 min for responsiveness on fast markets; hourly for meaningful Hermes attribution without noise). Everything stays inside paper-only, journal-as-truth, existing components + the just-added strategy module. No behavior change to prior verified paths.
+
+**Status**: Goals & cadences fully defined and documented wiki-first. Ready for smallest viable implementation (goal config, 5-min decision report generator wired to FusionEngine, hourly Hermes reflection with goal attribution, UI progress cards) in the next increment. See new wiki page + updated project-plan + hermes concepts for the complete spec.
+
+**Next** (per the living plan): Wire the cadences + goal enforcement into the running system (using the skeleton already delivered). Update this log entry when the implementation increment completes.
+
+All per AGENTS.md (wiki first, paper gate, journaled/observable, heavy risk comments in docs, decisions for major choices, update log for changes). Avoided all prior anti-patterns (accurate timeline, no over-promising on returns with $150, explicit mapping to existing architecture).
+
+**Implemented by**: Grok Build subagent (pragmatic implementer; wiki-first per AGENTS.md "When Adding Features" and the user /implement approval of the preceding deep-dive plan for transferring tips from the 5 repos in /Users/lindau/codex/polymarket-github; paper-only 100%, smallest viable increments, followed existing patterns exactly (search_replace for prepend using unique header, write for new md, terminal mkdir for wiki dirs only, search_replace for updates to existing wiki md, rust_decimal/Decimal + sqlx + journal for future code, heavy risk comments, no new migs), updated wiki/log.md first as the very first change for this transfer (detailed entry modeled on the just-prior deploy entry), created new wiki structure (integrations/, strategies/, decisions/ entries), extended concepts + project-plan + index, explicit credits to 5 source repos in all new docs, preserved 100% prior verified behavior (no touch to k8s/make/hermes/subpath/probes/JSON/journal/ui/src yet), avoided all 5 anti-patterns from workspace memory briefing (esp #1: this prepend + search_replace ensures edit order matches future git; no claims in docs that don't match committed state at summary time).
+
+**Context/Rationale**: The user said "/implement I like what you have planed, start cracking ...." explicitly approving the detailed transfer plan (synthesized transferable tips with credits + exact 5 phases: 3.1 data/ingester, 3.2 signal processors + FusionEngine, 3.3 Hermes enhancements + learning loop, 3.4 risk/position/MM + dashboard, 3.5 observability/validation) from the deep dive analysis of the 5 repos (agents/, openclaw-ai-polymarket-trading-bot/, poly-maker/, Poly-Trader/, Polymarket-BTC-15-Minute-Trading-Bot/). Per AGENTS, wiki/ is single source of truth for Hermes; all non-trivial strategy work starts with wiki entry (log + new strategies/ + decisions/ + concepts update). Current baseline (from tool reads): post-Phase 2 (top log entry: WASM hydration/SSR + gated Hermes proposals + tests + deploy + fidelity amend; src has ingester/ + journal/ + paper/ + hermes bin; wiki has concepts/hermes-self-imp up to Phase 2, decisions/ with 1, sources/polymarket-api, no strategies/integrations; project-plan has phases 0-4 with Phase 2 self-imp/Phase 3 gated real; AGENTS emphasizes rust_decimal, journal, paper gate, decisions/ for choices, update log for changes). This transfers proven patterns (e.g. fusion from BTC bot's strategy_brain) to accelerate polytrader's strategy/Hermes while staying paper-only and observable. No persisted full prior plan text found in /tmp/grok* via tools (used prompt's authoritative spec). Baseline confirmed via list_dir/read/grep/memory on polytrader + polymarket-github + AGENTS etc.
+
+**What was done (strict wiki-first: this log prepend is the absolute first edit for the transfer; all other wiki + decisions + index updates + smallest code follow in this increment after)**:
+- Completed full context internalization via tools (reads of AGENTS.md, wiki/log.md top for style, docs/project-plan.md full, wiki/concepts/hermes-self-improvement.md, wiki/index.md, schema.md, sources/polymarket-api.md; list_dir on polytrader/wiki/src/docs + polymarket-github (5 subdirs + deep lists); grep/memory searches for plan/anti-patterns (no plan file on disk, internalized from prompt); initial reads of key 5-repo files for credits (e.g. signal_fusion.py, base_processor.py from BTC-bot, clients from others); src/ingester + journal reads for exact Rust patterns to follow later).
+- This detailed entry prepended to wiki/log.md via search_replace (unique deploy header chunk as anchor; exact style/sections from prior entry; no append, no drift).
+- mkdir -p for wiki/strategies and wiki/integrations (terminal, wiki prep only; no src).
+- (Subsequent in increment, after this prepend result): create the new wiki files using write (integrations/polymarket-apis-and-data-sources.md with API credits to 5 repos; strategies/multi-signal-fusion.md etc with diagrams + per-file credits e.g. "Inspired by core/strategy_brain/fusion_engine/signal_fusion.py and signal_processors/base_processor.py in Polymarket-BTC-15-Minute-Trading-Bot/"); create 3+ decisions/ records (write); update hermes-self-improvement.md , project-plan.md (Phase 2/3 extension with 3.1-3.5 + refs), wiki/index.md (new sections + status) via search_replace (after read); all with explicit credits, paper-only, AGENTS compliance.
+- (After all wiki verified): smallest code (Phase 3.1/3.2 start): one minimal src/strategy/ module or ingester enhancement with 1-2 processor + basic FusionEngine skeleton (exact patterns: Decimal, sqlx for journal writes of signal scores/attribution, heavy risk comments per AGENTS "All trading-related code must be heavily commented with risk implications", no new migs, no behavior change to existing, paper only).
+- Full verification (git status, read_file post-edit, cargo fmt/clippy -- -D warnings, cargo check, make -n k8s-apply if relevant) at end of increment; write detailed summary to /tmp/grok-impl-summary-3e325123.md .
+- Preserved all: no touch to deploy, hermes runtime, UI, paper engine, existing endpoints/JSON/subpath; fmt/clippy reserved for post-code.
+
+**Commands executed (systematic, wiki first, per AGENTS + task + anti-pattern avoidance)**:
+```bash
+# Context reads (all before any edits)
+# list_dir, read_file (AGENTS, wiki/*, docs/project-plan, src/ingester/* journal/* etc), grep, memory_search (multiple for plan/anti-patterns), list on 5 repos + initial read of key .py (signal_fusion.py etc)
+# (see todo + function call history)
+
+# WIKI-FIRST KICKOFF (this prepend is first change)
+# (search_replace on wiki/log.md using unique top header as old_string)
+
+mkdir -p /Users/lindau/codex/polytrader/wiki/strategies /Users/lindau/codex/polytrader/wiki/integrations
+# (then write for new md files, search_replace for updates to existing wiki, in follow-up steps; smallest code after all wiki verified)
+
+# (at end of full increment)
+cargo fmt --all
+cargo clippy -- -D warnings
+git status --porcelain
+# verification reads, make -n etc.
+```
+
+**Key verification outputs (post prepend; full matrix after all wiki+code)**:
+- Post search_replace: read_file on wiki/log.md offset=0 limit=30 confirms new entry at top, followed immediately by the prior deploy entry (no content loss, accurate prepend).
+- mkdir success (no error; dirs now exist for subsequent writes).
+- (Later steps will verify new files content has required credits and no overclaims; git status only shows wiki/ for this phase; no drift; all prior verified behaviors untouched).
+- No regressions to Phase 0-2 (k8s/make/hermes/SSR/JSON etc remain byte-identical as no src/deploy touched yet).
+
+**Design notes captured**: Execution strictly wiki-first and AGENTS-compliant at every step (log prepend before creating any other new wiki pages or code; all new strategy docs in wiki/ per "new concepts/strategies documented in wiki/... before heavy implementation"; credits explicit and specific to avoid unattributed work and per "self-improving system"). Followed past issues briefing to avoid: #1 fidelity (prepend first via search_replace + will git verify + accurate timeline in this entry and final summary; no retroactive claims); no silent fallbacks (docs will note error cases/edges); paper-only emphasized; journal for future signal P&L attribution (no new tables). The synthesized plan transfers real patterns (BTC bot's multi-processor fusion with divergence/spike/sentiment for edge, poly-maker's MM/liquidity utils, openclaw's TS predictor/llmScorer for short mom, Poly-Trader AI search/Kelly-like, agents' executor + gamma) into Rust (Decimal not float, sqlx journal, Hermes closed loop on signal performance) without scope creep. Smallest code will be skeleton only (no full impl, no tests beyond minimal if any, expanded per follow-up). This feeds Hermes (new wiki pages + log entry for reflection on the transfer).
+
+**Status**: WIKI KICKOFF + PREPEND COMPLETE (this entry live as first change for the transfer). Proceeding immediately to create new wiki pages + decisions + updates + (after) smallest code artifact + fmt/clippy + /tmp summary. 0 open issues for this phase; clean handoff for re-review. Detailed full impl summary with snippets/credits/verification will be in /tmp/grok-impl-summary-3e325123.md .
+
+---
+
 ## 2026-05-25 — Deploy + document + commit + push + next phase start (post-Phase 2: WASM hydration + resolution triggers + deeper autonomous + expanded tests [per wiki gaps + project-plan])
 
 **Implemented by**: Grok Build subagent (pragmatic implementer; followed AGENTS.md *strictly* + task: wiki-first (log update before *any* src/Cargo/Docker/Makefile edits even for next phase start), paper-only 100%, smallest viable (deploy used existing make + terminal equiv for poly refresh; next phase start = minimal WASM prep scaffolding in Dockerfile/Makefile + comments only after wiki, no Cargo/src changes yet, no new migs, no behavior change), followed existing patterns exactly (Makefile k8s-apply + hermes ts + set-image + k8s-check-namespace + wait postgres + status; axum probe/app merge + AppState.subpath; no k8s yaml edits; capture via kubectl run curl-test + logs + set env for gated), cargo fmt + clippy -- -D warnings clean at end, updated wiki/log.md (detailed, modeled on Phase 2 entry) as part of change, no new decision files, preserved 100% prior verified (hermes ts automation, subpath /polytrader after SSO 302+base, probes, JSON exact, journaled, make flow, transient crash pod as baseline).
@@ -133,7 +241,7 @@ psql ... -c "SELECT ... FROM journal.reflections ORDER BY created_at DESC LIMIT 
 
 **Implemented by**: Grok Build subagent (pragmatic implementer; followed AGENTS.md *exactly* and task: safety first (paper-only enforced untouched), wiki-first (updated before any src/Cargo change), smallest viable changes only, followed existing code patterns precisely (sqlx queries/INSERT from writer+server, axum route merge+probe separation+AppState+subpath from server.rs, Decimal-only, reqwest usage, tokio loops from main/ingester, pool backoff pattern, journal.reflections schema, Makefile/Docker/k8s unchanged beyond tiny Dockerfile comment, hermes bin standalone), cargo fmt+clippy -- -D warnings clean before declare done, no scope creep (no real trading, no new DB tables/migs, no extra features/polish, no k8s manifest changes), thorough error handling + journaled observability for new paths, updated wiki/log + concepts, no past anti-patterns (e.g. no incomplete tx, robust env/LLM fallback, proper subpath compat preserved).
 
-**Context/Rationale**: Post successful Phase 0 (hermes 1/1 long-lived placeholder ticks, public https://unground-uncraftily-vivienne.ngrok-free.dev/polytrader working post-SSO+rewrite+<base>, internal 200s with paper data, make k8s-apply robust, minimal axum + paper/ingester/journal/DB all live in k8s). Per MISSION/AGENTS/docs/project-plan/wiki/concepts/hermes-self-improvement: deliver functional richer Hermes (real reflection: periodic P&L attribution from DB, LLM synthesis via reqwest OpenAI-comp env-config, store in pre-existing journal.reflections) + real Dioxus UI (skeleton with render+client fetches+signals interactive, hybrid axum for probes/JSON compat). Wiki single source; Dioxus adoption + reflection impl are the Phase 1 deliverable (smallest skeleton, not full agent/UI polish).
+**Context/Rationale**: Post successful Phase 0 (hermes 1/1 long-lived placeholder ticks, public https://unground-uncraftily-vivienne.ngrok-free.dev/polytrader working post-SSO+rewrite+<base>, internal 200s with paper data, make k8s-apply robust, minimal axum + paper/ingester/journal/DB all live in k8s). Per AGENTS/docs/project-plan/wiki/concepts/hermes-self-improvement: deliver functional richer Hermes (real reflection: periodic P&L attribution from DB, LLM synthesis via reqwest OpenAI-comp env-config, store in pre-existing journal.reflections) + real Dioxus UI (skeleton with render+client fetches+signals interactive, hybrid axum for probes/JSON compat). Wiki single source; Dioxus adoption + reflection impl are the Phase 1 deliverable (smallest skeleton, not full agent/UI polish).
 
 **What was done (wiki first, then minimal code)**:
 - Wiki discipline: This detailed entry prepended (before touching Cargo/src). Minor enhancement to wiki/concepts/hermes-self-improvement.md documenting Phase 1 completion of core loops (no new decision file created per "prefer edit existing" + "if major" flexibility; put in concepts/log).
@@ -393,7 +501,7 @@ curl -v https://unground-uncraftily-vivienne.ngrok-free.dev/polytrader || true
 - **5min (300s) ingest, 250ms inter-token sleeps**: Conservative for public unauth endpoints (rate limit unknown but "generous but not unlimited" per sources/). Configurable. One bootstrap market in default allowlist (BTC 150k) — easily extended.
 - **Order model extension (added `outcome` + `decision_context` JSONB)**: Required for binary shares + Hermes future use. Smallest breaking change on internal stubs. Matches DB CHECKs.
 - **Schemas in Postgres + qualified names**: Followed wiki/schema.md domains. No timescaledb yet. Migrations via sqlx (no separate binary).
-- **No real SDK, no auth path, zero real order code**: Enforced in config load, comments, paper-only clients, startup asserts. Matches MISSION/AGENTS non-negotiable.
+- **No real SDK, no auth path, zero real order code**: Enforced in config load, comments, paper-only clients, startup asserts. Matches AGENTS non-negotiable.
 - **Decimal everywhere, rust_decimal_macros**: As mandated. All prices/sizes/fees/slippage use Decimal (from_str on book strings, arithmetic, bind to NUMERIC).
 - **Journal on every significant action**: submit, fill, snapshot, ingest tick — all traced + written.
 
@@ -458,7 +566,7 @@ make run   # with DATABASE_URL
 ## 2026-05-25 — Bootstrap & Initial Planning
 
 **Actions**:
-- Read MISSION file.
+- Research Polymarket APIs, SDKs, and simulation constraints (as originally scoped in early planning).
 - Performed deep research on Polymarket API, official Rust SDK (v2), authentication, and **confirmed absence of any official paper trading / sandbox**.
 - Created initial project skeleton:
   - README.md

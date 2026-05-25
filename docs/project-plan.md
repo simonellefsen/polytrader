@@ -8,7 +8,7 @@
 
 Automate participation in Polymarket prediction markets using a Rust/Dioxus 24/7 agentic system with strong self-improvement loops (Hermes) and an LLM-consumable wiki. Prioritize safety via realistic paper trading before any real capital.
 
-See [MISSION](../MISSION) and [wiki/index.md](../wiki/index.md).
+See [wiki/index.md](../wiki/index.md) and [AGENTS.md](../AGENTS.md).
 
 ## Key Research Findings (Polymarket)
 
@@ -127,7 +127,7 @@ Decisions can be:
 
 ### Phase 0: Bootstrap & Foundations (Current)
 
-- [x] Read MISSION, research Polymarket (API, SDK, simulation reality).
+- [x] Research Polymarket (API, SDK, simulation reality).
 - [ ] Project skeleton: README, AGENTS.md, wiki/ structure, docs/plan.
 - [ ] Basic Rust Cargo workspace or single crate with Dioxus template (`dx new` or manual).
 - [ ] Postgres connection test + basic schema (markets, paper_trades).
@@ -164,6 +164,8 @@ Decisions can be:
 - Observability, alerts (email/webhook on large paper drawdown).
 - Documentation: runbooks complete, schema documented.
 
+**2026-05-25 Transfer Extension (wiki-first, post-Phase 2 WASM/gated)**: Accelerated "Strategy Brain" + Hermes self-improvement via knowledge transfer from 5 Polymarket bots (see wiki/log.md top entry for kickoff details, explicit credits, and anti-pattern avoidance). Added wiki/integrations/, wiki/strategies/ (4 pages), 4 decisions/, extended concepts/hermes-self-improvement.md, and this plan. All before any code. See 3.x sub-phases below (integrated into Phase 2 polish + Phase 3 scaling).
+
 ### Phase 3: Gated Real Trading & Scaling
 
 - Human approval workflows for real orders (or staged rollout: small size → larger).
@@ -173,6 +175,31 @@ Decisions can be:
 - Cloud deployment (real secrets, monitoring).
 - Advanced agent: multi-step reasoning, external data sources (news, on-chain, social), ensemble models.
 - Audit & tax reporting helpers.
+
+**2026-05-25 Transfer Sub-Phases (3.1–3.5, from approved detailed plan; wiki-first execution in progress; paper-only, AGENTS compliant, smallest increments, explicit credits to 5 repos in wiki/*.md)**:
+
+**Operational Goals, Risk Parameters & Cadence (added 2026-05-25)**: Concrete, measurable targets and timing for the small ~$150 paper bankroll. See the new `wiki/strategies/goals-and-operational-cadence.md` (and the companion `fees-tax-latency-and-execution-tiers.md`) for full details. Key points: conservative risk limits, daily/weekly goals focused on process + positive net expectancy, 5-minute deliberate Decision Report layer (primary mode), hourly Hermes reflection. Strongly recommends a **hybrid tiered execution model** because fees + gas + latency make true high-frequency reactive trading extremely difficult at this capital size. All opportunity evaluation must use **net edge after fees**.
+
+This operational layer turns the architecture into a real running system:
+- 5-min layer (3.2): Ingester + FusionEngine produces Decision Reports (ranked opportunities + attribution + risk/goal sizing) logged to journal.
+- Hourly layer (3.3): Hermes reflection attributes P&L/decisions vs goals, produces gated proposals.
+- Risk/goal enforcement lives in 3.4 (paper engine + future UI progress cards).
+
+All wiki-first (new goals page + log entry + this subsection + hermes concepts cross-ref) before any code wiring. Preserves paper-only + all prior verified behavior.
+
+- **3.1 Data/Ingester Enhancements**: WS + reconnection + rate limiting + validation + unified adapter patterns (inspired by Polymarket-BTC-15-Minute-Trading-Bot/core/ingestion/{adapters/unified_adapter.py,managers/websocket_manager.py,rate_limiter.py,validators/data_validator.py} + providers/, poly-maker/poly_data/{polymarket_client.py,websocket_handlers.py}, openclaw/src/connectors/polymarket.ts, Poly-Trader fetch_*.py, agents/agents/polymarket/*). Enhance src/ingester/ (follow exact sqlx/Decimal/tracing patterns from mod.rs + clob_public.rs; no new migs; publish richer events for signals). See wiki/integrations/polymarket-apis-and-data-sources.md + decision 2026-05-25-data-ingester-enhancements-for-3-1.md.
+
+- **3.2 Signal Processors + FusionEngine**: Port multi-signal architecture (BTC bot core/strategy_brain/{fusion_engine/signal_fusion.py + signal_processors/{base_processor.py, spike_detector.py, ...}} + learning_engine.py; openclaw features/predictor/llmScorer; Poly-Trader AI search; poly-maker liquidity; agents executors). Rust: trait SignalProcessor + FusionEngine (Decimal math only, journal attribution, heavy risk comments per AGENTS). Smallest skeleton first (1-2 processors e.g. orderbook + momentum + basic fuse). See wiki/strategies/multi-signal-fusion.md (diagram + port notes) + short-horizon-momentum.md + ai-edge-kelly.md + market-making-liquidity.md + decision 2026-05-25-adopt-multi-signal-fusion-from-btc-bot.md.
+
+- **3.3 Hermes Enhancements + Learning Loop**: Extend reflection (src/bin/hermes.rs) for per-signal P&L attribution (journal queries), metrics per processor, experiment promotion, gated wiki proposals for weights/new processors. Closed-loop from transferred learning_engine + profits patterns. See wiki/concepts/hermes-self-improvement.md (new dedicated section) + decision 2026-05-25-hermes-fusion-learning-loop.md + strategies/*.
+
+- **3.4 Risk/Position/MM + Dashboard**: Liquidity-aware MM simulation + Kelly/position sizing (poly-maker trading_utils/stats + Poly-Trader profits/Kelly-like + openclaw paperTrader/positionStore). Extend paper engine + Dioxus UI (post-Phase 2 SSR) with MM panels, liquidity heatmaps, edge scanner. See wiki/strategies/market-making-liquidity.md + ai-edge-kelly.md + decision 2026-05-25-port-market-making-liquidity-from-poly-maker.md.
+
+- **3.5 Observability/Validation**: Data_validator ports, performance tracking, grafana-like (BTC bot monitoring/grafana/), expanded journal for signal health, backtest harness on snapshots. Ties to all above + existing schema.md / runbooks.
+
+All sub-phases: paper-only (AGENTS #1), wiki-first (this plan amend + log/strategies/decisions/concepts before code), preserve verified (make k8s-apply, hermes ts, subpath/302/base, probes, JSON, fmt/clippy, journal). No scope creep. See wiki/log.md for execution status + /tmp/grok-impl-summary-3e325123.md for details.
+
+(End of 2026-05-25 transfer amendments to roadmap. Living plan; further updates via decisions/ + Hermes proposals.)
 
 ### Phase 4+: Future
 

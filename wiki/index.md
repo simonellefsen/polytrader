@@ -5,17 +5,18 @@
 Start here, then follow links. For full context, also read:
 - [../docs/project-plan.md](../docs/project-plan.md)
 - [../AGENTS.md](../AGENTS.md)
-- [../MISSION](../MISSION)
 
 ## Structure
 
 - **concepts/** — Core ideas, architecture principles, trading mental models.
 - **decisions/** — Important architectural, tech, process, and risk decisions with rationale.
 - **experiments/** — Past/present/future experiments, backtests, ideas under test.
+- **integrations/** — (Added 2026-05-25 transfer) Polymarket APIs, data sources, and patterns from community bots (with explicit credits).
 - **log.md** — Chronological living log of major progress, incidents, learnings.
 - **runbooks/** — Operational procedures (build, deploy, debug, incident response).
 - **schema.md** — Database schema, important data models, invariants.
 - **sources/** — External references, API docs summaries, version pins, data dictionaries.
+- **strategies/** — (Added 2026-05-25 transfer) Detailed strategy docs (multi-signal fusion, MM/liquidity, AI/Kelly edge, short-horizon momentum, **goals & operational cadence**, etc.) with ports, diagrams, credits to 5 repos, and Hermes integration notes.
 
 ## Quick Navigation for Agents
 
@@ -27,9 +28,9 @@ Start here, then follow links. For full context, also read:
 
 ## Current Status (Summary)
 
-**Phase**: Phase 2 Self-Improvement & Polish + post-Phase 2 WASM prep start (per log.md top 2026-05-25 deploy + fidelity amend entries).  
+**Phase**: Phase 2 Self-Improvement & Polish + post-Phase 2 WASM prep start + 2026-05-25 wiki-first kickoff of polymarket-github 5-repo transfer (Phase 3 strategy brain subphases 3.1-3.5; see log.md top entry + new integrations/ + strategies/ + 4 decisions/ + hermes concepts extension + project-plan amend).  
 **Trading mode**: Paper trading only (mandatory until Phase 3 gates passed).  
-**Key open item**: Full WASM hydration + expanded tests + resolution triggers + deeper autonomous (see log.md top for gaps/next phase; Phase 2 SSR/gated + initial tests delivered).
+**Key open item**: Full WASM hydration + expanded tests + resolution triggers + deeper autonomous + transfer code increments (see log.md top for gaps + transfer execution; wiki structure for fusion/MM/AI/momentum/ingester now live with credits).
 
 See [log.md](log.md) for the latest entry and active tasks.
 
