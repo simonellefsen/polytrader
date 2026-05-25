@@ -27,9 +27,9 @@ Start here, then follow links. For full context, also read:
 
 ## Current Status (Summary)
 
-**Phase**: Bootstrap / foundations.  
+**Phase**: Phase 2 Self-Improvement & Polish + post-Phase 2 WASM prep start (per log.md top 2026-05-25 deploy + fidelity amend entries).  
 **Trading mode**: Paper trading only (mandatory until Phase 3 gates passed).  
-**Key open item**: No official Polymarket paper trading; custom high-fidelity simulator required using live public data feeds.
+**Key open item**: Full WASM hydration + expanded tests + resolution triggers + deeper autonomous (see log.md top for gaps/next phase; Phase 2 SSR/gated + initial tests delivered).
 
 See [log.md](log.md) for the latest entry and active tasks.
 
@@ -37,4 +37,4 @@ See [log.md](log.md) for the latest entry and active tasks.
 
 This wiki is **LLM-maintained** with human oversight. Hermes agent is responsible for proposing and (in many cases) applying updates. See the llm-wiki concept page.
 
-Last major refresh: 2026-05 (initial bootstrap).
+Last major refresh: 2026-05-25 (post-Phase 2 deploy + fidelity wiki-git alignment fix round).

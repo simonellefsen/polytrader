@@ -13,6 +13,7 @@ Each decision file should contain:
 ## Index (newest first)
 
 - (Initial bootstrap decisions captured in [../../docs/project-plan.md](../../docs/project-plan.md) and early log entries. Individual decision files will be created as we formalize them.)
+- 2026-05-25 wiki-git fidelity alignment for deploy/next-phase scaffolding (see log.md top "Fidelity amend" + Next phase bullet for the AGENTS process correction round choosing option a: wiki amend first then commit; no new .md file per smallest viable).
 
 Example future entries:
 - `2026-05-25-use-official-rust-sdk-v2.md`

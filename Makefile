@@ -20,7 +20,7 @@ K8S_BASE  := deploy/k8s/base
 .PHONY: help build check test run dev docker-build \
         k8s-check-namespace k8s-apply k8s-deploy k8s-status \
         k8s-logs k8s-port-forward k8s-ngrok-reminder k8s-ngrok-update-policy \
-        k8s-delete clean
+        k8s-delete clean wasm-prep
 
 # Internal guard: ensures we are operating only on the polytrader namespace
 k8s-check-namespace:
@@ -53,6 +53,7 @@ help:
 	@echo "  make k8s-port-forward   - forward localhost:8080 -> service"
 	@echo "  make k8s-ngrok-reminder - show the one-time shared tunnel policy patch instructions"
 	@echo "  make k8s-delete         - delete everything in the base"
+	@echo "  make wasm-prep          - next phase WASM prep scaffolding (echo-only/no-op today; guarded in Dockerfile; see wiki/log.md top for gaps + definition)"
 	@echo ""
 	@echo "  After successful deploy + one-time policy patch by tunnel owner:"
 	@echo "    Public POC URL: https://unground-uncraftily-vivienne.ngrok-free.dev/polytrader"
@@ -155,3 +156,12 @@ k8s-delete: k8s-check-namespace
 clean:
 	cargo clean
 	@echo "Cargo clean done."
+
+# post-Phase 2 smallest start (post-wiki/log 2026-05-25 deploy entry + fidelity amend; WASM hydration prep per gaps: full client + assets + server_fns; see project-plan Phase 3 for gated real).
+# Non-breaking: no impact to docker-build, k8s-apply, hermes ts, existing targets, or any verified Phase 0/1/2 behavior (paper-only, subpath, probes, etc).
+wasm-prep:
+	@echo "WASM hydration prep (next phase after Phase 2 deploy+docs; see wiki/log.md top entry for gaps + definition)."
+	@echo "  - rustup target add wasm32-unknown-unknown (guarded in Dockerfile)"
+	@echo "  - dx build / cargo wasm32 + asset copy + axum static serve (future; server_fns for live rsx data)"
+	@echo "  - Keep k8s-apply/hermes ts/poly flow 100% intact (no changes to docker-build etc)."
+	@echo "Other gaps (resolution-triggered reflections, deeper autonomous local apply, expanded tests w/ wiremock/DB mocks/k8s e2e) defined in wiki for follow-ups."
