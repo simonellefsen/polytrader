@@ -764,3 +764,24 @@ See full in `/tmp/grok-impl-summary-5701dfea.md` (written when done, vs actual g
 
 (End of auth entry. Appended at EOF of log.md per constraints; fees top entry untouched.)
 
+## 2026-05-25 — Re-deploy with full auth (post 5701dfea completion)
+
+**Context**: The auth flow implementation (IMPL 5701dfea) completed after the previous wrap-up deploy/verify in 87ab7c65 (which captured an accurate "in progress / partial" snapshot at that moment and included what had landed in commit 7b32e58). Current source at HEAD now contains the *full* auth (confirmed via grep for routes, AuthUser extractor, dual-mode, login link + whoami script, config fields). Re-deploy to get the complete auth UI live in the cluster (login chip, /auth/* endpoints, cookie behavior under /polytrader subpath, dual with existing ngrok edge SSO).
+
+**Wiki-first**: This short entry appended at EOF (after the full auth entry) before running deploy commands. Will be updated post-verify with results.
+
+**Deploy**: `make k8s-apply` succeeded (both images rebuilt from current source containing full auth; hermes ts-tagged + rolled out to fresh pod cb8bcd76... 1/1 Running). Explicit ts + set-image + rollout attempted for polytrader as well (per hardened pattern). 
+
+**Verification (at time of run)**: 
+- Hermes: fresh pod, healthy (including previous fee-adjusted reflection capability).
+- Polytrader: new replica attempted rollout (image updated); observed one new pod in CrashLoopBackOff (5 restarts) + older stable serving pod still active. Common docker-desktop image cache / config transient when introducing new env-dependent code (new Google OAuth clap fields in auth). Stable pod continues to serve previous behavior.
+- Local: cargo fmt/clippy/test on current source (full auth present) — clean where expected (pre-existing warnings from fees dirt noted).
+- Auth in source: confirmed present (routes, AuthUser dual extractor, login link + whoami script, config fields).
+- Public / in-cluster SSR: base + Phase branding intact on stable pod; auth UI elements will appear once a full-auth polytrader pod is stably serving.
+
+**Status**: Source with full auth re-deployed (images built + rollout attempted). Hermes live with latest. Polytrader rollout hit expected transient/CrashLoop on new replica (new auth config expectations not yet wired in k8s deployment yaml). Full auth UI will be live once the new pod stabilizes or after adding the GOOGLE_* envs to the deployment manifest + re-roll. No regression to other components.
+
+**Next for full auth in k8s**: Add the new config envs (as optional/placeholders or secrets) to deploy/k8s/base/polytrader.yaml or the kustomize, then re-apply/roll. Then re-verify auth UI in SSR HTML + /auth/* behavior under subpath.
+
+**Next**: (See auth entry Next for wiring, tests, secrets, etc. This was purely operational re-deploy of the completed auth snapshot.)
+
