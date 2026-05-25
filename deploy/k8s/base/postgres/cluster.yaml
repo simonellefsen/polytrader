@@ -1,0 +1,55 @@
+# CloudNativePG Cluster for polytrader (2 replicas: primary + hot standby)
+# Requires CloudNativePG operator installed in the cluster (docker-desktop).
+#
+# Install (one-time):
+#   helm repo add cnpg https://cloudnative-pg.github.io/charts
+#   helm upgrade --install cnpg cnpg/cloudnative-pg -n cnpg-system --create-namespace
+#
+# Then apply this (or the kustomize base).
+
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: polytrader-postgres
+  labels:
+    app: postgres
+spec:
+  instances: 2          # primary + 1 replica (as per MISSION)
+  imageName: ghcr.io/cloudnative-pg/postgresql:16.4
+
+  # Storage (docker-desktop uses local; adjust for prod)
+  storage:
+    size: 5Gi
+  walStorage:
+    size: 2Gi
+
+  # Basic auth / superuser (in real: use secrets + bootstrap)
+  bootstrap:
+    initdb:
+      database: polytrader
+      owner: polytrader
+      secret:
+        name: polytrader-postgres-superuser  # create this secret separately
+
+  # Monitoring & backup scaffolding (expand later)
+  monitoring:
+    enablePodMonitor: false   # set true if prometheus operator present
+
+  # PostgreSQL configuration
+  postgresql:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "256MB"
+
+  # Resources (tune for docker-desktop)
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+
+  # Affinity / anti-affinity for replicas (simple for single-node docker-desktop)
+  affinity:
+    enablePodAntiAffinity: false

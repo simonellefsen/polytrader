@@ -1,0 +1,93 @@
+# Hermes self-improvement / reflection agent deployment.
+# Separate from main trader for independent lifecycle and safety.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes
+  labels:
+    app: hermes
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: hermes
+  template:
+    metadata:
+      labels:
+        app: hermes
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        runAsGroup: 10000
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+
+      initContainers:
+        # Wait for Postgres before starting (critical for CNPG)
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until pg_isready -h polytrader-postgres-rw.polytrader.svc.cluster.local -p 5432 -U polytrader; do
+                echo "Waiting for Postgres..."
+                sleep 3
+              done
+              echo "Postgres ready for Hermes."
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+
+      containers:
+        - name: hermes
+          image: hermes:local
+          imagePullPolicy: IfNotPresent
+          # Explicit command ensures tini + binary regardless of stale image ENTRYPOINT/CMD metadata.
+          # Combined with Makefile timestamp tagging + kubectl set-image on every deploy, this
+          # guarantees the fresh long-lived binary from src/bin/hermes.rs is always used.
+          command:
+            - /usr/bin/tini
+            - --
+            - /app/hermes
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: polytrader-postgres-app
+                  key: uri
+            - name: RUST_LOG
+              value: "info,hermes=debug"
+            # Phase 2: set HERMES_AUTONOMOUS_WIKI_PROPOSALS=lowrisk (via secret or env override) to enable
+            # the gated autonomous low-risk wiki proposal behavior (see src/bin/hermes.rs). Default off for safety.
+            # No manifest change required; opt-in per AGENTS "human review for high-impact" + smallest viable.
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10000
+            seccompProfile:
+              type: RuntimeDefault
+          # The hermes binary runs the richer Phase 1 reflection loop (see src/bin/hermes.rs: real P&L/Decimal attribution,
+          # conditional LLM via reqwest, journal.reflections storage, wiki proposals). Long-lived per design.

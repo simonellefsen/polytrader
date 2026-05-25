@@ -1,0 +1,35 @@
+# Rust
+/target/
+**/*.rs.bk
+# Cargo.lock is committed for application binaries (reproducible deploys)
+
+# Dioxus / web
+dist/
+.wasm-cache/
+
+# Env & secrets (never commit)
+.env
+.env.*
+*.pem
+*key*.json
+wallet*.json
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+
+# Project specific
+logs/
+data/
+minio-data/
+*.db
+*.sqlite
+
+# k8s rendered / secrets
+deploy/k8s/**/overlays/*/secrets/
+deploy/k8s/**/*.local.yaml

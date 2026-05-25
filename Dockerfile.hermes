@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+# Hermes self-improvement agent (separate binary)
+
+FROM rust:1.88-bookworm AS builder
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock* ./
+# Dummy to cache deps
+RUN mkdir -p src && echo 'fn main(){}' > src/main.rs
+RUN cargo build --release || true
+
+COPY . .
+# Build the real hermes binary (src/bin/hermes.rs)
+RUN cargo build --release --bin hermes
+
+# Final hermes runtime image
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 10002 hermes
+
+COPY --from=builder /app/target/release/hermes /app/hermes
+
+USER hermes
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/app/hermes"]

@@ -1,0 +1,59 @@
+[package]
+name = "polytrader"
+version = "0.1.0"
+edition = "2021"
+authors = ["simonellefsen"]
+description = "Autonomous Polymarket trading agent (paper first) with Dioxus UI and Hermes self-improvement"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/simonellefsen/polytrader"
+readme = "README.md"
+
+[dependencies]
+# Async & runtime
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Web / future UI (Dioxus skeleton source introduced Phase 1 per plan + AGENTS + Cargo placeholder comment; fullstack features for future hydration.
+# Runtime: manual axum HTML mirror of src/ui/app.rs rsx (smallest, preserves Phase 0 probes/JSON/subpath fidelity exactly; no router/SSR bloat yet).
+dioxus = { version = "0.7", features = ["fullstack", "web", "server"] }
+# dioxus-ssr for real SSR render of App rsx in Phase 2 hydration (smallest addition to enable rsx as rendered source; features already pulled related crates).
+dioxus-ssr = { version = "0.7", default-features = false }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "rust_decimal", "migrate"] }
+
+# Finance & numbers (never use f64 for money)
+rust_decimal = { version = "1", features = ["serde", "maths"] }
+rust_decimal_macros = "1"
+
+# HTTP & Polymarket (public reads + later SDK)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Minimal HTTP server for dashboard (Phase 0; full Dioxus later)
+axum = { version = "0.7", features = ["macros"] }
+tower-http = { version = "0.5", features = ["trace"] }
+
+# Ethereum / signing (for future real SDK + L1 auth)
+# alloy will come transitively via polymarket_client_sdk_v2 when added
+
+# Utils
+anyhow = "1"
+thiserror = "1"
+dotenvy = "0.15"
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[bin]]
+name = "polytrader"
+path = "src/main.rs"
+
+[[bin]]
+name = "hermes"
+path = "src/bin/hermes.rs"

@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: polytrader
+
+resources:
+  - namespace.yaml
+  - secrets.yaml
+  - postgres/cluster.yaml
+  - polytrader.yaml
+  - hermes.yaml
+  # ngrok shared-tunnel wiring (internal AgentEndpoint only; see ngrok/polytrader-agentendpoint.yaml comments for one-time policy patch + discovery)
+  - ngrok/polytrader-agentendpoint.yaml
+
+# Common labels, images (to be overridden in overlays), etc.
+commonLabels:
+  app.kubernetes.io/part-of: polytrader

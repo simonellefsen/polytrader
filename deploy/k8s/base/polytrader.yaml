@@ -1,0 +1,98 @@
+# Main polytrader deployment (Rust/Dioxus binary + background loops)
+# Paper mode only until Phase 3.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: polytrader
+  labels:
+    app: polytrader
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: polytrader
+  template:
+    metadata:
+      labels:
+        app: polytrader
+    spec:
+      containers:
+        - name: polytrader
+          image: polytrader:local   # override in overlays or via kustomize image transformer
+          imagePullPolicy: IfNotPresent
+          # Run directly. Tini (in the image) handles signal forwarding properly.
+          # The Rust binary is responsible for staying alive (axum server + proper shutdown).
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: POLYTRADER_MODE
+              value: "paper"
+            - name: RUST_LOG
+              value: "info,polytrader=debug"
+            # Extra visibility for container debugging
+            - name: RUST_BACKTRACE
+              value: "1"
+            # DATABASE_URL can be provided directly or via mounted secret file (best practice)
+            - name: DATABASE_URL_FILE
+              value: /etc/secrets/postgres-app/uri
+            # Subpath when exposed via the shared ngrok tunnel
+            - name: SUBPATH_PREFIX
+              value: "/polytrader"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          # Readiness/Liveness probes for the axum HTTP server (Phase 0 dashboard).
+          # Uses the existing /health endpoint (returns 200 + JSON {"status":"ok"}).
+          # POC values: conservative enough for docker-desktop / low traffic; adjust in overlays for prod.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: postgres-app-secret
+              mountPath: /etc/secrets/postgres-app
+              readOnly: true
+
+      volumes:
+        - name: postgres-app-secret
+          secret:
+            secretName: polytrader-postgres-app
+            items:
+              - key: uri
+                path: uri
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: polytrader
+  labels:
+    app: polytrader
+spec:
+  selector:
+    app: polytrader
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP

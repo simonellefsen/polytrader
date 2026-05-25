@@ -1,0 +1,162 @@
+# Ngrok Operator integration for shared tunnel path routing (POC)
+#
+# Purpose: Make the polytrader web UI (currently the axum dashboard serving
+# health, /markets, /paper/portfolio, and HTML banner at /) reachable at the
+# public URL:
+#   https://unground-uncraftily-vivienne.ngrok-free.dev/polytrader
+# (and /polytrader/* for sub-paths).
+#
+# Context:
+# - The cluster uses the ngrok-operator (in ngrok-operator ns) with a shared
+#   public HTTPS tunnel/endpoint protected by Google SSO at the ngrok edge.
+# - Other projects (e.g. danske-spil) are exposed under subpaths on the *same*
+#   tunnel, e.g. /danske-spil serves their web-ui.
+# - The public endpoint + domain reservation + OAuth policy live in saxo-rust ns.
+# - Path routing + forwarding is implemented via NgrokTrafficPolicy (see below).
+#
+# Discovery commands that revealed the exact mechanism (run these to inspect):
+#   kubectl get crd | grep -i ngrok
+#   kubectl get ingress --all-namespaces
+#   kubectl get ingressclass
+#   kubectl get agentendpoints,ngroktrafficpolicies,domains --all-namespaces
+#   kubectl get agentendpoints -n danske-spil -o wide
+#   kubectl get agentendpoints -n saxo-rust daytrader-frontend -o yaml
+#   kubectl get agentendpoints -n danske-spil danske-spil-gambler-internal -o yaml
+#   kubectl get ngroktrafficpolicies -n saxo-rust daytrader-oauth -o yaml
+#
+# Exact pattern used by danske-spil (and saxo-daytrader-internal):
+# - Each participating project/namespace creates its own *internal* AgentEndpoint
+#   (bindings: ["internal"]) that points to its ClusterIP Service.
+# - This creates a stable internal virtual hostname (e.g. danske-spil-gambler.internal)
+#   that the central traffic policy can forward to.
+# - No Ingress resources are used for the subpath routing (the operator supports
+#   IngressClass "ngrok" but the active pattern here is AgentEndpoint + TrafficPolicy).
+# - The Service (polytrader:80 -> 8080) and Deployment are untouched.
+#
+# Verbatim relevant excerpt from the live danske-spil template
+# (`kubectl get agentendpoints -n danske-spil danske-spil-gambler-internal -o yaml`):
+# (This makes the "exact match" claim independently auditable from repo artifacts alone.
+#  Note: the operator populates description/metadata/status at runtime; the applied
+#  user manifest only needs the core fields shown below, exactly as we do for polytrader.)
+#
+# spec:
+#   bindings:
+#   - internal
+#   upstream:
+#     protocol: http1
+#     url: http://gambler-api.danske-spil:8080
+#   url: http://danske-spil-gambler.internal:80
+#
+# (Full applied object also includes operator-added fields under metadata/status,
+#  plus the last-applied-configuration annotation containing the original user spec.)
+#
+# ONE-TIME SETUP REQUIRED (this manifest is only half):
+#   After applying the AgentEndpoint below, the owner/admin of the shared tunnel
+#   (typically in saxo-rust) must patch the "daytrader-oauth" NgrokTrafficPolicy
+#   to add a forward+rewrite rule for the /polytrader prefix.
+#
+#   QUICK REFERENCE — Tunnel Owner Action Required (highest-priority handoff step):
+#   - Precise parent: insert as a **new list item** under `spec.policy.on_http_request`
+#     (this is an array of rule objects in the policy; the saxo-daytrader and danske-spil rules
+#     are items in that array).
+#   - The structure must **exactly parallel** the existing saxo-daytrader entry (preferred,
+#     because it includes url-rewrite to strip the /polytrader prefix before it reaches the
+#     polytrader backend — this makes the existing axum routes work without bigger changes).
+#   - Use `kubectl edit` (recommended for safety, avoids clobbering the last-applied annotation) or
+#     careful patch. Example:
+#       kubectl edit ngroktrafficpolicy -n saxo-rust daytrader-oauth
+#     (Or: kubectl get ngroktrafficpolicy -n saxo-rust daytrader-oauth -o yaml > /tmp/policy.yaml
+#      then edit + kubectl apply -f /tmp/policy.yaml)
+#
+#   RECOMMENDED verbatim copy-paste stanza (correct structure; modeled EXACTLY on the live
+#   saxo-daytrader rule fetched via `kubectl get ngroktrafficpolicies -n saxo-rust daytrader-oauth -o yaml`):
+#
+#     - actions:
+#         - config:
+#             from: /polytrader/?(.*)
+#             to: /$1
+#           type: url-rewrite
+#         - config:
+#             url: http://polytrader.internal:80
+#           type: forward-internal
+#       expressions:
+#       - req.url.path.startsWith("/polytrader")
+#
+#   (This is the full usable version: rewrite strips the prefix so /polytrader/* hits the
+#   clean axum routes /health, /markets, /, etc. Combined with the <base href="/polytrader/">
+#   added to the dashboard HTML in this POC operationalization, all navigation links on the
+#   banner page resolve correctly to /polytrader/... subpaths, which the policy then rewrites.)
+#
+#   For reference, the simpler (no-rewrite) danske-spil style was:
+#     - actions:
+#       - config:
+#           url: http://danske-spil-gambler.internal:80
+#         type: forward-internal
+#       expressions:
+#       - req.url.path.startsWith("/danske-spil")
+#
+#   The Google SSO + allowlist is already enforced by the policy for the whole tunnel.
+#   No auth changes needed in polytrader.
+#   Note: the email allowlist inside the existing Google OAuth rule must permit the
+#   users who will access the /polytrader path; coordinate with the saxo-rust tunnel
+#   owner on allowlist updates if needed before first public exposure.
+#
+# How to apply (as part of normal deploy):
+#   make k8s-apply
+#   or
+#   kubectl apply -k deploy/k8s/base
+#
+#   This kustomize base sets namespace: polytrader, so the AgentEndpoint lands
+#   ONLY in the polytrader namespace.
+#
+#   SAFETY RULE (strictly enforced in tooling):
+#   - We NEVER run broad kubectl commands that could affect other namespaces.
+#   - The only exception is the one-time ngrok policy patch (see k8s-ngrok-update-policy target).
+#   - Always prefer `make k8s-*` targets.
+#
+# RBAC / Access Prerequisites (for first public exposure):
+# - The ngrok-operator (running in its own namespace) must already have
+#   permissions (get/list/watch/update on agentendpoints CRD + related) scoped
+#   to the polytrader namespace (it does for danske-spil today; confirm via
+#   `kubectl get clusterrole,role -n ngrok-operator -o yaml | grep -i agentendpoint` or events).
+# - The email allowlist in daytrader-oauth must include polytrader users (see note above).
+#
+# Verification (once the traffic policy rule is also present):
+#   # Direct (after SSO in browser):
+#   https://unground-uncraftily-vivienne.ngrok-free.dev/polytrader
+#
+#   # Or with token/cookie if scripting (curl example; real usage via browser):
+#   curl -v https://unground-uncraftily-vivienne.ngrok-free.dev/polytrader
+#   # Should return the polytrader HTML safety banner (or JSON from /health etc.)
+#
+#   Inside cluster (for debugging the internal endpoint):
+#   kubectl get agentendpoints -n polytrader polytrader-internal
+#   # Then use a debug pod or exec to curl the internal virtual host if needed.
+#
+# Design notes / why this structure:
+# - Matches the *exact* minimal pattern used by danske-spil (only an internal
+#   AgentEndpoint in their own namespace + k8s manifests).
+# - Keeps everything in the existing kustomize base tree so one `apply -k` enables it.
+# - Minimal Rust change (only <base href="/polytrader/"> in the Phase 0 dashboard HTML
+#   to make root links work under subpath when paired with policy rewrite); zero changes
+#   to trading engine, journal, ingester, paper logic, Deployment, Service, or other components.
+# - Docs updated in wiki/log.md + new runbook as required by AGENTS.md (self-documenting, auditable).
+# - POC only: no TLS secrets, rate limits, production Ingress, etc.
+#
+# Status: POC operationalized end-to-end. Probes added; deploy flow + runbook updated;
+# public /polytrader URL (with rewrite+base) is fully usable after the one-time policy patch.
+#
+
+# v1alpha1 per current ngrok-operator in the target cluster (re-verify on operator
+# upgrades or if the CRD evolves; confirmed via `kubectl get crd` during discovery).
+apiVersion: ngrok.k8s.ngrok.com/v1alpha1
+kind: AgentEndpoint
+metadata:
+  name: polytrader-internal
+spec:
+  bindings:
+    - internal
+  upstream:
+    protocol: http1
+    url: http://polytrader.polytrader:80
+  url: http://polytrader.internal:80
