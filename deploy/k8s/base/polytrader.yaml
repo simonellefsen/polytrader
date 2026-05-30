@@ -17,12 +17,20 @@ spec:
       labels:
         app: polytrader
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: polytrader
-          image: polytrader:local   # override in overlays or via kustomize image transformer
+          image: polytrader:local   # overridden at deploy time via unique TS tag + explicit set-image (rust_daytrader pattern)
           imagePullPolicy: IfNotPresent
-          # Run directly. Tini (in the image) handles signal forwarding properly.
-          # The Rust binary is responsible for staying alive (axum server + proper shutdown).
+          # Hardened scratch image: direct binary is PID1. Our shutdown_signal() + tokio::signal
+          # handles SIGTERM/SIGINT for graceful axum shutdown (no tini needed).
           ports:
             - name: http
               containerPort: 8080
@@ -41,6 +49,20 @@ spec:
             # Subpath when exposed via the shared ngrok tunnel
             - name: SUBPATH_PREFIX
               value: "/polytrader"
+            # New auth config (from 2026-05-25 auth flow). Empty = disabled (paper mode safe).
+            - name: GOOGLE_CLIENT_ID
+              value: ""
+            - name: GOOGLE_CLIENT_SECRET
+              value: ""
+            - name: GOOGLE_REDIRECT_URI
+              value: ""
+            - name: ALLOWED_EMAILS
+              value: ""
+            - name: AUTH_COOKIE_SECURE
+              value: "false"
+            # L2 auth private key (injected via secret file for security)
+            - name: POLYMARKET_PRIVATE_KEY_FILE
+              value: /etc/secrets/l2-auth/private-key
           resources:
             requests:
               memory: "128Mi"
@@ -48,6 +70,17 @@ spec:
             limits:
               memory: "512Mi"
               cpu: "500m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
           # Readiness/Liveness probes for the axum HTTP server (Phase 0 dashboard).
           # Uses the existing /health endpoint (returns 200 + JSON {"status":"ok"}).
           # POC values: conservative enough for docker-desktop / low traffic; adjust in overlays for prod.
@@ -55,9 +88,9 @@ spec:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 5
+            initialDelaySeconds: 12   # give auth config + static init a bit more time on fresh pods
             periodSeconds: 10
-            timeoutSeconds: 3
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
@@ -71,6 +104,11 @@ spec:
             - name: postgres-app-secret
               mountPath: /etc/secrets/postgres-app
               readOnly: true
+            - name: l2-auth-secret
+              mountPath: /etc/secrets/l2-auth
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
 
       volumes:
         - name: postgres-app-secret
@@ -79,6 +117,15 @@ spec:
             items:
               - key: uri
                 path: uri
+        - name: l2-auth-secret
+          secret:
+            secretName: polytrader-l2-auth
+            optional: true
+            items:
+              - key: private-key
+                path: private-key
+        - name: tmp
+          emptyDir: {}
 
 ---
 apiVersion: v1

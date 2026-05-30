@@ -49,7 +49,7 @@ See also: `deploy/k8s/base/ngrok/polytrader-agentendpoint.yaml` (the authoritati
    kubectl describe agentendpoints -n polytrader polytrader-internal
    ```
 
-5. **ONE-TIME manual step** — give this exact instruction + stanza to the saxo-rust tunnel owner (or perform if you are the owner):
+5. **ONE-TIME manual step** — add this route in the shared gateway repo (`../shared-ngrok-gateway`) and apply it from there. For emergency live repair, the equivalent manual edit is:
    ```bash
    kubectl edit ngroktrafficpolicy -n saxo-rust daytrader-oauth
    ```
@@ -58,23 +58,19 @@ See also: `deploy/k8s/base/ngrok/polytrader-agentendpoint.yaml` (the authoritati
    ```yaml
    - actions:
      - config:
-         from: /polytrader/?(.*)
-         to: /$1
-       type: url-rewrite
-     - config:
          url: http://polytrader.internal:80
        type: forward-internal
      expressions:
      - req.url.path.startsWith("/polytrader")
    ```
 
-   This is the *recommended usable version* (includes rewrite to strip the prefix, modeled exactly on the live `/saxo-daytrader` rule in the same policy). The accompanying `<base href="/polytrader/">` in the dashboard HTML ensures that the page's navigation links (`/markets`, etc.) resolve to subpaths that the policy will match and rewrite.
+   This is the recommended version after the 2026-05-26 regression fix. The app serves both clean root paths and raw `/polytrader/*` paths, so the edge can forward the original public path without relying on `url-rewrite` after SSO. The accompanying `<base href="/polytrader/">` in the dashboard HTML still ensures browser links resolve under the shared public prefix.
 
    Save and exit the editor. The operator will reconcile quickly.
 
 6. (Optional) Confirm the policy now contains the rule (owner side):
    ```bash
-   kubectl get ngroktrafficpolicy -n saxo-rust daytrader-oauth -o yaml | grep -A 20 -E 'polytrader|url-rewrite'
+   kubectl get ngroktrafficpolicy -n saxo-rust daytrader-oauth -o yaml | grep -A 20 polytrader
    ```
 
 ## Verification (end-to-end public URL)
@@ -95,7 +91,7 @@ See also: `deploy/k8s/base/ngrok/polytrader-agentendpoint.yaml` (the authoritati
     - https://unground-uncraftily-vivienne.ngrok-free.dev/polytrader/markets  (JSON list)
     - https://unground-uncraftily-vivienne.ngrok-free.dev/polytrader/paper/portfolio
     - https://unground-uncraftily-vivienne.ngrok-free.dev/polytrader/health  (JSON)
-  - The root-relative links on the banner now correctly target the subpath thanks to the `<base>` + rewrite combination.
+  - The root-relative links on the banner correctly target the subpath thanks to the `<base>` tag and raw-prefix `/polytrader` routing.
 
 - curl example (note: full SSO/cookies usually required; useful for header inspection):
   ```bash
@@ -109,6 +105,36 @@ See also: `deploy/k8s/base/ngrok/polytrader-agentendpoint.yaml` (the authoritati
 
 See `wiki/runbooks/k8s-diagnostics.md` for more debugging commands.
 
+## Troubleshooting: public `/polytrader` returns `{"error":"not found"}`
+
+If port-forwarding `svc/polytrader` works but the public shared tunnel returns `{"error":"not found"}`, first check the shared ngrok policy rather than rebuilding the app. This usually means the request is reaching the shared endpoint but the live `saxo-rust/daytrader-oauth` `NgrokTrafficPolicy` no longer has the `/polytrader` forward rule.
+
+```bash
+kubectl get ngroktrafficpolicy -n saxo-rust daytrader-oauth -o yaml | grep -A 6 polytrader.internal
+kubectl get agentendpoint -n polytrader polytrader-internal -o wide
+```
+
+Expected policy rule:
+
+```yaml
+- actions:
+  - config:
+      url: http://polytrader.internal:80
+    type: forward-internal
+  expressions:
+  - req.url.path.startsWith("/polytrader")
+```
+
+If the rule is missing, run the guarded target:
+
+```bash
+make k8s-ngrok-update-policy
+```
+
+If the rule disappears after a later deploy, check the shared policy source in `../shared-ngrok-gateway/deploy/k8s/base/gateway.template.yaml`; it must include the same `/polytrader` forward rule.
+
+An unauthenticated curl to the public URL should generally return the ngrok OAuth redirect (`302`). Validate the actual app through an authenticated browser session, or test `/polytrader/health` after SSO.
+
 ## In-app Google OAuth Authentication Flow (dual with edge SSO)
 
 **Added 2026-05-25 (IMPL_ID 5701dfea)**. See full details + commands in the top-level append to `wiki/log.md` ("Next Phase: Auth Flow").
@@ -120,7 +146,7 @@ The web UI (Dioxus SSR + Axum) now includes a minimal self-contained Google OAut
 - **Cookie details** (critical for subpath): HttpOnly, SameSite=Lax (or Strict), Path= normalized SUBPATH_PREFIX or "/", Secure flag configurable (default false for paper dev http; true for prod https). No signing (in-mem uuid lookup); restart clears sessions (acceptable for paper $150).
 - **Config (clap + env, no main change needed)**: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI (MUST be the full public URL e.g. https://.../polytrader/auth/callback for subpath deploys), ALLOWED_EMAILS (comma sep or empty=any in paper mode), AUTH_COOKIE_SECURE.
 - **UI integration (smallest)**: "Login with Google" button / "Signed in as you@example.com | Logout" chip in rsx top area (relative links under <base>); existing client <script> extended to fetch /auth/whoami on load and populate placeholder (fits live fetch pattern exactly; no App props change, no SSR string post-proc for user data).
-- **Preservation**: 100% of prior (SSR rsx source + <base> injection, relative JS fetches, /health public always, JSON endpoints, k8s probes, subpath rewrite compat, paper engine/ingester/hermes/strategy untouched, no Cargo deps added, no migs, fmt/clippy clean).
+- **Preservation**: 100% of prior (SSR rsx source + <base> injection, relative JS fetches, /health public always, JSON endpoints, k8s probes, subpath routing compat, paper engine/ingester/hermes/strategy untouched, no Cargo deps added, no migs, fmt/clippy clean).
 - **Security notes (AGENTS/RISK)**: state param prevents CSRF, no secrets logged or in HTML, redirect_uri from config (intent whitelist), manual parse only, dual trust model documented, paper-only (user identity for future personalization of $150 bankroll/journal, not real funds). See heavy comments in src/server.rs + config.rs + ui/app.rs.
 
 This fulfills the "next phase" request for auth flow *within the web UI* so it can stand alone while coexisting with edge protection.
@@ -135,7 +161,7 @@ Update this runbook (and the AgentEndpoint comments) when the pattern evolves or
 
 ## When to page a human
 - AgentEndpoint stays "not ready" or shows errors after apply (check RBAC for ngrok-operator in polytrader ns; events: `kubectl get events -n polytrader --sort-by=.lastTimestamp`).
-- Public URL returns 404/5xx even after correct policy patch + SSO (verify rewrite rule syntax exactly matches the saxo-daytrader example; check polytrader pod logs and that /health responds 200 inside cluster).
+- Public URL returns 404/5xx even after correct policy patch + SSO (verify the raw-prefix forward rule points to `http://polytrader.internal:80`; check polytrader pod logs and that /health responds 200 inside cluster).
 - Email allowlist blocks access (SSO succeeds but custom-response 403 from policy).
 - Probes cause repeated restarts (tune thresholds in an overlay; server may be slow to bind DB).
 - Any change to the shared tunnel structure (new CRD version, policy refactor) — re-discover with the commands listed in the AgentEndpoint yaml comments.

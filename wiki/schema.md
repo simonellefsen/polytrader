@@ -68,6 +68,30 @@
 - hermes_version, llm_model, prompt_hash
 - created_at
 
+### journal.events
+- id
+- event_type, source, severity
+- payload (jsonb)
+- created_at
+
+Append-only audit events for diagnostics and safety gates that are not paper orders/fills or Hermes reflections. Current CLOB uses:
+- `clob_order_intent_dry_run`: hypothetical order intent validation report.
+- `clob_order_intent_review`: paper-only operator review of a dry-run event (`would_approve`, `would_reject`, or `needs_rework`).
+- `clob_collateral_readiness`: read-only collateral/allowance readiness snapshot for the active L2 wallet. It records balance/allowance blocker state, operator actions, `request_sent=false`, and no order POST calls so Hermes can track whether the external wallet blockers have changed.
+- `clob_market_metadata_validation`: read-only CLOB market metadata validation for a token. It records tick-size and negative-risk lookup results, price tick/range validation, `request_sent=false`, and no order POST calls.
+- `clob_order_post_request_dry_run`: redacted, non-submitting preview of the would-be CLOB `POST /order` request. It records no full signatures, no L2 HMACs, no private keys, and no API secrets. Hermes consumes these events for safety-loop reflections.
+- `clob_order_human_approval`: short-lived, journaled human approval workflow event keyed to a deterministic order-intent subject hash. It can validate the submit facade but is not a live-trading approval.
+- `clob_order_submit_facade`: fail-closed real-order submission facade evaluation. It records gate status for human approval, fresh collateral-readiness checkpoint, kill switch, per-order exposure, total exposure, daily loss, paper mode, and explicit config unlocks, but must always record `request_sent=false` while real trading is disabled.
+- `clob_order_submit_reconciliation`: submit-facade reconciliation audit event linked to the facade event. It records the submit/reject decision, `reconciliation_status='reconciled_no_send'`, `request_sent=false`, no exchange order id, and expected exchange state `no_order_created`.
+- `clob_real_trading_unlock_status`: read-only report for explicit real-trading unlock state. It records env/config gate status, paper-mode state, kill-switch state, live-sender absence, `request_sent=false`, and no order POST calls.
+- `clob_live_sender_design_readiness`: read-only design-readiness package for the deliberately absent live sender. It records live-sender implementation blockers, final-review audit evidence, explicit unlock state, kill-switch state, paper-mode state, `request_sent=false`, and no order POST calls.
+- `clob_live_sender_design_review`: read-only ADR-style design contract for a future live sender. It records required sender boundaries, pre-submit guards, prohibited shortcuts, design-review evidence, `implementation_permitted=false`, `request_sent=false`, and no order POST calls.
+- `clob_live_sender_boundary_status`: read-only status for the code-level live-sender trait boundary. It records that `LiveOrderSender` exists, the only implementation is `FailClosedLiveOrderSender`, `network_sender_present=false`, `accepted_for_network_dispatch=false`, `request_sent=false`, and no order POST calls.
+- `clob_final_review_readiness`: read-only aggregate package over latest journaled CLOB gate evidence. It records whether final human review is still blocked by collateral, allowance, unlock, kill-switch, paper mode, live-sender absence, or missing no-send reconciliation evidence.
+- `clob_final_review_decision`: audit-only operator decision linked to a `clob_final_review_readiness` event. It records `acknowledge_blocked`, `reject_live_trading`, or `needs_rework` decisions with `approved_for_real_orders=false`, `request_sent=false`, and no order POST calls.
+
+Payloads must not contain secrets, raw private keys, or L2 API secrets. Review events are not approvals for real trading; they are analysis/audit records only.
+
 ### journal.experiments
 - id
 - hypothesis (text)

@@ -1,0 +1,19 @@
+# .dockerignore for polytrader (security hygiene for L2 key + build context)
+# Addresses high-severity review finding (build context exposure of .env* containing POLYMARKET_PRIVATE_KEY during docker build COPY . .)
+# Standard for secret hygiene in Dockerfile flows with k8s-set-l2-key (which relies on .env.local on build host).
+
+.env*
+.env.local
+.env.*.local
+target/
+**/.git
+**/.gitattributes
+**/.gitignore
+*.pem
+wallet*.json
+**/.env*
+**/*.key
+**/*.secret
+**/secrets/
+# Keep Cargo.lock etc for reproducible builds; exclude only sensitive
+# Note: .dockerignore does not affect k8s secret mounts (runtime only) or git (already ignored)

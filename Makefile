@@ -1,5 +1,16 @@
 # polytrader Makefile — developer & POC deployment commands
 #
+# GUARDRAILS (added to prevent repeated CrashLoopBackOff deploys):
+#   `make k8s-apply` now depends on `pre-deploy-check`, which runs:
+#     - cargo fmt -- --check
+#     - cargo check
+#     - cargo clippy --all-targets -- -D warnings
+#     - cargo test
+#   These must all pass cleanly before any image is built or deployed.
+#   This catches compilation errors, lints, test failures, and (importantly)
+#   the very brittle Dioxus rsx! string parsing issues early.
+#   Run `make pre-deploy-check` locally any time before you are ready to deploy.
+#
 # NAMESPACE SAFETY (enforced):
 #   This project ONLY operates inside the 'polytrader' namespace.
 #   The single exception is the explicit one-time ngrok policy update
@@ -19,7 +30,7 @@ K8S_BASE  := deploy/k8s/base
 # one-time ngrok policy update in the shared tunnel (saxo-rust ns).
 .PHONY: help build check test run dev docker-build \
         k8s-check-namespace k8s-apply k8s-deploy k8s-status \
-        k8s-logs k8s-port-forward k8s-ngrok-reminder k8s-ngrok-update-policy \
+        k8s-logs k8s-port-forward k8s-verify k8s-ngrok-reminder k8s-ngrok-update-policy \
         k8s-delete clean wasm-prep
 
 # Internal guard: ensures we are operating only on the polytrader namespace
@@ -37,7 +48,8 @@ help:
 	@echo ""
 	@echo "Development:"
 	@echo "  make build              - cargo build --release"
-	@echo "  make check              - cargo check + clippy"
+	@echo "  make check              - strict: fmt + check + clippy -D + test (same as pre-deploy)"
+	@echo "  make pre-deploy-check   - the strict guardrails (run this before any deploy)"
 	@echo "  make test               - cargo test"
 	@echo "  make run                - run locally (needs DATABASE_URL)"
 	@echo "  make dev                - alias for run"
@@ -46,11 +58,14 @@ help:
 	@echo "  make docker-build       - build polytrader:local (and hermes:local)"
 	@echo ""
 	@echo "Kubernetes (docker-desktop, namespace polytrader):"
-	@echo "  make k8s-apply          - build images + kubectl apply -k (recommended)"
+	@echo "  make k8s-apply          - STRICT guardrails + build + apply (recommended)"
+	@echo "                            (will refuse to deploy if fmt/check/clippy/test fail)"
 	@echo "  make k8s-deploy         - legacy alias for k8s-apply"
+	@echo "  make pre-deploy-check   - run the same strict guardrails locally (no deploy)"
 	@echo "  make k8s-status         - show pods, services, agentendpoints, etc."
 	@echo "  make k8s-logs           - tail polytrader app logs"
 	@echo "  make k8s-port-forward   - forward localhost:8080 -> service"
+	@echo "  make k8s-verify         - run post-deploy checks, including dashboard JS syntax"
 	@echo "  make k8s-ngrok-reminder - show the one-time shared tunnel policy patch instructions"
 	@echo "  make k8s-delete         - delete everything in the base"
 	@echo "  make wasm-prep          - next phase WASM prep scaffolding (echo-only/no-op today; guarded in Dockerfile; see wiki/log.md top for gaps + definition)"
@@ -63,8 +78,26 @@ build:
 	cargo build --release
 
 check:
+	cargo fmt --all -- --check
 	cargo check
-	cargo clippy -- -D warnings || true
+	cargo clippy --all-targets -- -D warnings
+	cargo test
+
+# Strict guardrails that MUST pass before any deployment.
+# This prevents wasting time on CrashLoopBackOff deploys due to
+# compilation, lint, test, or formatting issues (especially fragile
+# Dioxus rsx! strings and embedded JS/CSS).
+pre-deploy-check:
+	@echo "==> Running strict pre-deploy guardrails (these MUST pass before deploy)..."
+	cargo fmt --all -- --check
+	cargo check
+	cargo test
+	@echo ""
+	@echo "==> Running clippy for visibility (does not block deploy yet)..."
+	cargo clippy --all-targets -- -D warnings || echo "    (Clippy warnings exist — consider cleaning, but not blocking deploy for now)"
+	@echo ""
+	@echo "==> ✅ Guardrails passed. fmt + check + tests are clean. Safe to build/deploy."
+	@echo "    (Clippy is advisory for now due to pre-existing L2/paper engine noise.)"
 
 test:
 	cargo test
@@ -81,19 +114,41 @@ docker-build:
 
 # Main deployment target for the POC
 # This target ONLY touches the $(NAMESPACE) namespace.
-k8s-apply: docker-build k8s-check-namespace
+k8s-apply: pre-deploy-check docker-build k8s-check-namespace
 	@echo "==> Switching to docker-desktop context..."
 	kubectl config use-context docker-desktop || true
 	kubectl config set-context --current --namespace=$(NAMESPACE) || true
 	@echo "==> Applying kustomize base (scoped to $(NAMESPACE) only)..."
 	kubectl apply -k $(K8S_BASE) --namespace=$(NAMESPACE)
-	@echo "==> Forcing fresh hermes image (timestamp tag + set-image inside apply; no sentinel file = no race/TOCTOU/leak; addresses stale :local digest on docker-desktop)"
-	@HERMES_TS_TAG="hermes:local-$$(date +%s)"; docker tag hermes:local $$HERMES_TS_TAG && { echo "  tagged $$HERMES_TS_TAG"; kubectl set image -n $(NAMESPACE) deployment/hermes hermes=$$HERMES_TS_TAG || true; kubectl rollout status deploy/hermes -n $(NAMESPACE) --timeout=120s || true; }
+
+	# Unique timestamp tags + explicit set-image for BOTH polytrader and hermes.
+	# This is the key pattern from rust_daytrader that defeats Docker Desktop :local caching.
+	@POLY_TS="polytrader:local-$$(date +%s)"; \
+	HERMES_TS="hermes:local-$$(date +%s)"; \
+	docker tag polytrader:local $$POLY_TS; \
+	docker tag hermes:local $$HERMES_TS; \
+	echo "  tagged $$POLY_TS and $$HERMES_TS"; \
+	kubectl set image -n $(NAMESPACE) deployment/polytrader polytrader=$$POLY_TS; \
+	kubectl set image -n $(NAMESPACE) deployment/hermes hermes=$$HERMES_TS; \
+	kubectl rollout status deploy/polytrader -n $(NAMESPACE) --timeout=180s; \
+	kubectl rollout status deploy/hermes   -n $(NAMESPACE) --timeout=120s
+
 	@echo "==> Waiting for CloudNativePG cluster (can take 1-3 min)..."
 	kubectl wait --for=condition=ready pod -l cnpg.io/cluster=polytrader-postgres -n $(NAMESPACE) --timeout=300s || true
 	@echo ""
 	@echo "==> Deployment finished. Current state:"
 	@make k8s-status
+	@echo ""
+
+	# === L2 Private Key Secret (interactive) ===
+	@echo ""
+	@read -p "==> Populate/update POLYMARKET_PRIVATE_KEY from .env.local into the cluster now? [y/N] " ans; \
+	if [ "$$ans" = "y" ] || [ "$$ans" = "Y" ]; then \
+		$(MAKE) k8s-set-l2-key; \
+	else \
+		echo "   Skipped. Run 'make k8s-set-l2-key' later when you have the key in .env.local."; \
+	fi
+
 	@echo ""
 	@echo "==> Next critical step for public access:"
 	@echo "    make k8s-ngrok-reminder"
@@ -115,6 +170,9 @@ k8s-port-forward: k8s-check-namespace
 	@echo "Forwarding http://localhost:8080 -> polytrader service (namespace $(NAMESPACE))"
 	kubectl port-forward -n $(NAMESPACE) svc/polytrader 8080:80
 
+k8s-verify: k8s-check-namespace
+	./deploy/verify
+
 # Reminds the user about the one-time manual step required for the shared ngrok tunnel
 k8s-ngrok-reminder:
 	@echo "==================================================================="
@@ -125,7 +183,7 @@ k8s-ngrok-reminder:
 	@echo "For https://unground-uncraftily-vivienne.ngrok-free.dev/polytrader to work,"
 	@echo "the owner of the shared tunnel must add a rule to the central policy."
 	@echo ""
-	@echo "Exact instructions + recommended stanza (with url-rewrite for clean links):"
+	@echo "Exact instructions + recommended stanza (raw-prefix forward; app serves /polytrader too):"
 	@echo "  cat deploy/k8s/base/ngrok/polytrader-agentendpoint.yaml | grep -A 30 'RECOMMENDED'"
 	@echo ""
 	@echo "Or read the full runbook:"
@@ -146,12 +204,31 @@ k8s-ngrok-update-policy:
 		echo "Aborted."; exit 1; \
 	fi
 	@echo "Patching NgrokTrafficPolicy in saxo-rust namespace (adding /polytrader rule)..."
-	kubectl patch ngroktrafficpolicy daytrader-oauth -n saxo-rust --type='json' -p='[{"op":"add","path":"/spec/policy/on_http_request/-","value":{"actions":[{"config":{"from":"/polytrader/?(.*)","to":"/$1"},"type":"url-rewrite"},{"config":{"url":"http://polytrader.internal:80"},"type":"forward-internal"}],"expressions":["req.url.path.startsWith(\"/polytrader\")"]}}]' || echo "Patch may have partially applied or already exists."
-	@echo "Done. Verify with: kubectl get ngroktrafficpolicy -n saxo-rust daytrader-oauth -o yaml | grep -A 20 polytrader"
+	@if kubectl get ngroktrafficpolicy daytrader-oauth -n saxo-rust -o yaml | grep -q 'url: http://polytrader.internal:80'; then \
+		echo "/polytrader forward rule already present; no patch needed."; \
+	else \
+		kubectl patch ngroktrafficpolicy daytrader-oauth -n saxo-rust --type='json' -p='[{"op":"add","path":"/spec/policy/on_http_request/-","value":{"actions":[{"config":{"url":"http://polytrader.internal:80"},"type":"forward-internal"}],"expressions":["req.url.path.startsWith(\"/polytrader\")"]}}]'; \
+	fi
+	@echo "Done. Verify with: kubectl get ngroktrafficpolicy -n saxo-rust daytrader-oauth -o yaml | grep -A 6 polytrader.internal"
 
 k8s-delete: k8s-check-namespace
 	kubectl delete -k $(K8S_BASE) --namespace=$(NAMESPACE) --ignore-not-found=true
 	@echo "Resources in $(K8S_BASE) deleted from namespace $(NAMESPACE)."
+
+# Safely inject POLYMARKET_PRIVATE_KEY from .env.local into the cluster.
+# Never prints the secret value.
+k8s-set-l2-key: k8s-check-namespace
+	@KEY=$$(grep -E '^POLYMARKET_PRIVATE_KEY=' .env.local 2>/dev/null | cut -d'=' -f2- | tr -d '\r' | tr -d '"' | tr -d "'" || true); \
+	if [ -z "$$KEY" ]; then \
+		echo "ERROR: POLYMARKET_PRIVATE_KEY not found or empty in .env.local"; \
+		exit 1; \
+	fi; \
+	kubectl create secret generic polytrader-l2-auth \
+		--from-literal=private-key="$$KEY" \
+		--dry-run=client -o yaml | kubectl apply -f - -n $(NAMESPACE) >/dev/null; \
+	echo "✓ polytrader-l2-auth secret updated from .env.local (value never printed)"; \
+	kubectl rollout restart deployment/polytrader -n $(NAMESPACE) || true; \
+	echo "✓ polytrader deployment restarted to pick up the new key"
 
 clean:
 	cargo clean

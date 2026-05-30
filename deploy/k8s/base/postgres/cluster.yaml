@@ -42,6 +42,10 @@ spec:
       shared_buffers: "256MB"
 
   # Resources (tune for docker-desktop)
+  stopDelay: 60
+  smartShutdownTimeout: 15
+  primaryUpdateMethod: switchover
+  primaryUpdateStrategy: unsupervised
   resources:
     requests:
       memory: "256Mi"

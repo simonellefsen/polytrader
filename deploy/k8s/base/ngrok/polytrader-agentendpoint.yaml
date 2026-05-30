@@ -52,40 +52,35 @@
 #
 # ONE-TIME SETUP REQUIRED (this manifest is only half):
 #   After applying the AgentEndpoint below, the owner/admin of the shared tunnel
-#   (typically in saxo-rust) must patch the "daytrader-oauth" NgrokTrafficPolicy
-#   to add a forward+rewrite rule for the /polytrader prefix.
+#   must add a raw-prefix forward rule for /polytrader in the sibling shared gateway repo:
+#   ../shared-ngrok-gateway/deploy/k8s/base/gateway.template.yaml
 #
 #   QUICK REFERENCE — Tunnel Owner Action Required (highest-priority handoff step):
 #   - Precise parent: insert as a **new list item** under `spec.policy.on_http_request`
 #     (this is an array of rule objects in the policy; the saxo-daytrader and danske-spil rules
 #     are items in that array).
-#   - The structure must **exactly parallel** the existing saxo-daytrader entry (preferred,
-#     because it includes url-rewrite to strip the /polytrader prefix before it reaches the
-#     polytrader backend — this makes the existing axum routes work without bigger changes).
+#   - The structure should point /polytrader directly at the polytrader internal
+#     AgentEndpoint. The app serves both root and raw /polytrader routes, so no
+#     edge url-rewrite is required.
 #   - Use `kubectl edit` (recommended for safety, avoids clobbering the last-applied annotation) or
 #     careful patch. Example:
 #       kubectl edit ngroktrafficpolicy -n saxo-rust daytrader-oauth
 #     (Or: kubectl get ngroktrafficpolicy -n saxo-rust daytrader-oauth -o yaml > /tmp/policy.yaml
 #      then edit + kubectl apply -f /tmp/policy.yaml)
 #
-#   RECOMMENDED verbatim copy-paste stanza (correct structure; modeled EXACTLY on the live
-#   saxo-daytrader rule fetched via `kubectl get ngroktrafficpolicies -n saxo-rust daytrader-oauth -o yaml`):
+#   RECOMMENDED verbatim copy-paste stanza (raw-prefix forward; app serves /polytrader too):
 #
 #     - actions:
-#         - config:
-#             from: /polytrader/?(.*)
-#             to: /$1
-#           type: url-rewrite
-#         - config:
-#             url: http://polytrader.internal:80
-#           type: forward-internal
+#       - config:
+#           url: http://polytrader.internal:80
+#         type: forward-internal
 #       expressions:
 #       - req.url.path.startsWith("/polytrader")
 #
-#   (This is the full usable version: rewrite strips the prefix so /polytrader/* hits the
-#   clean axum routes /health, /markets, /, etc. Combined with the <base href="/polytrader/">
+#   (The app serves raw /polytrader/* routes so this does not depend on edge
+#   url-rewrite behavior after ngrok SSO. Combined with the <base href="/polytrader/">
 #   added to the dashboard HTML in this POC operationalization, all navigation links on the
-#   banner page resolve correctly to /polytrader/... subpaths, which the policy then rewrites.)
+#   banner page resolve correctly to /polytrader/... subpaths.)
 #
 #   For reference, the simpler (no-rewrite) danske-spil style was:
 #     - actions:
@@ -138,13 +133,13 @@
 #   AgentEndpoint in their own namespace + k8s manifests).
 # - Keeps everything in the existing kustomize base tree so one `apply -k` enables it.
 # - Minimal Rust change (only <base href="/polytrader/"> in the Phase 0 dashboard HTML
-#   to make root links work under subpath when paired with policy rewrite); zero changes
+#   to make root links work under subpath when paired with raw-prefix routing); zero changes
 #   to trading engine, journal, ingester, paper logic, Deployment, Service, or other components.
 # - Docs updated in wiki/log.md + new runbook as required by AGENTS.md (self-documenting, auditable).
 # - POC only: no TLS secrets, rate limits, production Ingress, etc.
 #
 # Status: POC operationalized end-to-end. Probes added; deploy flow + runbook updated;
-# public /polytrader URL (with rewrite+base) is fully usable after the one-time policy patch.
+# public /polytrader URL (with raw-prefix routing + base tag) is fully usable after the one-time policy patch.
 #
 
 # v1alpha1 per current ngrok-operator in the target cluster (re-verify on operator

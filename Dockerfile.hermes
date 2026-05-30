@@ -11,11 +11,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY Cargo.toml Cargo.lock* ./
 # Dummy to cache deps
 RUN mkdir -p src && echo 'fn main(){}' > src/main.rs
-RUN cargo build --release || true
+RUN cargo build --release --bin polytrader || true
 
 COPY . .
 # Build the real hermes binary (src/bin/hermes.rs)
-RUN cargo build --release --bin hermes
+RUN touch src/bin/hermes.rs && cargo build --release --bin hermes
 
 # Final hermes runtime image
 FROM debian:bookworm-slim

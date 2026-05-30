@@ -5,6 +5,8 @@
 //! Phase 2: gated autonomous low-risk wiki patch proposals (env HERMES_AUTONOMOUS_WIKI_PROPOSALS=lowrisk).
 //! Follows exact patterns from src/journal/writer.rs, src/server.rs, src/db.rs.
 
+#![recursion_limit = "256"]
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -163,6 +165,7 @@ async fn do_reflection(
         sqlx::query_scalar("SELECT COUNT(*) FROM market_data.markets WHERE active = true")
             .fetch_one(pool)
             .await?;
+    let clob_safety_loop = load_clob_safety_loop_snapshot(pool, period_start).await?;
 
     // Basic P&L attribution (Decimal only; no floats in finance per AGENTS)
     // Now includes prior snapshot deltas for true window change (smallest viable fix for weak attribution)
@@ -225,6 +228,7 @@ async fn do_reflection(
             "min_net_edge_for_trade_pct": "4-6",
             "fee_adjusted_progress_note": "Current fee-adjusted realized compared against targets; low fee drag = good signal quality"
         },
+        "clob_safety_loop": clob_safety_loop,
         "note": "attribution from latest+prior snapshots + fills in window; deltas + fee-adjusted computed (Decimal); see fees-tax-latency wiki for model"
     });
 
@@ -232,15 +236,63 @@ async fn do_reflection(
     // Enhanced with fee-adjusted + goals ref (per fees impl #3).
     let local_summary = format!(
         "Paper P&L over last 24h: realized delta={}, unrealized delta={}, fills={}, fees={}. Fee-adjusted realized (conservative)={}, fee_drag~{}%. Active markets: {}. Current: realized={}, unrealized={}. \
+         CLOB safety loop: {} live-sender boundary status event(s), {} live-sender design review contract(s), {} live-sender design package(s), {} final-review package(s), {} final-review decision(s) with {}/{} fail-closed boundary coverage and {}/{} no-network dispatch coverage, {} unlock-status event(s), {} collateral readiness snapshot(s), {} market metadata validation event(s), {} post-request dry-run event(s), {} human-approval event(s), {} submit-facade event(s), {} reconciliation event(s), and {} signed/order-intent dry-run event(s) in window; latest event={}. \
          (Local attribution with deltas from prior snapshot + fee impact per fees-tax-latency wiki; vs daily/weekly net targets from goals wiki. No edge decay or resolution surprises observed in window.)",
-        delta_realized, delta_unreal, fill_count, total_fees, fee_adjusted_realized, fee_drag, active_markets, realized, unreal
+        delta_realized,
+        delta_unreal,
+        fill_count,
+        total_fees,
+        fee_adjusted_realized,
+        fee_drag,
+        active_markets,
+        realized,
+        unreal,
+        clob_safety_loop["live_sender_boundary_status_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["live_sender_design_review_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["live_sender_design_readiness_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["final_review_readiness_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["final_review_decision_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["final_review_decision_boundary_evidence_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["final_review_decision_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["final_review_decision_no_network_evidence_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["final_review_decision_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["real_trading_unlock_status_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["collateral_readiness_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["market_metadata_validation_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["post_request_dry_run_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["human_approval_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["submit_facade_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["submit_reconciliation_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["order_intent_or_signed_dry_run_events_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["latest_event_type"].as_str().unwrap_or("none")
     );
-    let local_recs = vec![
+    let mut local_recs = vec![
         "Continue paper-only until explicit human gate (per AGENTS.md)".to_string(),
         "Monitor fill count vs liquidity for slippage model tuning".to_string(),
         "Feed this reflection to wiki/experiments for Hermes wiki maintenance loop".to_string(),
         "Review fee_impact + fee_adjusted_attribution in this reflection vs 4-6% net edge min (goals wiki); tune if fee drag high on positive signals".to_string(),
+        "Track clob_collateral_readiness snapshots until collateral_balance_positive and collateral_allowance_positive are both true; do not treat this as live-order approval".to_string(),
+        "Keep clob_real_trading_unlock_status journaled and false until collateral, allowance, paper-mode, live-sender, and final human review gates are all deliberately addressed".to_string(),
+        "Use clob_final_review_readiness as the single operator packet for review discussions; it remains no-send and should stay blocked until every gate has evidence".to_string(),
+        "Record clob_final_review_decision events for review outcomes; these are audit-only and must not be treated as live-order approval".to_string(),
+        "Use clob_live_sender_design_readiness before any live-sender implementation work; it remains no-send and should stay blocked until every external and explicit unlock gate is deliberate".to_string(),
+        "Use clob_live_sender_design_review as the ADR-style contract before any live-sender boundary work; a ready design review still does not permit implementation or real orders".to_string(),
+        "Track clob_live_sender_boundary_status to ensure the only live-sender implementation remains fail-closed before network dispatch".to_string(),
+        "Review clob_safety_loop human-approval and submit-facade blockers before implementing kill-switch or live-send internals".to_string(),
     ];
+    let final_review_decision_events = clob_safety_loop["final_review_decision_events_24h"]
+        .as_i64()
+        .unwrap_or(0);
+    let complete_boundary_coverage = clob_safety_loop["final_review_decision_boundary_coverage"]
+        .get("complete_fail_closed_no_network_evidence")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if final_review_decision_events > 0 && !complete_boundary_coverage {
+        local_recs.push(
+            "Inspect /clob/final-review-decisions: at least one final-review decision is missing complete fail-closed/no-network live-sender boundary evidence"
+                .to_string(),
+        );
+    }
 
     // Conditional LLM synthesis (reqwest OpenAI-comp; smallest, configurable, safe)
     let (final_summary, recommendations, used_llm) = if let Some(key) = llm_key {
@@ -307,6 +359,344 @@ async fn do_reflection(
     );
 
     Ok(())
+}
+
+/// Pull recent CLOB safety audit events into Hermes' reflection loop.
+///
+/// RISK: Hermes only reads append-only, redacted `journal.events` payloads here.
+/// It never receives private keys, full signatures, L2 HMACs, or permission to
+/// place/cancel orders. These metrics exist so the meta-agent can spot whether
+/// dry-run safety gates are actually being exercised before any future real
+/// order client is considered.
+async fn load_clob_safety_loop_snapshot(
+    pool: &sqlx::PgPool,
+    period_start: DateTime<Utc>,
+) -> Result<serde_json::Value> {
+    let post_request_dry_run_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_order_post_request_dry_run'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
+    let submit_facade_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_order_submit_facade'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
+    let submit_reconciliation_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_order_submit_reconciliation'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
+    let market_metadata_validation_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_market_metadata_validation'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
+    let collateral_readiness_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_collateral_readiness'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
+    let real_trading_unlock_status_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_real_trading_unlock_status'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
+    let final_review_readiness_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_final_review_readiness'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
+    let final_review_decision_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_final_review_decision'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
+    let final_review_decision_boundary_evidence_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_final_review_decision'
+           AND created_at >= $1
+           AND payload->>'live_sender_boundary_fail_closed' = 'true'",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
+    let final_review_decision_no_network_evidence_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_final_review_decision'
+           AND created_at >= $1
+           AND payload->>'live_sender_boundary_fail_closed' = 'true'
+           AND payload #>> '{live_sender_boundary_status,network_sender_present}' = 'false'
+           AND payload #>> '{live_sender_boundary_status,accepted_for_network_dispatch}' = 'false'
+           AND payload #>> '{live_sender_boundary_status,request_sent}' = 'false'",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
+    let latest_final_review_decision_boundary_status: Option<serde_json::Value> =
+        sqlx::query_scalar(
+            "SELECT payload->'live_sender_boundary_status'
+             FROM journal.events
+             WHERE event_type = 'clob_final_review_decision'
+               AND created_at >= $1
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(period_start)
+        .fetch_optional(pool)
+        .await?;
+
+    let live_sender_design_readiness_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_live_sender_design_readiness'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
+    let live_sender_design_review_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_live_sender_design_review'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
+    let live_sender_boundary_status_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_live_sender_boundary_status'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
+    let human_approval_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_order_human_approval'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
+    let order_intent_or_signed_dry_run_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type IN ('clob_order_intent_dry_run', 'clob_live_sender_boundary_status', 'clob_live_sender_design_review', 'clob_live_sender_design_readiness', 'clob_final_review_readiness', 'clob_final_review_decision', 'clob_real_trading_unlock_status', 'clob_collateral_readiness', 'clob_market_metadata_validation', 'clob_order_post_request_dry_run', 'clob_order_submit_facade', 'clob_order_submit_reconciliation', 'clob_order_human_approval')
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
+    let latest: Option<(String, serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT event_type, payload, created_at
+         FROM journal.events
+         WHERE event_type IN (
+             'clob_order_intent_dry_run',
+             'clob_order_intent_review',
+             'clob_live_sender_boundary_status',
+             'clob_live_sender_design_review',
+             'clob_live_sender_design_readiness',
+             'clob_final_review_readiness',
+             'clob_final_review_decision',
+             'clob_real_trading_unlock_status',
+             'clob_collateral_readiness',
+             'clob_market_metadata_validation',
+             'clob_order_post_request_dry_run',
+             'clob_order_submit_facade',
+             'clob_order_submit_reconciliation',
+             'clob_order_human_approval'
+         )
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let (latest_event_type, latest_created_at, latest_summary) =
+        latest
+            .map(|(event_type, payload, created_at)| {
+                let report = payload.get("report").unwrap_or(&payload);
+                let blockers = report
+                    .get("blockers")
+                    .cloned()
+                    .or_else(|| {
+                        report
+                            .get("reconciliation")
+                            .and_then(|reconciliation| reconciliation.get("blockers"))
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| serde_json::json!([]));
+                let fresh_collateral_readiness_valid = report
+                    .get("gate_report")
+                    .and_then(|gate| gate.get("collateral_readiness"))
+                    .and_then(|readiness| readiness.get("valid"))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        if blockers
+                            .as_array()
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .any(|item| item.as_str() == Some("fresh_collateral_readiness_valid"))
+                            })
+                            .unwrap_or(false)
+                        {
+                            serde_json::json!(false)
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    });
+                let latest_summary = serde_json::json!({
+                    "post_request_dry_run_built": report.get("post_request_dry_run_built").cloned().unwrap_or(serde_json::Value::Null),
+                    "submission_facade_only": report.get("submission_facade_only").cloned().unwrap_or(serde_json::Value::Null),
+                    "facade_available": report.get("facade_available").cloned().unwrap_or(serde_json::Value::Null),
+                    "ready_for_design_review": report.get("ready_for_design_review").cloned().unwrap_or(serde_json::Value::Null),
+                    "implementation_permitted": report.get("implementation_permitted").cloned().unwrap_or(serde_json::Value::Null),
+                    "network_sender_present": report.get("network_sender_present").cloned().unwrap_or(serde_json::Value::Null),
+                    "fail_closed_implementation_present": report.get("fail_closed_implementation_present").cloned().unwrap_or(serde_json::Value::Null),
+                    "accepted_for_network_dispatch": report.get("accepted_for_network_dispatch").cloned().unwrap_or(serde_json::Value::Null),
+                    "ready_for_live_sender_implementation": report.get("ready_for_live_sender_implementation").cloned().unwrap_or(serde_json::Value::Null),
+                    "ready_for_final_review": report.get("ready_for_final_review").cloned().unwrap_or(serde_json::Value::Null),
+                    "final_review_decision_recorded": report.get("final_review_decision_recorded").cloned().unwrap_or(serde_json::Value::Null),
+                    "live_sender_boundary_fail_closed": report.get("live_sender_boundary_fail_closed").cloned().unwrap_or(serde_json::Value::Null),
+                    "live_sender_boundary_status": report.get("live_sender_boundary_status").cloned().unwrap_or(serde_json::Value::Null),
+                    "approved_for_real_orders": report.get("approved_for_real_orders").cloned().unwrap_or(serde_json::Value::Null),
+                    "review_decision_effect": report.get("review_decision_effect").cloned().unwrap_or(serde_json::Value::Null),
+                    "final_review_event_valid": report.get("final_review_event_valid").cloned().unwrap_or(serde_json::Value::Null),
+                    "human_approval_event_valid": report.get("human_approval_event_valid").cloned().unwrap_or(serde_json::Value::Null),
+                    "approved_for_facade": report.get("approved_for_facade").cloned().unwrap_or(serde_json::Value::Null),
+                    "collateral_balance": report.get("collateral_balance").cloned().unwrap_or(serde_json::Value::Null),
+                    "collateral_balance_positive": report.get("collateral_balance_positive").cloned().unwrap_or(serde_json::Value::Null),
+                    "collateral_allowance_positive": report.get("collateral_allowance_positive").cloned().unwrap_or(serde_json::Value::Null),
+                    "positive_allowance_count": report.get("positive_allowance_count").cloned().unwrap_or(serde_json::Value::Null),
+                    "market_metadata_fetched": report.get("market_metadata_fetched").cloned().unwrap_or(serde_json::Value::Null),
+                    "tick_size": report.get("tick_size").cloned().unwrap_or(serde_json::Value::Null),
+                    "neg_risk": report.get("neg_risk").cloned().unwrap_or(serde_json::Value::Null),
+                    "price_tick_valid": report.get("price_tick_valid").cloned().unwrap_or(serde_json::Value::Null),
+                    "price_within_tick_range": report.get("price_within_tick_range").cloned().unwrap_or(serde_json::Value::Null),
+                    "submit_decision": report.get("submit_decision").cloned().unwrap_or(serde_json::Value::Null),
+                    "reconciliation_status": report.get("reconciliation_status").cloned().unwrap_or(serde_json::Value::Null),
+                    "reconciliation": report.get("reconciliation").cloned().unwrap_or(serde_json::Value::Null),
+                    "kill_switch_and_risk_limits_available": report.get("gate_report").and_then(|gate| gate.get("kill_switch_and_risk_limits_available")).cloned().unwrap_or(serde_json::Value::Null),
+                    "kill_switch_open": report.get("gate_report").and_then(|gate| gate.get("kill_switch_open")).cloned().unwrap_or(serde_json::Value::Null),
+                    "fresh_collateral_readiness_valid": fresh_collateral_readiness_valid,
+                    "fresh_collateral_readiness_event_id": report.get("gate_report").and_then(|gate| gate.get("collateral_readiness")).and_then(|readiness| readiness.get("event_id")).cloned().unwrap_or(serde_json::Value::Null),
+                    "explicit_real_order_submission_configured": report.get("explicit_real_order_submission_configured").cloned().unwrap_or(serde_json::Value::Null),
+                    "live_order_sender_implemented": report.get("live_order_sender_implemented").cloned().unwrap_or(serde_json::Value::Null),
+                    "paper_mode_active": report.get("paper_mode_active").cloned().unwrap_or(serde_json::Value::Null),
+                    "risk_limits": report.get("gate_report").and_then(|gate| gate.get("risk_limits")).cloned().unwrap_or(serde_json::Value::Null),
+                    "request_sent": report.get("request_sent").cloned().unwrap_or(serde_json::Value::Null),
+                    "signature_redacted": report.get("signature_redacted").cloned().unwrap_or(serde_json::Value::Null),
+                    "l2_hmac_redacted": report.get("l2_hmac_redacted").cloned().unwrap_or(serde_json::Value::Null),
+                    "would_send": report.get("would_send").cloned().unwrap_or(serde_json::Value::Null),
+                    "post_order_called": report.get("post_order_called").cloned().unwrap_or(serde_json::Value::Null),
+                    "post_orders_called": report.get("post_orders_called").cloned().unwrap_or(serde_json::Value::Null),
+                    "blockers": blockers,
+                });
+                (event_type, Some(created_at), latest_summary)
+            })
+            .unwrap_or_else(|| ("none".to_string(), None, serde_json::json!({})));
+
+    let final_review_decision_boundary_coverage = build_final_review_decision_boundary_coverage(
+        final_review_decision_events_24h,
+        final_review_decision_boundary_evidence_events_24h,
+        final_review_decision_no_network_evidence_events_24h,
+    );
+
+    Ok(json!({
+        "post_request_dry_run_events_24h": post_request_dry_run_events_24h,
+        "live_sender_boundary_status_events_24h": live_sender_boundary_status_events_24h,
+        "live_sender_design_review_events_24h": live_sender_design_review_events_24h,
+        "live_sender_design_readiness_events_24h": live_sender_design_readiness_events_24h,
+        "final_review_readiness_events_24h": final_review_readiness_events_24h,
+        "final_review_decision_events_24h": final_review_decision_events_24h,
+        "final_review_decision_boundary_evidence_events_24h": final_review_decision_boundary_evidence_events_24h,
+        "final_review_decision_no_network_evidence_events_24h": final_review_decision_no_network_evidence_events_24h,
+        "final_review_decision_boundary_coverage": final_review_decision_boundary_coverage,
+        "latest_final_review_decision_boundary_status": latest_final_review_decision_boundary_status.unwrap_or(serde_json::Value::Null),
+        "real_trading_unlock_status_events_24h": real_trading_unlock_status_events_24h,
+        "collateral_readiness_events_24h": collateral_readiness_events_24h,
+        "market_metadata_validation_events_24h": market_metadata_validation_events_24h,
+        "submit_facade_events_24h": submit_facade_events_24h,
+        "submit_reconciliation_events_24h": submit_reconciliation_events_24h,
+        "human_approval_events_24h": human_approval_events_24h,
+        "order_intent_or_signed_dry_run_events_24h": order_intent_or_signed_dry_run_events_24h,
+        "latest_event_type": latest_event_type,
+        "latest_created_at": latest_created_at,
+        "latest_summary": latest_summary,
+        "hermes_consumes_clob_safety_events": true,
+        "real_orders_enabled": false,
+        "note": "Hermes consumes redacted CLOB live-sender boundary status, live-sender design review, live-sender design readiness, final-review readiness, final-review decision, real-trading unlock status, collateral readiness, dry-run, market metadata validation, human approval, fail-closed submit-facade, and reconciliation audit events only; no real order authority."
+    }))
+}
+
+fn build_final_review_decision_boundary_coverage(
+    decision_events: i64,
+    boundary_evidence_events: i64,
+    no_network_evidence_events: i64,
+) -> serde_json::Value {
+    let missing_boundary_evidence_events = (decision_events - boundary_evidence_events).max(0);
+    let missing_no_network_evidence_events = (decision_events - no_network_evidence_events).max(0);
+    let coverage_status = if decision_events == 0 {
+        "no_decisions"
+    } else if missing_boundary_evidence_events == 0 && missing_no_network_evidence_events == 0 {
+        "complete"
+    } else {
+        "legacy_or_missing_boundary_evidence"
+    };
+
+    json!({
+        "decision_events": decision_events,
+        "boundary_evidence_events": boundary_evidence_events,
+        "no_network_evidence_events": no_network_evidence_events,
+        "missing_boundary_evidence_events": missing_boundary_evidence_events,
+        "missing_no_network_evidence_events": missing_no_network_evidence_events,
+        "coverage_status": coverage_status,
+        "all_decisions_have_boundary_evidence": decision_events > 0 && boundary_evidence_events == decision_events,
+        "all_decisions_have_no_network_evidence": decision_events > 0 && no_network_evidence_events == decision_events,
+        "complete_fail_closed_no_network_evidence": decision_events > 0
+            && boundary_evidence_events == decision_events
+            && no_network_evidence_events == decision_events,
+        "note": "Final-review decisions are audit-only; missing counts usually mean older decisions were recorded before fail-closed LiveOrderSender evidence was attached."
+    })
 }
 
 /// Minimal reqwest call to OpenAI-compatible chat completions (no extra crates, timeout, error mapped).
@@ -407,7 +797,7 @@ fn augment_wiki_proposal_if_gated(recs: &mut Vec<String>, summary: &str) -> bool
 
 #[cfg(test)]
 mod tests {
-    use super::augment_wiki_proposal_if_gated;
+    use super::{augment_wiki_proposal_if_gated, build_final_review_decision_boundary_coverage};
     use rust_decimal::Decimal;
     use serde_json::json;
 
@@ -472,5 +862,44 @@ mod tests {
             Some(v) => std::env::set_var("HERMES_AUTONOMOUS_WIKI_PROPOSALS", v),
             None => std::env::remove_var("HERMES_AUTONOMOUS_WIKI_PROPOSALS"),
         }
+    }
+
+    #[test]
+    fn final_review_boundary_coverage_requires_fail_closed_no_network_evidence() {
+        let complete = build_final_review_decision_boundary_coverage(3, 3, 3);
+        assert_eq!(complete["all_decisions_have_boundary_evidence"], true);
+        assert_eq!(complete["all_decisions_have_no_network_evidence"], true);
+        assert_eq!(complete["complete_fail_closed_no_network_evidence"], true);
+        assert_eq!(complete["missing_boundary_evidence_events"], 0);
+        assert_eq!(complete["missing_no_network_evidence_events"], 0);
+        assert_eq!(complete["coverage_status"], "complete");
+
+        let missing_no_network = build_final_review_decision_boundary_coverage(3, 3, 2);
+        assert_eq!(
+            missing_no_network["all_decisions_have_boundary_evidence"],
+            true
+        );
+        assert_eq!(
+            missing_no_network["all_decisions_have_no_network_evidence"],
+            false
+        );
+        assert_eq!(
+            missing_no_network["complete_fail_closed_no_network_evidence"],
+            false
+        );
+        assert_eq!(missing_no_network["missing_boundary_evidence_events"], 0);
+        assert_eq!(missing_no_network["missing_no_network_evidence_events"], 1);
+        assert_eq!(
+            missing_no_network["coverage_status"],
+            "legacy_or_missing_boundary_evidence"
+        );
+
+        let no_decisions = build_final_review_decision_boundary_coverage(0, 0, 0);
+        assert_eq!(no_decisions["all_decisions_have_boundary_evidence"], false);
+        assert_eq!(
+            no_decisions["complete_fail_closed_no_network_evidence"],
+            false
+        );
+        assert_eq!(no_decisions["coverage_status"], "no_decisions");
     }
 }

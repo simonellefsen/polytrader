@@ -1,0 +1,1180 @@
+#!/usr/bin/env bash
+# deploy/verify — hardened post-deploy verification for polytrader
+#
+# Runs the full matrix after make k8s-apply (or any rollout):
+# - Pod health + exact image (TS tag)
+# - Log milestones (MAIN ENTERED, shutdown, L2 auto-derive success, no crash)
+# - In-cluster /health + /l2/status + read-only CLOB diagnostics/operator rollup + dry-run audit (via temp curl pod)
+# - SSR fidelity greps via local port-forward ( <base>, L2 chip, Derive button, legacy note, Phase ids, no 404)
+# - Dashboard JavaScript syntax + subpath CLOB diagnostics/operator rollup and dry-run audit markers
+# - Hermes status
+# - Public ngrok spot-check (if reachable)
+#
+# Usage:
+#   chmod +x deploy/verify
+#   ./deploy/verify
+#
+# Part of rust_daytrader-inspired guardrails + repeatable deploy/verify flow.
+set -euo pipefail
+
+NAMESPACE="polytrader"
+PUBLIC_URL="https://unground-uncraftily-vivienne.ngrok-free.dev/polytrader"
+
+require_file_contains() {
+  local file="$1"
+  local pattern="$2"
+  local label="$3"
+  if ! grep -Eq "$pattern" "$file"; then
+    echo "ERROR: required marker missing: $label"
+    echo "       Pattern: $pattern"
+    echo "       File: $file"
+    exit 1
+  fi
+}
+
+echo "============================================================"
+echo "  POLYTRADER HARDENED DEPLOY/VERIFY"
+echo "  (guardrails + unique-TS + scratch+musl + L2 + SSR fidelity)"
+echo "============================================================"
+echo ""
+
+# 1. Identify newest pod + image
+echo "==> 1. Current polytrader pod + image (post unique-TS set-image)"
+POD=$(kubectl get pod -n "$NAMESPACE" -l app=polytrader \
+  --sort-by=.metadata.creationTimestamp \
+  -o jsonpath='{.items[-1].metadata.name}' 2>/dev/null || echo "")
+if [[ -z "$POD" ]]; then
+  echo "ERROR: No polytrader pod found in $NAMESPACE"
+  exit 1
+fi
+IMAGE=$(kubectl get pod -n "$NAMESPACE" "$POD" -o jsonpath='{.spec.containers[0].image}' 2>/dev/null || echo "")
+READY=$(kubectl get pod -n "$NAMESPACE" "$POD" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
+RESTARTS=$(kubectl get pod -n "$NAMESPACE" "$POD" -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo "0")
+
+echo "  Pod:      $POD"
+echo "  Image:    $IMAGE"
+echo "  Ready:    $READY"
+echo "  Restarts: $RESTARTS"
+echo ""
+
+if [[ "$READY" != "True" ]]; then
+  echo "WARNING: Pod not Ready yet — waiting 30s..."
+  kubectl wait --for=condition=ready "pod/$POD" -n "$NAMESPACE" --timeout=30s || true
+  READY=$(kubectl get pod -n "$NAMESPACE" "$POD" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
+  RESTARTS=$(kubectl get pod -n "$NAMESPACE" "$POD" -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo "0")
+fi
+
+if [[ "$READY" != "True" ]]; then
+  echo "ERROR: Pod $POD is not Ready after wait (Ready=$READY)"
+  kubectl describe pod -n "$NAMESPACE" "$POD" 2>/dev/null | tail -80 || true
+  exit 1
+fi
+
+if [[ "$RESTARTS" != "0" ]]; then
+  echo "ERROR: Pod $POD has non-zero restart count (Restarts=$RESTARTS)"
+  kubectl get pod -n "$NAMESPACE" "$POD" -o wide 2>/dev/null || true
+  echo "       Previous logs, if available:"
+  kubectl logs -n "$NAMESPACE" "$POD" --previous --tail=80 2>/dev/null || true
+  exit 1
+fi
+
+# 2. Logs — key sequence + L2 derive + no crash markers
+echo "==> 2. Logs (key startup + L2 + no Exit 0 / crash signals)"
+echo "     (use kubectl logs -p --previous for prior if CrashLoop)"
+kubectl logs -n "$NAMESPACE" "$POD" --tail=80 2>/dev/null | cat
+echo ""
+echo "     --- L2 / startup grep ---"
+kubectl logs -n "$NAMESPACE" "$POD" --tail=120 2>/dev/null | grep -E \
+  '=== POLYTRADER MAIN ENTERED|ABOUT TO CALL start_server|ENTERED start_server|starting axum server|L2 auto-derive|POLYMARKET_PRIVATE_KEY_FILE|Connected.*server key|server key.*auto|shutdown_signal|graceful' || echo "     (some milestones may appear later; re-run after full init)"
+echo ""
+
+# 3. In-cluster API checks (/health + /l2/status + read-only CLOB diagnostics/operator rollup + dry-run audit)
+echo "==> 3. In-cluster API checks (/health, /l2/status, CLOB diagnostics/operator, dry-run audit)"
+# One-shot curl pod (uses public curl image; cleans up). These checks are
+# blocking because they verify service routing inside the cluster, not just SSR.
+IN_CLUSTER_OUT="/tmp/polytrader-in-cluster-verify.out"
+set +e
+kubectl run -n "$NAMESPACE" curl-verify --rm --attach -i --restart=Never --image=curlimages/curl:8.6.0 -- \
+  sh -ec '
+    echo "GET /health:";
+    HEALTH=$(curl -fsS --max-time 5 http://polytrader:80/health);
+    echo "$HEALTH";
+    echo "$HEALTH" | grep -q "\"status\":\"ok\"";
+    echo "";
+    echo "GET /l2/status:";
+    L2=$(curl -fsS --max-time 5 http://polytrader:80/l2/status);
+    echo "$L2";
+    echo "$L2" | grep -q "\"paper_only\":true";
+    echo "$L2" | grep -q "\"connected\":true";
+    echo "";
+    echo "GET /clob/status:";
+    CLOB=$(curl -fsS --max-time 8 http://polytrader:80/clob/status);
+    echo "$CLOB";
+    echo "$CLOB" | grep -q "\"l2_connected\":true";
+    echo "$CLOB" | grep -q "\"read_only_live_check\":true";
+    echo "$CLOB" | grep -q "\"paper_only\":true";
+    echo "$CLOB" | grep -q "\"real_orders_enabled\":false";
+    echo "";
+    echo "GET /clob/account:";
+    ACCOUNT=$(curl -fsS --max-time 8 http://polytrader:80/clob/account);
+    echo "$ACCOUNT";
+    echo "$ACCOUNT" | grep -q "\"l2_connected\":true";
+    echo "$ACCOUNT" | grep -q "\"read_only_live_check\":true";
+    echo "$ACCOUNT" | grep -q "\"paper_only\":true";
+    echo "$ACCOUNT" | grep -q "\"real_orders_enabled\":false";
+    echo "$ACCOUNT" | grep -q "\"account\":";
+    echo "$ACCOUNT" | grep -q "\"open_orders\":";
+    echo "$ACCOUNT" | grep -q "\"collateral\":";
+    echo "";
+    echo "GET /clob/preflight:";
+    PREFLIGHT=$(curl -fsS --max-time 8 http://polytrader:80/clob/preflight);
+    echo "$PREFLIGHT";
+    echo "$PREFLIGHT" | grep -q "\"l2_connected\":true";
+    echo "$PREFLIGHT" | grep -q "\"read_only_live_check\":true";
+    echo "$PREFLIGHT" | grep -q "\"paper_only\":true";
+    echo "$PREFLIGHT" | grep -q "\"real_orders_enabled\":false";
+	    echo "$PREFLIGHT" | grep -q "\"ready_for_real_orders\":false";
+	    echo "$PREFLIGHT" | grep -q "\"blockers\":";
+	    echo "$PREFLIGHT" | grep -q "\"checks\":";
+	    echo "";
+	    echo "GET /clob/diagnostics:";
+	    DIAGNOSTICS=$(curl -fsS --max-time 10 http://polytrader:80/clob/diagnostics);
+	    echo "$DIAGNOSTICS";
+	    echo "$DIAGNOSTICS" | grep -q "\"l2_connected\":true";
+	    echo "$DIAGNOSTICS" | grep -q "\"read_only_live_check\":true";
+	    echo "$DIAGNOSTICS" | grep -q "\"paper_only\":true";
+	    echo "$DIAGNOSTICS" | grep -q "\"real_orders_enabled\":false";
+	    echo "$DIAGNOSTICS" | grep -q "\"ready_for_real_orders\":false";
+	    echo "$DIAGNOSTICS" | grep -q "\"status\":";
+		    echo "$DIAGNOSTICS" | grep -q "\"account\":";
+		    echo "$DIAGNOSTICS" | grep -q "\"preflight\":";
+		    echo "";
+		    echo "GET /clob/collateral-readiness:";
+		    COLLATERAL_READINESS=$(curl -fsS --max-time 10 http://polytrader:80/clob/collateral-readiness);
+		    echo "$COLLATERAL_READINESS";
+		    echo "$COLLATERAL_READINESS" | grep -q "\"paper_only\":true";
+		    echo "$COLLATERAL_READINESS" | grep -q "\"real_orders_enabled\":false";
+		    echo "$COLLATERAL_READINESS" | grep -q "\"journaled\":true";
+		    echo "$COLLATERAL_READINESS" | grep -q "\"journal_event_id\":";
+		    echo "$COLLATERAL_READINESS" | grep -q "\"collateral_readiness\":";
+		    echo "$COLLATERAL_READINESS" | grep -q "\"request_sent\":false";
+		    echo "$COLLATERAL_READINESS" | grep -q "\"post_order_called\":false";
+		    echo "";
+		    echo "GET /clob/operator-status?limit=10:";
+		    OPERATOR_STATUS=$(curl -fsS --max-time 10 "http://polytrader:80/clob/operator-status?limit=10");
+		    echo "$OPERATOR_STATUS";
+		    echo "$OPERATOR_STATUS" | grep -q "\"paper_only\":true";
+		    echo "$OPERATOR_STATUS" | grep -q "\"real_orders_enabled\":false";
+		    echo "$OPERATOR_STATUS" | grep -q "\"ready_for_real_orders\":false";
+		    echo "$OPERATOR_STATUS" | grep -q "\"operator_status\":";
+		    echo "$OPERATOR_STATUS" | grep -q "\"clob\":";
+		    echo "$OPERATOR_STATUS" | grep -q "\"review\":";
+		    echo "$OPERATOR_STATUS" | grep -q "\"recommended_next_actions\":";
+		    echo "";
+		    echo "GET /clob/order-intent/dry-runs?limit=3:";
+		    DRY_RUNS=$(curl -fsS --max-time 8 "http://polytrader:80/clob/order-intent/dry-runs?limit=3");
+		    echo "$DRY_RUNS";
+		    echo "$DRY_RUNS" | grep -q "\"paper_only\":true";
+		    echo "$DRY_RUNS" | grep -q "\"real_orders_enabled\":false";
+		    echo "$DRY_RUNS" | grep -q "\"event_type\":\"clob_order_intent_dry_run\"";
+		    echo "$DRY_RUNS" | grep -q "\"events\":";
+		    echo "";
+		    echo "GET /clob/order-intent/reviews?limit=3:";
+		    REVIEWS=$(curl -fsS --max-time 8 "http://polytrader:80/clob/order-intent/reviews?limit=3");
+		    echo "$REVIEWS";
+		    echo "$REVIEWS" | grep -q "\"paper_only\":true";
+		    echo "$REVIEWS" | grep -q "\"real_orders_enabled\":false";
+		    echo "$REVIEWS" | grep -q "\"event_type\":\"clob_order_intent_review\"";
+		    echo "$REVIEWS" | grep -q "\"decision_counts\":";
+		    echo "";
+		    echo "GET /clob/order-intent/review-summary?limit=10:";
+		    REVIEW_SUMMARY=$(curl -fsS --max-time 8 "http://polytrader:80/clob/order-intent/review-summary?limit=10");
+		    echo "$REVIEW_SUMMARY";
+		    echo "$REVIEW_SUMMARY" | grep -q "\"paper_only\":true";
+		    echo "$REVIEW_SUMMARY" | grep -q "\"real_orders_enabled\":false";
+		    echo "$REVIEW_SUMMARY" | grep -q "\"summary\":";
+		    echo "$REVIEW_SUMMARY" | grep -q "\"items\":";
+		    echo "";
+		    echo "GET /clob/order-intent/review-health?limit=10:";
+		    REVIEW_HEALTH=$(curl -fsS --max-time 8 "http://polytrader:80/clob/order-intent/review-health?limit=10");
+		    echo "$REVIEW_HEALTH";
+		    echo "$REVIEW_HEALTH" | grep -q "\"paper_only\":true";
+		    echo "$REVIEW_HEALTH" | grep -q "\"real_orders_enabled\":false";
+		    echo "$REVIEW_HEALTH" | grep -q "\"health\":";
+		    echo "$REVIEW_HEALTH" | grep -q "\"recommended_actions\":";
+		    echo "";
+		    echo "GET /clob/order-intent/review-backlog:";
+		    REVIEW_BACKLOG=$(curl -fsS --max-time 8 "http://polytrader:80/clob/order-intent/review-backlog");
+		    echo "$REVIEW_BACKLOG";
+		    echo "$REVIEW_BACKLOG" | grep -q "\"paper_only\":true";
+		    echo "$REVIEW_BACKLOG" | grep -q "\"real_orders_enabled\":false";
+		    echo "$REVIEW_BACKLOG" | grep -Eq "\"status\":\"(empty|fresh|stale)\"";
+		    echo "";
+		    echo "GET /clob/order-intent/review-queue?limit=3:";
+		    REVIEW_QUEUE=$(curl -fsS --max-time 8 "http://polytrader:80/clob/order-intent/review-queue?limit=3");
+		    echo "$REVIEW_QUEUE";
+		    echo "$REVIEW_QUEUE" | grep -q "\"paper_only\":true";
+		    echo "$REVIEW_QUEUE" | grep -q "\"real_orders_enabled\":false";
+		    echo "$REVIEW_QUEUE" | grep -q "\"review_stale_after_seconds\":";
+		    echo "$REVIEW_QUEUE" | grep -q "\"items\":";
+		    echo "$REVIEW_QUEUE" | grep -Eq "\"review_priority\":\"(stale_unreviewed|blocked_unreviewed|standard_unreviewed)\"|\"count\":0";
+		    echo "";
+		    echo "GET /clob/order-intent/review-guidance-exceptions?limit=3:";
+		    GUIDANCE_EXCEPTIONS=$(curl -fsS --max-time 8 "http://polytrader:80/clob/order-intent/review-guidance-exceptions?limit=3");
+		    echo "$GUIDANCE_EXCEPTIONS";
+		    echo "$GUIDANCE_EXCEPTIONS" | grep -q "\"paper_only\":true";
+		    echo "$GUIDANCE_EXCEPTIONS" | grep -q "\"real_orders_enabled\":false";
+		    echo "$GUIDANCE_EXCEPTIONS" | grep -q "\"items\":";
+		    echo "";
+		    echo "GET /clob/order-intent/review-guidance-overrides?limit=3:";
+		    GUIDANCE_OVERRIDES=$(curl -fsS --max-time 8 "http://polytrader:80/clob/order-intent/review-guidance-overrides?limit=3");
+		    echo "$GUIDANCE_OVERRIDES";
+		    echo "$GUIDANCE_OVERRIDES" | grep -q "\"paper_only\":true";
+		    echo "$GUIDANCE_OVERRIDES" | grep -q "\"real_orders_enabled\":false";
+		    echo "$GUIDANCE_OVERRIDES" | grep -q "\"items\":";
+		    echo "";
+		  ' >"$IN_CLUSTER_OUT" 2>&1
+IN_CLUSTER_STATUS=$?
+set -e
+cat "$IN_CLUSTER_OUT"
+if [[ "$IN_CLUSTER_STATUS" != "0" ]]; then
+  echo "ERROR: in-cluster API verification failed"
+  exit 1
+fi
+echo ""
+
+# 4. SSR + UI fidelity (local port-forward + grep for L2 primary, Google legacy, <base>, Phase branding, ids)
+echo "==> 4. SSR + UI fidelity checks (subpath routes, CLOB diagnostics, dry-run audit panels)"
+PF_LOG="/tmp/pf-verify.log"
+PF_PID=""
+cleanup_pf() {
+  if [[ -n "${PF_PID:-}" ]]; then
+    kill "$PF_PID" 2>/dev/null || true
+    wait "$PF_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup_pf EXIT
+kubectl port-forward -n "$NAMESPACE" svc/polytrader 18080:80 >"$PF_LOG" 2>&1 &
+PF_PID=$!
+sleep 4
+HTML_FILE="/tmp/polytrader-dashboard-verify.html"
+STATUS_FILE="/tmp/polytrader-clob-status-subpath-verify.json"
+ACCOUNT_FILE="/tmp/polytrader-clob-account-subpath-verify.json"
+	PREFLIGHT_FILE="/tmp/polytrader-clob-preflight-subpath-verify.json"
+	DIAGNOSTICS_FILE="/tmp/polytrader-clob-diagnostics-subpath-verify.json"
+	COLLATERAL_READINESS_FILE="/tmp/polytrader-clob-collateral-readiness-verify.json"
+	OPERATOR_STATUS_FILE="/tmp/polytrader-clob-operator-status-subpath-verify.json"
+	ORDER_READINESS_FILE="/tmp/polytrader-clob-order-placement-readiness-verify.json"
+	UNLOCK_STATUS_FILE="/tmp/polytrader-clob-real-trading-unlock-status-verify.json"
+	LIVE_SENDER_DESIGN_FILE="/tmp/polytrader-clob-live-sender-design-readiness-verify.json"
+	LIVE_SENDER_DESIGN_REVIEW_FILE="/tmp/polytrader-clob-live-sender-design-review-verify.json"
+	LIVE_SENDER_BOUNDARY_FILE="/tmp/polytrader-clob-live-sender-boundary-status-verify.json"
+	FINAL_REVIEW_FILE="/tmp/polytrader-clob-final-review-readiness-verify.json"
+	FINAL_REVIEW_DECISION_FILE="/tmp/polytrader-clob-final-review-decision-verify.json"
+	FINAL_REVIEW_DECISIONS_FILE="/tmp/polytrader-clob-final-review-decisions-verify.json"
+	FINAL_REVIEW_GAPS_FILE="/tmp/polytrader-clob-final-review-coverage-gaps-verify.json"
+	HERMES_SAFETY_LOOP_FILE="/tmp/polytrader-clob-hermes-safety-loop-verify.json"
+	MARKET_VALIDATION_FILE="/tmp/polytrader-market-validation-verify.json"
+	SIGNATURE_DRY_RUN_FILE="/tmp/polytrader-signature-dry-run-verify.json"
+	POST_REQUEST_DRY_RUN_FILE="/tmp/polytrader-post-request-dry-run-verify.json"
+	HUMAN_APPROVAL_FILE="/tmp/polytrader-human-approval-verify.json"
+	SUBMIT_FACADE_FILE="/tmp/polytrader-submit-facade-verify.json"
+	SUBMIT_RECONCILIATIONS_FILE="/tmp/polytrader-submit-reconciliations-verify.json"
+	DRY_RUNS_FILE="/tmp/polytrader-dry-runs-subpath-verify.json"
+	REVIEWS_FILE="/tmp/polytrader-reviews-subpath-verify.json"
+	REVIEW_SUMMARY_FILE="/tmp/polytrader-review-summary-verify.json"
+	HEALTH_FILE="/tmp/polytrader-review-health-verify.json"
+	REVIEW_BACKLOG_FILE="/tmp/polytrader-review-backlog-verify.json"
+	REVIEW_QUEUE_FILE="/tmp/polytrader-review-queue-verify.json"
+	GUIDANCE_EXCEPTIONS_FILE="/tmp/polytrader-guidance-exceptions-verify.json"
+	GUIDANCE_OVERRIDES_FILE="/tmp/polytrader-guidance-overrides-verify.json"
+	HTML_STATUS=$(curl -s -o "$HTML_FILE" -w '%{http_code}' --max-time 8 http://localhost:18080/polytrader || echo "000")
+	STATUS_STATUS=$(curl -s -o "$STATUS_FILE" -w '%{http_code}' --max-time 8 http://localhost:18080/polytrader/clob/status || echo "000")
+	ACCOUNT_STATUS=$(curl -s -o "$ACCOUNT_FILE" -w '%{http_code}' --max-time 8 http://localhost:18080/polytrader/clob/account || echo "000")
+	PREFLIGHT_STATUS=$(curl -s -o "$PREFLIGHT_FILE" -w '%{http_code}' --max-time 8 http://localhost:18080/polytrader/clob/preflight || echo "000")
+	DIAGNOSTICS_STATUS=$(curl -s -o "$DIAGNOSTICS_FILE" -w '%{http_code}' --max-time 10 http://localhost:18080/polytrader/clob/diagnostics || echo "000")
+	COLLATERAL_READINESS_STATUS=$(curl -s -o "$COLLATERAL_READINESS_FILE" -w '%{http_code}' --max-time 10 http://localhost:18080/polytrader/clob/collateral-readiness || echo "000")
+	OPERATOR_STATUS_STATUS=$(curl -s -o "$OPERATOR_STATUS_FILE" -w '%{http_code}' --max-time 10 'http://localhost:18080/polytrader/clob/operator-status?limit=10' || echo "000")
+	ORDER_READINESS_STATUS=$(curl -s -o "$ORDER_READINESS_FILE" -w '%{http_code}' --max-time 10 'http://localhost:18080/polytrader/clob/order-placement-readiness?limit=10' || echo "000")
+	UNLOCK_STATUS_STATUS=$(curl -s -o "$UNLOCK_STATUS_FILE" -w '%{http_code}' --max-time 10 'http://localhost:18080/polytrader/clob/real-trading-unlock-status' || echo "000")
+	LIVE_SENDER_DESIGN_STATUS=$(curl -s -o "$LIVE_SENDER_DESIGN_FILE" -w '%{http_code}' --max-time 10 'http://localhost:18080/polytrader/clob/live-sender-design-readiness' || echo "000")
+	FINAL_REVIEW_STATUS=$(curl -s -o "$FINAL_REVIEW_FILE" -w '%{http_code}' --max-time 10 'http://localhost:18080/polytrader/clob/final-review-readiness' || echo "000")
+	FINAL_REVIEW_EVENT_ID=$(grep -o '"journal_event_id":"[^"]*"' "$FINAL_REVIEW_FILE" 2>/dev/null | head -1 | cut -d'"' -f4 || true)
+	FINAL_REVIEW_DECISION_STATUS=$(curl -s -o "$FINAL_REVIEW_DECISION_FILE" -w '%{http_code}' --max-time 10 -H 'Content-Type: application/json' -X POST 'http://localhost:18080/polytrader/clob/final-review-decision' -d "{\"final_review_event_id\":\"$FINAL_REVIEW_EVENT_ID\",\"decision\":\"acknowledge_blocked\",\"confirm_final_review_workflow\":true,\"note\":\"deploy verifier acknowledges final review blockers without approving live trading\",\"operator\":\"deploy-verify\"}" || echo "000")
+	FINAL_REVIEW_DECISIONS_STATUS=$(curl -s -o "$FINAL_REVIEW_DECISIONS_FILE" -w '%{http_code}' --max-time 8 'http://localhost:18080/polytrader/clob/final-review-decisions?limit=3' || echo "000")
+	FINAL_REVIEW_GAPS_STATUS=$(curl -s -o "$FINAL_REVIEW_GAPS_FILE" -w '%{http_code}' --max-time 8 'http://localhost:18080/polytrader/clob/final-review-decisions?limit=50&gaps_only=true' || echo "000")
+	HERMES_SAFETY_LOOP_STATUS=$(curl -s -o "$HERMES_SAFETY_LOOP_FILE" -w '%{http_code}' --max-time 8 'http://localhost:18080/polytrader/clob/hermes-safety-loop' || echo "000")
+	LIVE_SENDER_DESIGN_REVIEW_STATUS=$(curl -s -o "$LIVE_SENDER_DESIGN_REVIEW_FILE" -w '%{http_code}' --max-time 10 'http://localhost:18080/polytrader/clob/live-sender-design-review' || echo "000")
+	LIVE_SENDER_BOUNDARY_STATUS=$(curl -s -o "$LIVE_SENDER_BOUNDARY_FILE" -w '%{http_code}' --max-time 10 'http://localhost:18080/polytrader/clob/live-sender-boundary-status' || echo "000")
+	MARKET_VALIDATION_STATUS=$(curl -s -o "$MARKET_VALIDATION_FILE" -w '%{http_code}' --max-time 12 -H 'Content-Type: application/json' -X POST 'http://localhost:18080/polytrader/clob/order-intent/market-validation' -d '{"token_id":"123","side":"buy","order_type":"limit","size":"1","price":"0.5","expected_edge_bps":"500","market_id":"verify-market-validation","outcome":"Yes"}' || echo "000")
+	SIGNATURE_DRY_RUN_STATUS=$(curl -s -o "$SIGNATURE_DRY_RUN_FILE" -w '%{http_code}' --max-time 10 -H 'Content-Type: application/json' -X POST 'http://localhost:18080/polytrader/clob/order-intent/signature-dry-run' -d '{"token_id":"123","side":"buy","order_type":"limit","size":"1","price":"0.5","expected_edge_bps":"500","market_id":"verify-signature-dry-run","outcome":"Yes","confirm_signed_payload_dry_run":false}' || echo "000")
+	POST_REQUEST_DRY_RUN_STATUS=$(curl -s -o "$POST_REQUEST_DRY_RUN_FILE" -w '%{http_code}' --max-time 10 -H 'Content-Type: application/json' -X POST 'http://localhost:18080/polytrader/clob/order-intent/post-request-dry-run' -d '{"token_id":"123","side":"buy","order_type":"limit","size":"1","price":"0.5","expected_edge_bps":"500","market_id":"verify-post-request-dry-run","outcome":"Yes","confirm_signed_payload_dry_run":false,"confirm_order_post_request_dry_run":false}' || echo "000")
+	HUMAN_APPROVAL_STATUS=$(curl -s -o "$HUMAN_APPROVAL_FILE" -w '%{http_code}' --max-time 10 -H 'Content-Type: application/json' -X POST 'http://localhost:18080/polytrader/clob/order-intent/human-approval' -d '{"token_id":"123","side":"buy","order_type":"limit","size":"1","price":"0.5","expected_edge_bps":"500","market_id":"verify-submit-facade","outcome":"Yes","decision":"approve_facade","confirm_human_approval_workflow":true,"note":"deploy verifier approval for fail-closed submit facade","operator":"deploy-verify"}' || echo "000")
+	HUMAN_APPROVAL_EVENT_ID=$(grep -o '"journal_event_id":"[^"]*"' "$HUMAN_APPROVAL_FILE" 2>/dev/null | head -1 | cut -d'"' -f4 || true)
+	SUBMIT_FACADE_STATUS=$(curl -s -o "$SUBMIT_FACADE_FILE" -w '%{http_code}' --max-time 10 -H 'Content-Type: application/json' -X POST 'http://localhost:18080/polytrader/clob/order-intent/submit-facade' -d "{\"token_id\":\"123\",\"side\":\"buy\",\"order_type\":\"limit\",\"size\":\"1\",\"price\":\"0.5\",\"expected_edge_bps\":\"500\",\"market_id\":\"verify-submit-facade\",\"outcome\":\"Yes\",\"confirm_signed_payload_dry_run\":false,\"confirm_order_post_request_dry_run\":false,\"confirm_real_order_submission\":true,\"human_approval_event_id\":\"$HUMAN_APPROVAL_EVENT_ID\",\"human_approval_token\":\"\",\"human_approval_note\":\"verify safety path\",\"operator\":\"deploy-verify\"}" || echo "000")
+	SUBMIT_RECONCILIATIONS_STATUS=$(curl -s -o "$SUBMIT_RECONCILIATIONS_FILE" -w '%{http_code}' --max-time 8 'http://localhost:18080/polytrader/clob/order-intent/submit-reconciliations?limit=3' || echo "000")
+	DRY_RUNS_STATUS=$(curl -s -o "$DRY_RUNS_FILE" -w '%{http_code}' --max-time 8 'http://localhost:18080/polytrader/clob/order-intent/dry-runs?limit=3' || echo "000")
+	REVIEWS_STATUS=$(curl -s -o "$REVIEWS_FILE" -w '%{http_code}' --max-time 8 'http://localhost:18080/polytrader/clob/order-intent/reviews?limit=3' || echo "000")
+	REVIEW_SUMMARY_STATUS=$(curl -s -o "$REVIEW_SUMMARY_FILE" -w '%{http_code}' --max-time 8 'http://localhost:18080/polytrader/clob/order-intent/review-summary?limit=10' || echo "000")
+	HEALTH_STATUS=$(curl -s -o "$HEALTH_FILE" -w '%{http_code}' --max-time 8 'http://localhost:18080/polytrader/clob/order-intent/review-health?limit=50' || echo "000")
+	REVIEW_BACKLOG_STATUS=$(curl -s -o "$REVIEW_BACKLOG_FILE" -w '%{http_code}' --max-time 8 'http://localhost:18080/polytrader/clob/order-intent/review-backlog' || echo "000")
+	REVIEW_QUEUE_STATUS=$(curl -s -o "$REVIEW_QUEUE_FILE" -w '%{http_code}' --max-time 8 'http://localhost:18080/polytrader/clob/order-intent/review-queue?limit=3' || echo "000")
+	GUIDANCE_EXCEPTIONS_STATUS=$(curl -s -o "$GUIDANCE_EXCEPTIONS_FILE" -w '%{http_code}' --max-time 8 'http://localhost:18080/polytrader/clob/order-intent/review-guidance-exceptions?limit=3' || echo "000")
+	GUIDANCE_OVERRIDES_STATUS=$(curl -s -o "$GUIDANCE_OVERRIDES_FILE" -w '%{http_code}' --max-time 8 'http://localhost:18080/polytrader/clob/order-intent/review-guidance-overrides?limit=3' || echo "000")
+	HTML=$(cat "$HTML_FILE" 2>/dev/null || echo "")
+	STATUS_JSON=$(cat "$STATUS_FILE" 2>/dev/null || echo "")
+	ACCOUNT_JSON=$(cat "$ACCOUNT_FILE" 2>/dev/null || echo "")
+	PREFLIGHT_JSON=$(cat "$PREFLIGHT_FILE" 2>/dev/null || echo "")
+	DIAGNOSTICS_JSON=$(cat "$DIAGNOSTICS_FILE" 2>/dev/null || echo "")
+	COLLATERAL_READINESS_JSON=$(cat "$COLLATERAL_READINESS_FILE" 2>/dev/null || echo "")
+	OPERATOR_STATUS_JSON=$(cat "$OPERATOR_STATUS_FILE" 2>/dev/null || echo "")
+	ORDER_READINESS_JSON=$(cat "$ORDER_READINESS_FILE" 2>/dev/null || echo "")
+	MARKET_VALIDATION_JSON=$(cat "$MARKET_VALIDATION_FILE" 2>/dev/null || echo "")
+	SIGNATURE_DRY_RUN_JSON=$(cat "$SIGNATURE_DRY_RUN_FILE" 2>/dev/null || echo "")
+	POST_REQUEST_DRY_RUN_JSON=$(cat "$POST_REQUEST_DRY_RUN_FILE" 2>/dev/null || echo "")
+	HUMAN_APPROVAL_JSON=$(cat "$HUMAN_APPROVAL_FILE" 2>/dev/null || echo "")
+	FINAL_REVIEW_DECISION_JSON=$(cat "$FINAL_REVIEW_DECISION_FILE" 2>/dev/null || echo "")
+	FINAL_REVIEW_DECISIONS_JSON=$(cat "$FINAL_REVIEW_DECISIONS_FILE" 2>/dev/null || echo "")
+	HERMES_SAFETY_LOOP_JSON=$(cat "$HERMES_SAFETY_LOOP_FILE" 2>/dev/null || echo "")
+	LIVE_SENDER_DESIGN_REVIEW_JSON=$(cat "$LIVE_SENDER_DESIGN_REVIEW_FILE" 2>/dev/null || echo "")
+	LIVE_SENDER_BOUNDARY_JSON=$(cat "$LIVE_SENDER_BOUNDARY_FILE" 2>/dev/null || echo "")
+	SUBMIT_FACADE_JSON=$(cat "$SUBMIT_FACADE_FILE" 2>/dev/null || echo "")
+	SUBMIT_RECONCILIATIONS_JSON=$(cat "$SUBMIT_RECONCILIATIONS_FILE" 2>/dev/null || echo "")
+	DRY_RUNS_JSON=$(cat "$DRY_RUNS_FILE" 2>/dev/null || echo "")
+	REVIEWS_JSON=$(cat "$REVIEWS_FILE" 2>/dev/null || echo "")
+	REVIEW_SUMMARY_JSON=$(cat "$REVIEW_SUMMARY_FILE" 2>/dev/null || echo "")
+	HEALTH=$(cat "$HEALTH_FILE" 2>/dev/null || echo "")
+	REVIEW_BACKLOG_JSON=$(cat "$REVIEW_BACKLOG_FILE" 2>/dev/null || echo "")
+	REVIEW_QUEUE_JSON=$(cat "$REVIEW_QUEUE_FILE" 2>/dev/null || echo "")
+	GUIDANCE_EXCEPTIONS_JSON=$(cat "$GUIDANCE_EXCEPTIONS_FILE" 2>/dev/null || echo "")
+	GUIDANCE_OVERRIDES_JSON=$(cat "$GUIDANCE_OVERRIDES_FILE" 2>/dev/null || echo "")
+if [[ "$HTML_STATUS" != "200" ]] || ! grep -q '<script>' "$HTML_FILE" 2>/dev/null; then
+  echo "ERROR: dashboard fetch failed or did not include script block (status=$HTML_STATUS)"
+  echo "       Port-forward log:"
+  cat "$PF_LOG" 2>/dev/null || true
+  exit 1
+fi
+if [[ "$HEALTH_STATUS" != "200" ]]; then
+  echo "ERROR: review-health fetch failed (status=$HEALTH_STATUS)"
+  cat "$HEALTH_FILE" 2>/dev/null || true
+  exit 1
+fi
+if [[ "$STATUS_STATUS" != "200" ]]; then
+  echo "ERROR: subpath CLOB status fetch failed (status=$STATUS_STATUS)"
+  cat "$STATUS_FILE" 2>/dev/null || true
+  exit 1
+fi
+if [[ "$ACCOUNT_STATUS" != "200" ]]; then
+  echo "ERROR: subpath CLOB account fetch failed (status=$ACCOUNT_STATUS)"
+  cat "$ACCOUNT_FILE" 2>/dev/null || true
+  exit 1
+fi
+if [[ "$PREFLIGHT_STATUS" != "200" ]]; then
+  echo "ERROR: subpath CLOB preflight fetch failed (status=$PREFLIGHT_STATUS)"
+  cat "$PREFLIGHT_FILE" 2>/dev/null || true
+  exit 1
+fi
+	if [[ "$DIAGNOSTICS_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB diagnostics fetch failed (status=$DIAGNOSTICS_STATUS)"
+	  cat "$DIAGNOSTICS_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$COLLATERAL_READINESS_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB collateral readiness fetch failed (status=$COLLATERAL_READINESS_STATUS)"
+	  cat "$COLLATERAL_READINESS_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$OPERATOR_STATUS_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB operator status fetch failed (status=$OPERATOR_STATUS_STATUS)"
+	  cat "$OPERATOR_STATUS_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$ORDER_READINESS_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB order placement readiness fetch failed (status=$ORDER_READINESS_STATUS)"
+	  cat "$ORDER_READINESS_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$UNLOCK_STATUS_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB real trading unlock status fetch failed (status=$UNLOCK_STATUS_STATUS)"
+	  cat "$UNLOCK_STATUS_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$LIVE_SENDER_DESIGN_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB live sender design readiness fetch failed (status=$LIVE_SENDER_DESIGN_STATUS)"
+	  cat "$LIVE_SENDER_DESIGN_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$FINAL_REVIEW_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB final review readiness fetch failed (status=$FINAL_REVIEW_STATUS)"
+	  cat "$FINAL_REVIEW_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$FINAL_REVIEW_DECISION_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB final review decision fetch failed (status=$FINAL_REVIEW_DECISION_STATUS)"
+	  cat "$FINAL_REVIEW_DECISION_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$FINAL_REVIEW_DECISIONS_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB final review decisions fetch failed (status=$FINAL_REVIEW_DECISIONS_STATUS)"
+	  cat "$FINAL_REVIEW_DECISIONS_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$FINAL_REVIEW_GAPS_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB final review gap-only audit fetch failed (status=$FINAL_REVIEW_GAPS_STATUS)"
+	  cat "$FINAL_REVIEW_GAPS_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$HERMES_SAFETY_LOOP_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath Hermes CLOB safety loop fetch failed (status=$HERMES_SAFETY_LOOP_STATUS)"
+	  cat "$HERMES_SAFETY_LOOP_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$LIVE_SENDER_DESIGN_REVIEW_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB live sender design review fetch failed (status=$LIVE_SENDER_DESIGN_REVIEW_STATUS)"
+	  cat "$LIVE_SENDER_DESIGN_REVIEW_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$LIVE_SENDER_BOUNDARY_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB live sender boundary status fetch failed (status=$LIVE_SENDER_BOUNDARY_STATUS)"
+	  cat "$LIVE_SENDER_BOUNDARY_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$MARKET_VALIDATION_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB market metadata validation fetch failed (status=$MARKET_VALIDATION_STATUS)"
+	  cat "$MARKET_VALIDATION_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$SIGNATURE_DRY_RUN_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB signature dry-run safety fetch failed (status=$SIGNATURE_DRY_RUN_STATUS)"
+	  cat "$SIGNATURE_DRY_RUN_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$POST_REQUEST_DRY_RUN_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB post-request dry-run safety fetch failed (status=$POST_REQUEST_DRY_RUN_STATUS)"
+	  cat "$POST_REQUEST_DRY_RUN_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$HUMAN_APPROVAL_STATUS" != "200" ]] || [[ -z "$HUMAN_APPROVAL_EVENT_ID" ]]; then
+	  echo "ERROR: subpath CLOB human approval workflow fetch failed (status=$HUMAN_APPROVAL_STATUS approval_event_id=${HUMAN_APPROVAL_EVENT_ID:-missing})"
+	  cat "$HUMAN_APPROVAL_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$SUBMIT_FACADE_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB submit facade safety fetch failed (status=$SUBMIT_FACADE_STATUS)"
+	  cat "$SUBMIT_FACADE_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$SUBMIT_RECONCILIATIONS_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath CLOB submit reconciliation fetch failed (status=$SUBMIT_RECONCILIATIONS_STATUS)"
+	  cat "$SUBMIT_RECONCILIATIONS_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$DRY_RUNS_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath dry-runs fetch failed (status=$DRY_RUNS_STATUS)"
+	  cat "$DRY_RUNS_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$REVIEWS_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath reviews fetch failed (status=$REVIEWS_STATUS)"
+	  cat "$REVIEWS_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$REVIEW_SUMMARY_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath review-summary fetch failed (status=$REVIEW_SUMMARY_STATUS)"
+	  cat "$REVIEW_SUMMARY_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$REVIEW_BACKLOG_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath review-backlog fetch failed (status=$REVIEW_BACKLOG_STATUS)"
+	  cat "$REVIEW_BACKLOG_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$REVIEW_QUEUE_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath review-queue fetch failed (status=$REVIEW_QUEUE_STATUS)"
+	  cat "$REVIEW_QUEUE_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$GUIDANCE_EXCEPTIONS_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath guidance-exceptions fetch failed (status=$GUIDANCE_EXCEPTIONS_STATUS)"
+	  cat "$GUIDANCE_EXCEPTIONS_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+	if [[ "$GUIDANCE_OVERRIDES_STATUS" != "200" ]]; then
+	  echo "ERROR: subpath guidance-overrides fetch failed (status=$GUIDANCE_OVERRIDES_STATUS)"
+	  cat "$GUIDANCE_OVERRIDES_FILE" 2>/dev/null || true
+	  exit 1
+	fi
+require_file_contains "$HTML_FILE" '<base href="/polytrader/"' 'dashboard base href'
+require_file_contains "$HTML_FILE" 'id="l2-chip"' 'L2 status chip'
+require_file_contains "$HTML_FILE" 'Derive from Server Key' 'server-key derive button'
+require_file_contains "$HTML_FILE" 'CLOB Readiness' 'CLOB readiness card'
+require_file_contains "$HTML_FILE" 'id="clob-readiness-panel"' 'CLOB readiness panel'
+require_file_contains "$HTML_FILE" 'updateClobReadiness' 'CLOB readiness updater'
+require_file_contains "$HTML_FILE" 'clob/status' 'CLOB status fetch hook'
+	require_file_contains "$HTML_FILE" 'CLOB Diagnostics' 'CLOB diagnostics card'
+	require_file_contains "$HTML_FILE" 'id="clob-diagnostics-panel"' 'CLOB diagnostics panel'
+	require_file_contains "$HTML_FILE" 'updateClobDiagnosticsPanel' 'CLOB diagnostics updater'
+	require_file_contains "$HTML_FILE" 'clob/diagnostics' 'CLOB diagnostics fetch hook'
+	require_file_contains "$HTML_FILE" 'CLOB Operator Status' 'CLOB operator status card'
+	require_file_contains "$HTML_FILE" 'id="clob-operator-status-panel"' 'CLOB operator status panel'
+	require_file_contains "$HTML_FILE" 'id="clob-operator-status-actions"' 'CLOB operator status actions'
+	require_file_contains "$HTML_FILE" 'updateClobOperatorStatus' 'CLOB operator status updater'
+	require_file_contains "$HTML_FILE" 'renderClobOperatorActions' 'CLOB operator status action renderer'
+	require_file_contains "$HTML_FILE" 'runClobOperatorAction' 'CLOB operator status action click handler'
+	require_file_contains "$HTML_FILE" 'inspect_final_review_decisions' 'CLOB operator final review action'
+	require_file_contains "$HTML_FILE" 'inspect_hermes_safety_loop' 'CLOB operator Hermes safety-loop action'
+	require_file_contains "$HTML_FILE" 'inspect_final_review_coverage_gaps' 'CLOB operator final review coverage gap action'
+	require_file_contains "$HTML_FILE" 'inspect_hermes_gap_alignment' 'CLOB operator Hermes gap alignment action'
+	require_file_contains "$HTML_FILE" 'inspect_live_sender_boundary' 'CLOB operator live sender boundary action'
+	require_file_contains "$HTML_FILE" 'clob/operator-status' 'CLOB operator status fetch hook'
+	require_file_contains "$HTML_FILE" 'operator_status' 'CLOB operator status field marker'
+	require_file_contains "$HTML_FILE" 'final_review.status' 'CLOB operator final review status marker'
+	require_file_contains "$HTML_FILE" 'final_review.coverage_gap_probe.available' 'CLOB operator final review coverage gap probe availability marker'
+	require_file_contains "$HTML_FILE" 'final_review.coverage_gap_probe.gap_count' 'CLOB operator final review coverage gap probe count marker'
+	require_file_contains "$HTML_FILE" 'final_review.coverage_gap_probe.displayed_event_count' 'CLOB operator final review coverage gap probe displayed count marker'
+	require_file_contains "$HTML_FILE" 'final_review.coverage_gap_probe.active_24h_gap_status' 'CLOB operator final review active 24h gap status marker'
+	require_file_contains "$HTML_FILE" 'final_review.coverage_gap_probe.active_24h_gap_count' 'CLOB operator final review active 24h gap count marker'
+	require_file_contains "$HTML_FILE" 'final_review.coverage_gap_probe.expired_24h_gap_count' 'CLOB operator final review expired 24h gap count marker'
+	require_file_contains "$HTML_FILE" 'final_review.coverage_gap_probe.hermes_coverage_window_seconds' 'CLOB operator final review Hermes window marker'
+	require_file_contains "$HTML_FILE" 'final_review.coverage_gap_probe.oldest_gap_age_seconds' 'CLOB operator final review coverage gap probe oldest age marker'
+	require_file_contains "$HTML_FILE" 'final_review.coverage_gap_probe.newest_gap_age_seconds' 'CLOB operator final review coverage gap probe newest age marker'
+	require_file_contains "$HTML_FILE" 'final_review.coverage_gap_probe.seconds_until_all_gaps_age_out_of_24h' 'CLOB operator final review coverage gap probe TTL marker'
+	require_file_contains "$HTML_FILE" 'final_review.coverage_gap_probe.seconds_until_active_gaps_age_out_of_24h' 'CLOB operator final review coverage gap active TTL marker'
+	require_file_contains "$HTML_FILE" 'final_review.coverage_gap_probe.active_gaps_age_out_at' 'CLOB operator final review active gap age-out timestamp marker'
+	require_file_contains "$HTML_FILE" 'final_review.hermes_gap_alignment.status' 'CLOB operator Hermes gap alignment status marker'
+	require_file_contains "$HTML_FILE" 'final_review.hermes_gap_alignment.aligned' 'CLOB operator Hermes gap alignment marker'
+	require_file_contains "$HTML_FILE" 'final_review.hermes_gap_alignment.requires_attention' 'CLOB operator Hermes gap alignment attention marker'
+	require_file_contains "$HTML_FILE" 'final_review.hermes_gap_alignment.app_active_24h_gap_count' 'CLOB operator Hermes gap alignment app count marker'
+	require_file_contains "$HTML_FILE" 'final_review.hermes_gap_alignment.hermes_missing_gap_count' 'CLOB operator Hermes gap alignment Hermes count marker'
+	require_file_contains "$HTML_FILE" 'final_review.hermes_gap_alignment.active_gaps_age_out_at' 'CLOB operator Hermes gap alignment age-out timestamp marker'
+	require_file_contains "$HTML_FILE" 'final_review.hermes_gap_alignment.hermes_reflection_freshness_status' 'CLOB operator Hermes reflection freshness marker'
+	require_file_contains "$HTML_FILE" 'final_review.hermes_gap_alignment.hermes_reflection_stale_after_seconds' 'CLOB operator Hermes reflection stale threshold marker'
+	require_file_contains "$HTML_FILE" 'hermes_safety_loop.status' 'CLOB operator Hermes safety-loop status marker'
+	require_file_contains "$HTML_FILE" 'live_sender.network_sender_present' 'CLOB operator live sender network marker'
+	require_file_contains "$HTML_FILE" 'CLOB Order Placement Readiness' 'CLOB order placement readiness card'
+	require_file_contains "$HTML_FILE" 'id="clob-order-placement-readiness-panel"' 'CLOB order placement readiness panel'
+	require_file_contains "$HTML_FILE" 'updateOrderPlacementReadiness' 'CLOB order placement readiness updater'
+	require_file_contains "$HTML_FILE" 'clob/order-placement-readiness' 'CLOB order placement readiness fetch hook'
+	require_file_contains "$HTML_FILE" 'next_safe_step' 'CLOB order placement next step marker'
+	require_file_contains "$HTML_FILE" 'Real Trading Unlock Status' 'real trading unlock status card'
+	require_file_contains "$HTML_FILE" 'id="clob-real-trading-unlock-panel"' 'real trading unlock status panel'
+	require_file_contains "$HTML_FILE" 'updateRealTradingUnlockStatus' 'real trading unlock status updater'
+	require_file_contains "$HTML_FILE" 'clob/real-trading-unlock-status' 'real trading unlock status fetch hook'
+	require_file_contains "$HTML_FILE" 'explicit_real_order_submission_configured' 'real trading unlock explicit config marker'
+	require_file_contains "$HTML_FILE" 'live_order_sender_implemented' 'real trading unlock live sender marker'
+	require_file_contains "$HTML_FILE" 'Live Sender Design Readiness' 'live sender design readiness card'
+	require_file_contains "$HTML_FILE" 'id="clob-live-sender-design-panel"' 'live sender design readiness panel'
+	require_file_contains "$HTML_FILE" 'updateLiveSenderDesignReadiness' 'live sender design readiness updater'
+	require_file_contains "$HTML_FILE" 'clob/live-sender-design-readiness' 'live sender design readiness fetch hook'
+	require_file_contains "$HTML_FILE" 'ready_for_live_sender_implementation' 'live sender design readiness marker'
+	require_file_contains "$HTML_FILE" 'Live Sender Design Review' 'live sender design review card'
+	require_file_contains "$HTML_FILE" 'id="clob-live-sender-design-review-panel"' 'live sender design review panel'
+	require_file_contains "$HTML_FILE" 'updateLiveSenderDesignReview' 'live sender design review updater'
+	require_file_contains "$HTML_FILE" 'clob/live-sender-design-review' 'live sender design review fetch hook'
+	require_file_contains "$HTML_FILE" 'ready_for_design_review' 'live sender design review marker'
+	require_file_contains "$HTML_FILE" 'implementation_permitted' 'live sender implementation permission marker'
+	require_file_contains "$HTML_FILE" 'Live Sender Boundary Status' 'live sender boundary status card'
+	require_file_contains "$HTML_FILE" 'id="clob-live-sender-boundary-panel"' 'live sender boundary status panel'
+	require_file_contains "$HTML_FILE" 'updateLiveSenderBoundaryStatus' 'live sender boundary status updater'
+	require_file_contains "$HTML_FILE" 'clob/live-sender-boundary-status' 'live sender boundary status fetch hook'
+	require_file_contains "$HTML_FILE" 'fail_closed_implementation_present' 'live sender fail-closed implementation marker'
+	require_file_contains "$HTML_FILE" 'accepted_for_network_dispatch' 'live sender network dispatch marker'
+	require_file_contains "$HTML_FILE" 'Final Review Readiness' 'final review readiness card'
+	require_file_contains "$HTML_FILE" 'id="clob-final-review-readiness-panel"' 'final review readiness panel'
+	require_file_contains "$HTML_FILE" 'Record Blocked Review' 'final review decision button'
+	require_file_contains "$HTML_FILE" 'id="clob-final-review-decision-panel"' 'final review decision panel'
+	require_file_contains "$HTML_FILE" 'updateFinalReviewReadiness' 'final review readiness updater'
+	require_file_contains "$HTML_FILE" 'recordFinalReviewDecision' 'final review decision hook'
+	require_file_contains "$HTML_FILE" 'clob/final-review-readiness' 'final review readiness fetch hook'
+	require_file_contains "$HTML_FILE" 'clob/final-review-decision' 'final review decision fetch hook'
+	require_file_contains "$HTML_FILE" 'live_sender_boundary' 'final review live sender boundary marker'
+	require_file_contains "$HTML_FILE" 'Final Review Decisions' 'final review decisions audit list'
+	require_file_contains "$HTML_FILE" 'id="clob-final-review-decisions-summary"' 'final review decisions summary'
+	require_file_contains "$HTML_FILE" 'id="clob-final-review-decisions-list"' 'final review decisions list'
+	require_file_contains "$HTML_FILE" 'updateFinalReviewDecisions' 'final review decisions updater'
+	require_file_contains "$HTML_FILE" 'updateFinalReviewCoverageGaps' 'final review coverage gap updater'
+	require_file_contains "$HTML_FILE" 'audit_limit' 'final review audit limit UI marker'
+	require_file_contains "$HTML_FILE" 'gaps_only' 'final review gap-only UI marker'
+	require_file_contains "$HTML_FILE" 'displayed_event_count' 'final review displayed event count UI marker'
+	require_file_contains "$HTML_FILE" 'clob/final-review-decisions' 'final review decisions fetch hook'
+	require_file_contains "$HTML_FILE" 'no_network_evidence_count' 'final review no-network evidence UI marker'
+	require_file_contains "$HTML_FILE" 'missing_boundary_evidence_count' 'final review missing boundary UI marker'
+	require_file_contains "$HTML_FILE" 'coverage_gap_count' 'final review coverage gap UI marker'
+	require_file_contains "$HTML_FILE" 'ready_for_final_review' 'final review readiness marker'
+	require_file_contains "$HTML_FILE" 'Hermes CLOB Safety Loop' 'Hermes CLOB safety-loop card'
+	require_file_contains "$HTML_FILE" 'id="clob-hermes-safety-loop-panel"' 'Hermes CLOB safety-loop panel'
+	require_file_contains "$HTML_FILE" 'updateHermesSafetyLoop' 'Hermes CLOB safety-loop updater'
+	require_file_contains "$HTML_FILE" 'clob/hermes-safety-loop' 'Hermes CLOB safety-loop fetch hook'
+	require_file_contains "$HTML_FILE" 'final_review_decision_boundary_coverage' 'Hermes final review boundary coverage UI marker'
+	require_file_contains "$HTML_FILE" 'missing_boundary_evidence_events_24h' 'Hermes missing boundary evidence UI marker'
+	require_file_contains "$HTML_FILE" 'coverage_status' 'Hermes boundary coverage status UI marker'
+	require_file_contains "$HTML_FILE" 'complete_fail_closed_no_network_evidence' 'Hermes complete boundary coverage UI marker'
+	require_file_contains "$HTML_FILE" 'CLOB Account' 'CLOB account card'
+require_file_contains "$HTML_FILE" 'id="clob-account-panel"' 'CLOB account panel'
+require_file_contains "$HTML_FILE" 'updateClobAccountPanel' 'CLOB account updater'
+require_file_contains "$HTML_FILE" 'clob/account' 'CLOB account fetch hook'
+	require_file_contains "$HTML_FILE" 'CLOB Preflight' 'CLOB preflight card'
+require_file_contains "$HTML_FILE" 'id="clob-preflight-panel"' 'CLOB preflight panel'
+require_file_contains "$HTML_FILE" 'updatePreflightPanel' 'CLOB preflight updater'
+require_file_contains "$HTML_FILE" 'clob/preflight' 'CLOB preflight fetch hook'
+	require_file_contains "$HTML_FILE" 'CLOB Collateral Readiness' 'CLOB collateral readiness card'
+	require_file_contains "$HTML_FILE" 'id="clob-collateral-readiness-panel"' 'CLOB collateral readiness panel'
+	require_file_contains "$HTML_FILE" 'updateCollateralReadinessPanel' 'CLOB collateral readiness updater'
+	require_file_contains "$HTML_FILE" 'clob/collateral-readiness' 'CLOB collateral readiness fetch hook'
+	require_file_contains "$HTML_FILE" 'review-health-actions' 'review-health action container'
+	require_file_contains "$HTML_FILE" 'renderReviewHealthActions' 'review-health action renderer'
+	require_file_contains "$HTML_FILE" 'runReviewHealthAction' 'review-health action click handler'
+	require_file_contains "$HTML_FILE" 'Recent CLOB Dry-Runs' 'dry-run list card'
+	require_file_contains "$HTML_FILE" 'id="dry-runs-list"' 'dry-run list body'
+	require_file_contains "$HTML_FILE" 'updateDryRunsList' 'dry-run list updater'
+	require_file_contains "$HTML_FILE" 'clob/order-intent/dry-runs' 'dry-run list fetch hook'
+	require_file_contains "$HTML_FILE" 'Recent CLOB Reviews' 'review list card'
+	require_file_contains "$HTML_FILE" 'id="reviews-list"' 'review list body'
+	require_file_contains "$HTML_FILE" 'updateReviewsList' 'review list updater'
+	require_file_contains "$HTML_FILE" 'clob/order-intent/reviews' 'review list fetch hook'
+	require_file_contains "$HTML_FILE" 'CLOB Review Summary' 'review summary card'
+	require_file_contains "$HTML_FILE" 'id="review-summary-panel"' 'review summary panel'
+	require_file_contains "$HTML_FILE" 'updateReviewSummary' 'review summary updater'
+	require_file_contains "$HTML_FILE" 'clob/order-intent/review-summary' 'review summary fetch hook'
+	require_file_contains "$HTML_FILE" 'CLOB Review Backlog' 'review backlog card'
+	require_file_contains "$HTML_FILE" 'id="review-backlog-panel"' 'review backlog panel'
+	require_file_contains "$HTML_FILE" 'updateReviewBacklog' 'review backlog updater'
+	require_file_contains "$HTML_FILE" 'clob/order-intent/review-backlog' 'review backlog fetch hook'
+	require_file_contains "$HTML_FILE" 'CLOB Guidance Exceptions' 'guidance exceptions card'
+	require_file_contains "$HTML_FILE" 'id="guidance-exceptions-list"' 'guidance exceptions list'
+	require_file_contains "$HTML_FILE" 'updateGuidanceExceptions' 'guidance exceptions updater'
+	require_file_contains "$HTML_FILE" 'clob/order-intent/review-guidance-exceptions' 'guidance exceptions fetch hook'
+	require_file_contains "$HTML_FILE" 'CLOB Guidance Overrides' 'guidance overrides card'
+	require_file_contains "$HTML_FILE" 'id="guidance-overrides-list"' 'guidance overrides list'
+	require_file_contains "$HTML_FILE" 'updateGuidanceOverrides' 'guidance overrides updater'
+	require_file_contains "$HTML_FILE" 'clob/order-intent/review-guidance-overrides' 'guidance overrides fetch hook'
+	require_file_contains "$HTML_FILE" 'CLOB Review Queue' 'review queue card'
+	require_file_contains "$HTML_FILE" 'id="review-queue-list"' 'review queue list'
+	require_file_contains "$HTML_FILE" 'updateReviewQueue' 'review queue updater'
+	require_file_contains "$HTML_FILE" 'clob/order-intent/review-queue' 'review queue fetch hook'
+	require_file_contains "$HTML_FILE" 'CLOB Dry-Run Detail' 'dry-run detail card'
+	require_file_contains "$HTML_FILE" 'id="dry-run-detail-panel"' 'dry-run detail panel'
+	require_file_contains "$HTML_FILE" 'showDryRunDetail' 'dry-run detail updater'
+	require_file_contains "$HTML_FILE" 'CLOB Dry-Run Intent' 'dry-run intent card'
+	require_file_contains "$HTML_FILE" 'id="dry-run-result"' 'dry-run result panel'
+	require_file_contains "$HTML_FILE" 'submitDryRunIntent' 'dry-run intent submit hook'
+	require_file_contains "$HTML_FILE" 'Validate Market Metadata' 'market metadata validation button'
+	require_file_contains "$HTML_FILE" 'validateMarketMetadataIntent' 'market metadata validation hook'
+	require_file_contains "$HTML_FILE" 'clob/order-intent/market-validation' 'market metadata validation fetch hook'
+	require_file_contains "$HTML_FILE" 'market_metadata_validation_available' 'market metadata validation UI marker'
+	require_file_contains "$HTML_FILE" 'Signed Payload Dry Run' 'signed payload dry-run button'
+	require_file_contains "$HTML_FILE" 'submitSignatureDryRunIntent' 'signed payload dry-run submit hook'
+	require_file_contains "$HTML_FILE" 'clob/order-intent/signature-dry-run' 'signed payload dry-run fetch hook'
+	require_file_contains "$HTML_FILE" 'POST Request Dry Run' 'post request dry-run button'
+	require_file_contains "$HTML_FILE" 'submitPostRequestDryRunIntent' 'post request dry-run submit hook'
+	require_file_contains "$HTML_FILE" 'clob/order-intent/post-request-dry-run' 'post request dry-run fetch hook'
+	require_file_contains "$HTML_FILE" 'Record Facade Approval' 'human approval workflow button'
+	require_file_contains "$HTML_FILE" 'recordHumanApprovalIntent' 'human approval workflow hook'
+	require_file_contains "$HTML_FILE" 'clob/order-intent/human-approval' 'human approval workflow fetch hook'
+	require_file_contains "$HTML_FILE" 'Submit Facade Check' 'submit facade check button'
+	require_file_contains "$HTML_FILE" 'submitOrderFacadeIntent' 'submit facade check hook'
+	require_file_contains "$HTML_FILE" 'clob/order-intent/submit-facade' 'submit facade fetch hook'
+	require_file_contains "$HTML_FILE" 'submission_facade_only' 'submit facade safety marker'
+	require_file_contains "$HTML_FILE" 'reconciliation_status' 'submit reconciliation UI marker'
+	require_file_contains "$HTML_FILE" 'human_approval_event_valid' 'submit facade human approval validation marker'
+	require_file_contains "$HTML_FILE" 'signature_redacted' 'signed payload dry-run redaction marker'
+	require_file_contains "$HTML_FILE" 'l2_hmac_redacted' 'post request dry-run HMAC redaction marker'
+	require_file_contains "$HTML_FILE" 'post_order_called' 'signed payload dry-run post-order guard marker'
+	require_file_contains "$STATUS_FILE" '"l2_connected":true' 'subpath CLOB status L2 connected'
+require_file_contains "$STATUS_FILE" '"read_only_live_check":true' 'subpath CLOB status read-only check'
+require_file_contains "$STATUS_FILE" '"paper_only":true' 'subpath CLOB status paper-only'
+require_file_contains "$STATUS_FILE" '"real_orders_enabled":false' 'subpath CLOB status real-orders disabled'
+require_file_contains "$ACCOUNT_FILE" '"l2_connected":true' 'subpath CLOB account L2 connected'
+require_file_contains "$ACCOUNT_FILE" '"read_only_live_check":true' 'subpath CLOB account read-only check'
+require_file_contains "$ACCOUNT_FILE" '"paper_only":true' 'subpath CLOB account paper-only'
+require_file_contains "$ACCOUNT_FILE" '"real_orders_enabled":false' 'subpath CLOB account real-orders disabled'
+require_file_contains "$ACCOUNT_FILE" '"account":' 'subpath CLOB account snapshot'
+require_file_contains "$ACCOUNT_FILE" '"open_orders":' 'subpath CLOB account open orders'
+require_file_contains "$ACCOUNT_FILE" '"collateral":' 'subpath CLOB account collateral'
+require_file_contains "$PREFLIGHT_FILE" '"l2_connected":true' 'subpath CLOB preflight L2 connected'
+require_file_contains "$PREFLIGHT_FILE" '"read_only_live_check":true' 'subpath CLOB preflight read-only check'
+require_file_contains "$PREFLIGHT_FILE" '"paper_only":true' 'subpath CLOB preflight paper-only'
+require_file_contains "$PREFLIGHT_FILE" '"real_orders_enabled":false' 'subpath CLOB preflight real-orders disabled'
+require_file_contains "$PREFLIGHT_FILE" '"ready_for_real_orders":false' 'subpath CLOB preflight not ready'
+require_file_contains "$PREFLIGHT_FILE" '"blockers":' 'subpath CLOB preflight blockers'
+require_file_contains "$PREFLIGHT_FILE" '"checks":' 'subpath CLOB preflight checks'
+require_file_contains "$DIAGNOSTICS_FILE" '"l2_connected":true' 'subpath CLOB diagnostics L2 connected'
+require_file_contains "$DIAGNOSTICS_FILE" '"read_only_live_check":true' 'subpath CLOB diagnostics read-only check'
+require_file_contains "$DIAGNOSTICS_FILE" '"paper_only":true' 'subpath CLOB diagnostics paper-only'
+require_file_contains "$DIAGNOSTICS_FILE" '"real_orders_enabled":false' 'subpath CLOB diagnostics real-orders disabled'
+require_file_contains "$DIAGNOSTICS_FILE" '"ready_for_real_orders":false' 'subpath CLOB diagnostics not ready'
+	require_file_contains "$DIAGNOSTICS_FILE" '"status":' 'subpath CLOB diagnostics status section'
+	require_file_contains "$DIAGNOSTICS_FILE" '"account":' 'subpath CLOB diagnostics account section'
+	require_file_contains "$DIAGNOSTICS_FILE" '"preflight":' 'subpath CLOB diagnostics preflight section'
+	require_file_contains "$COLLATERAL_READINESS_FILE" '"paper_only":true' 'subpath CLOB collateral readiness paper-only'
+	require_file_contains "$COLLATERAL_READINESS_FILE" '"real_orders_enabled":false' 'subpath CLOB collateral readiness real-orders disabled'
+	require_file_contains "$COLLATERAL_READINESS_FILE" '"journaled":true' 'subpath CLOB collateral readiness journaled'
+	require_file_contains "$COLLATERAL_READINESS_FILE" '"journal_event_id":' 'subpath CLOB collateral readiness journal event id'
+	require_file_contains "$COLLATERAL_READINESS_FILE" '"collateral_readiness":' 'subpath CLOB collateral readiness report'
+	require_file_contains "$COLLATERAL_READINESS_FILE" '"collateral_balance_positive":false' 'subpath CLOB collateral balance blocker'
+	require_file_contains "$COLLATERAL_READINESS_FILE" '"collateral_allowance_positive":false' 'subpath CLOB collateral allowance blocker'
+	require_file_contains "$COLLATERAL_READINESS_FILE" '"operator_actions":' 'subpath CLOB collateral operator actions'
+	require_file_contains "$COLLATERAL_READINESS_FILE" '"request_sent":false' 'subpath CLOB collateral no send'
+	require_file_contains "$COLLATERAL_READINESS_FILE" '"post_order_called":false' 'subpath CLOB collateral post order not called'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"paper_only":true' 'subpath CLOB operator status paper-only'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"real_orders_enabled":false' 'subpath CLOB operator status real-orders disabled'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"ready_for_real_orders":false' 'subpath CLOB operator status not ready'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"operator_status":' 'subpath CLOB operator status field'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"clob":' 'subpath CLOB operator status clob section'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"review":' 'subpath CLOB operator status review section'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"final_review":' 'subpath CLOB operator final review section'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"coverage_gap_probe":' 'subpath CLOB operator final review coverage gap probe'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"hermes_gap_alignment":' 'subpath CLOB operator final review Hermes gap alignment'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"app_active_24h_gap_count":' 'subpath CLOB operator final review Hermes alignment app count'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"hermes_missing_gap_count":' 'subpath CLOB operator final review Hermes alignment Hermes count'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"aligned":' 'subpath CLOB operator final review Hermes alignment flag'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"requires_attention":' 'subpath CLOB operator final review Hermes alignment attention flag'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"hermes_reflection_freshness_status":' 'subpath CLOB operator Hermes reflection freshness'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"hermes_reflection_stale_after_seconds":600' 'subpath CLOB operator Hermes reflection stale threshold'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"gaps_only":true' 'subpath CLOB operator gap probe gap-only marker'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"displayed_event_count":' 'subpath CLOB operator gap probe displayed event count'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"active_24h_gap_status":' 'subpath CLOB operator active 24h gap status'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"active_24h_gap_count":' 'subpath CLOB operator active 24h gap count'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"expired_24h_gap_count":' 'subpath CLOB operator expired 24h gap count'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"hermes_coverage_window_seconds":86400' 'subpath CLOB operator Hermes 24h window'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"oldest_gap_age_seconds":' 'subpath CLOB operator gap probe oldest age'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"newest_gap_age_seconds":' 'subpath CLOB operator gap probe newest age'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"seconds_until_all_gaps_age_out_of_24h":' 'subpath CLOB operator gap probe TTL'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"seconds_until_active_gaps_age_out_of_24h":' 'subpath CLOB operator active gap probe TTL'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"active_gaps_age_out_at":' 'subpath CLOB operator active gap age-out timestamp'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"hermes_safety_loop":' 'subpath CLOB operator Hermes safety-loop section'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"final_review_decision_boundary_coverage":' 'subpath CLOB operator Hermes boundary coverage'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"missing_boundary_evidence_events":' 'subpath CLOB operator Hermes missing boundary evidence'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"coverage_status":' 'subpath CLOB operator Hermes coverage status'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"audit":' 'subpath CLOB operator final review audit'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"approved_for_real_orders":false' 'subpath CLOB operator final review no approval'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"clob_final_review_decision"' 'subpath CLOB operator final review decision event type'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"live_sender_boundary":' 'subpath CLOB operator live sender boundary'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"boundary_name":"LiveOrderSender"' 'subpath CLOB operator live sender boundary name'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"implementation_name":"FailClosedLiveOrderSender"' 'subpath CLOB operator fail-closed sender'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"network_sender_present":false' 'subpath CLOB operator no network sender'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"accepted_for_network_dispatch":false' 'subpath CLOB operator rejects network dispatch'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"action_summary":' 'subpath CLOB operator action summary'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"attention_count":' 'subpath CLOB operator attention count'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"primary_action_id":' 'subpath CLOB operator primary action'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"freshness":' 'subpath CLOB operator freshness'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"generated_at":' 'subpath CLOB operator generated timestamp'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"stale_after_seconds":60' 'subpath CLOB operator stale threshold'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"recommended_next_actions":' 'subpath CLOB operator status next actions'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"id":"inspect_live_sender_boundary"' 'subpath CLOB operator live sender action'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"id":"inspect_hermes_safety_loop"' 'subpath CLOB operator Hermes safety-loop action'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"id":"inspect_final_review_coverage_gaps"' 'subpath CLOB operator final review coverage gap action'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"endpoint":"/clob/final-review-decisions\?limit=50&gaps_only=true"' 'subpath CLOB operator final review coverage gap endpoint'
+	require_file_contains "$OPERATOR_STATUS_FILE" '"hermes_gap_alignment_status":' 'subpath CLOB operator coverage gap action alignment status'
+	if grep -Eq '"id":"inspect_guidance_exceptions"' "$HEALTH_FILE"; then
+		require_file_contains "$OPERATOR_STATUS_FILE" '"id":"inspect_guidance_exceptions"' 'subpath CLOB operator guidance action'
+		require_file_contains "$OPERATOR_STATUS_FILE" '"guidance_exception_count":' 'subpath CLOB operator guidance action count'
+	fi
+	if grep -Eq '"id":"inspect_review_latency"' "$HEALTH_FILE"; then
+		require_file_contains "$OPERATOR_STATUS_FILE" '"id":"inspect_review_latency"' 'subpath CLOB operator latency action'
+		require_file_contains "$OPERATOR_STATUS_FILE" '"max_latency_seconds":' 'subpath CLOB operator latency action max age'
+		require_file_contains "$OPERATOR_STATUS_FILE" '"slow_latency_after_seconds":' 'subpath CLOB operator latency action threshold'
+	fi
+	if grep -Eq '"id":"review_unreviewed_dry_runs"' "$HEALTH_FILE"; then
+		require_file_contains "$OPERATOR_STATUS_FILE" '"id":"review_unreviewed_dry_runs"' 'subpath CLOB operator review-queue action'
+		require_file_contains "$OPERATOR_STATUS_FILE" '"unreviewed_count":' 'subpath CLOB operator review-queue action count'
+		require_file_contains "$OPERATOR_STATUS_FILE" '"review_stale_after_seconds":' 'subpath CLOB operator review-queue stale threshold'
+	fi
+	require_file_contains "$ORDER_READINESS_FILE" '"paper_only":true' 'subpath CLOB order placement readiness paper-only'
+	require_file_contains "$ORDER_READINESS_FILE" '"real_orders_enabled":false' 'subpath CLOB order placement readiness real-orders disabled'
+	require_file_contains "$ORDER_READINESS_FILE" '"ready_for_real_orders":false' 'subpath CLOB order placement readiness not ready'
+	require_file_contains "$ORDER_READINESS_FILE" '"stage":"authenticated_read_and_paper_dry_run"' 'subpath CLOB order placement readiness stage'
+	require_file_contains "$ORDER_READINESS_FILE" '"ready":false' 'subpath CLOB order placement readiness false'
+	require_file_contains "$ORDER_READINESS_FILE" '"market_tick_and_neg_risk_validation"' 'subpath CLOB order placement market metadata gate'
+	require_file_contains "$ORDER_READINESS_FILE" '"completed_count":(13|14)' 'subpath CLOB order placement completed gate count'
+	require_file_contains "$ORDER_READINESS_FILE" '"required_count":17' 'subpath CLOB order placement required gate count'
+	require_file_contains "$ORDER_READINESS_FILE" '"eip712_order_payload_signing"' 'subpath CLOB order placement signing blocker'
+	require_file_contains "$ORDER_READINESS_FILE" '"human_approval_gate"' 'subpath CLOB order placement approval blocker'
+	require_file_contains "$ORDER_READINESS_FILE" '"final_review_decision_audit"' 'subpath CLOB order placement final review audit gate'
+	require_file_contains "$ORDER_READINESS_FILE" '"fail_closed_live_sender_boundary"' 'subpath CLOB order placement live sender boundary gate'
+	require_file_contains "$ORDER_READINESS_FILE" '"final_review_audit_status":' 'subpath CLOB order placement final review audit status'
+	require_file_contains "$ORDER_READINESS_FILE" '"final_review_audit":' 'subpath CLOB order placement final review audit'
+	require_file_contains "$ORDER_READINESS_FILE" '"live_sender_boundary_status":' 'subpath CLOB order placement live sender boundary status'
+	require_file_contains "$ORDER_READINESS_FILE" '"boundary_name":"LiveOrderSender"' 'subpath CLOB order placement live sender boundary name'
+	require_file_contains "$ORDER_READINESS_FILE" '"implementation_name":"FailClosedLiveOrderSender"' 'subpath CLOB order placement fail-closed sender'
+	require_file_contains "$ORDER_READINESS_FILE" '"network_sender_present":false' 'subpath CLOB order placement no network sender'
+	require_file_contains "$ORDER_READINESS_FILE" '"accepted_for_network_dispatch":false' 'subpath CLOB order placement rejects network dispatch'
+	require_file_contains "$ORDER_READINESS_FILE" '"next_safe_step":' 'subpath CLOB order placement next safe step'
+	require_file_contains "$UNLOCK_STATUS_FILE" '"paper_only":true' 'real trading unlock status paper-only'
+	require_file_contains "$UNLOCK_STATUS_FILE" '"real_orders_enabled":false' 'real trading unlock status disabled'
+	require_file_contains "$UNLOCK_STATUS_FILE" '"ready_for_real_orders":false' 'real trading unlock status not ready'
+	require_file_contains "$UNLOCK_STATUS_FILE" '"unlock_status":' 'real trading unlock status report'
+	require_file_contains "$UNLOCK_STATUS_FILE" '"explicit_real_order_submission_configured":false' 'real trading explicit unlock closed'
+	require_file_contains "$UNLOCK_STATUS_FILE" '"live_order_sender_implemented":false' 'real trading live sender absent'
+	require_file_contains "$UNLOCK_STATUS_FILE" '"request_sent":false' 'real trading unlock no send'
+	require_file_contains "$UNLOCK_STATUS_FILE" '"post_order_called":false' 'real trading unlock post order not called'
+	require_file_contains "$UNLOCK_STATUS_FILE" '"journaled":true' 'real trading unlock status journaled'
+	require_file_contains "$UNLOCK_STATUS_FILE" '"journal_event_id":' 'real trading unlock status journal event id'
+	require_file_contains "$LIVE_SENDER_DESIGN_FILE" '"paper_only":true' 'live sender design paper-only'
+	require_file_contains "$LIVE_SENDER_DESIGN_FILE" '"real_orders_enabled":false' 'live sender design real-orders disabled'
+	require_file_contains "$LIVE_SENDER_DESIGN_FILE" '"ready_for_real_orders":false' 'live sender design not ready'
+	require_file_contains "$LIVE_SENDER_DESIGN_FILE" '"live_sender_design":' 'live sender design report'
+	require_file_contains "$LIVE_SENDER_DESIGN_FILE" '"ready_for_live_sender_implementation":false' 'live sender design blocked'
+	require_file_contains "$LIVE_SENDER_DESIGN_FILE" '"stage":"live_sender_design_blocked"' 'live sender design stage'
+	require_file_contains "$LIVE_SENDER_DESIGN_FILE" '"approved_for_real_orders":false' 'live sender design no approval'
+	require_file_contains "$LIVE_SENDER_DESIGN_FILE" '"live_order_sender_implemented":false' 'live sender design sender absent'
+	require_file_contains "$LIVE_SENDER_DESIGN_FILE" '"explicit_real_trading_config_unlock"' 'live sender design explicit unlock blocker'
+	require_file_contains "$LIVE_SENDER_DESIGN_FILE" '"request_sent":false' 'live sender design no send'
+	require_file_contains "$LIVE_SENDER_DESIGN_FILE" '"post_order_called":false' 'live sender design post order not called'
+	require_file_contains "$LIVE_SENDER_DESIGN_FILE" '"post_orders_called":false' 'live sender design post orders not called'
+	require_file_contains "$LIVE_SENDER_DESIGN_FILE" '"journaled":true' 'live sender design journaled'
+	require_file_contains "$LIVE_SENDER_DESIGN_FILE" '"journal_event_id":' 'live sender design journal event id'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"paper_only":true' 'live sender design review paper-only'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"real_orders_enabled":false' 'live sender design review real-orders disabled'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"ready_for_real_orders":false' 'live sender design review not ready'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"live_sender_design_review":' 'live sender design review report'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"ready_for_design_review":true' 'live sender design review contract ready'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"ready_for_live_sender_implementation":false' 'live sender design review implementation blocked'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"implementation_permitted":false' 'live sender design review no implementation permission'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"stage":"design_review_contract_ready"' 'live sender design review stage'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"review_contract":' 'live sender design review contract'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"boundary_name":"LiveOrderSender"' 'live sender design review boundary'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"required_pre_submit_guards":' 'live sender design review guards'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"prohibited_shortcuts":' 'live sender design review prohibited shortcuts'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"approved_for_real_orders":false' 'live sender design review no approval'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"live_order_sender_implemented":false' 'live sender design review sender absent'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"request_sent":false' 'live sender design review no send'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"post_order_called":false' 'live sender design review post order not called'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"post_orders_called":false' 'live sender design review post orders not called'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"journaled":true' 'live sender design review journaled'
+	require_file_contains "$LIVE_SENDER_DESIGN_REVIEW_FILE" '"journal_event_id":' 'live sender design review journal event id'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"paper_only":true' 'live sender boundary paper-only'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"real_orders_enabled":false' 'live sender boundary real-orders disabled'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"ready_for_real_orders":false' 'live sender boundary not ready'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"live_sender_boundary":' 'live sender boundary report'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"boundary_name":"LiveOrderSender"' 'live sender boundary name'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"implementation_name":"FailClosedLiveOrderSender"' 'live sender fail-closed implementation'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"trait_defined":true' 'live sender trait defined'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"fail_closed_implementation_present":true' 'live sender fail-closed present'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"network_sender_present":false' 'live sender no network implementation'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"implementation_permitted":false' 'live sender implementation not permitted'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"accepted_for_network_dispatch":false' 'live sender network dispatch rejected'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"submit_decision":"rejected_before_network"' 'live sender rejected before network'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"request_sent":false' 'live sender boundary no send'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"post_order_called":false' 'live sender boundary post order not called'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"post_orders_called":false' 'live sender boundary post orders not called'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"journaled":true' 'live sender boundary journaled'
+	require_file_contains "$LIVE_SENDER_BOUNDARY_FILE" '"journal_event_id":' 'live sender boundary journal event id'
+	require_file_contains "$FINAL_REVIEW_FILE" '"paper_only":true' 'final review readiness paper-only'
+	require_file_contains "$FINAL_REVIEW_FILE" '"real_orders_enabled":false' 'final review readiness real-orders disabled'
+	require_file_contains "$FINAL_REVIEW_FILE" '"ready_for_real_orders":false' 'final review readiness not ready for real orders'
+	require_file_contains "$FINAL_REVIEW_FILE" '"final_review":' 'final review readiness report'
+	require_file_contains "$FINAL_REVIEW_FILE" '"ready_for_final_review":false' 'final review readiness blocked'
+	require_file_contains "$FINAL_REVIEW_FILE" '"stage":"final_review_blocked"' 'final review readiness stage'
+	require_file_contains "$FINAL_REVIEW_FILE" '"latest_evidence":' 'final review readiness evidence package'
+	require_file_contains "$FINAL_REVIEW_FILE" '"collateral_balance_positive"' 'final review collateral blocker'
+	require_file_contains "$FINAL_REVIEW_FILE" '"explicit_real_trading_config_unlock"' 'final review explicit unlock blocker'
+	require_file_contains "$FINAL_REVIEW_FILE" '"live_order_sender_implemented"' 'final review live sender blocker'
+	require_file_contains "$FINAL_REVIEW_FILE" '"fail_closed_live_sender_boundary"' 'final review live sender boundary gate'
+	require_file_contains "$FINAL_REVIEW_FILE" '"live_sender_boundary_status":' 'final review live sender boundary status'
+	require_file_contains "$FINAL_REVIEW_FILE" '"boundary_name":"LiveOrderSender"' 'final review live sender boundary name'
+	require_file_contains "$FINAL_REVIEW_FILE" '"implementation_name":"FailClosedLiveOrderSender"' 'final review fail-closed sender'
+	require_file_contains "$FINAL_REVIEW_FILE" '"network_sender_present":false' 'final review no network sender'
+	require_file_contains "$FINAL_REVIEW_FILE" '"accepted_for_network_dispatch":false' 'final review rejects network dispatch'
+	require_file_contains "$FINAL_REVIEW_FILE" '"request_sent":false' 'final review no send'
+	require_file_contains "$FINAL_REVIEW_FILE" '"post_order_called":false' 'final review post order not called'
+	require_file_contains "$FINAL_REVIEW_FILE" '"journaled":true' 'final review readiness journaled'
+	require_file_contains "$FINAL_REVIEW_FILE" '"journal_event_id":' 'final review readiness journal event id'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"paper_only":true' 'final review decision paper-only'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"real_orders_enabled":false' 'final review decision real-orders disabled'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"ready_for_real_orders":false' 'final review decision not ready for real orders'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"approved_for_real_orders":false' 'final review decision cannot approve real orders'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"final_review_decision_recorded":true' 'final review decision recorded'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"decision":"acknowledge_blocked"' 'final review decision value'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"final_review_event_valid":true' 'final review decision linked readiness event'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"review_decision_effect":"audit_only_no_unlock"' 'final review decision no-unlock effect'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"readiness_blockers":' 'final review decision readiness blockers'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"live_sender_boundary_fail_closed":true' 'final review decision fail-closed boundary evidence'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"live_sender_boundary_status":' 'final review decision live sender boundary status'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"boundary_name":"LiveOrderSender"' 'final review decision live sender boundary name'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"implementation_name":"FailClosedLiveOrderSender"' 'final review decision fail-closed sender'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"network_sender_present":false' 'final review decision no network sender'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"accepted_for_network_dispatch":false' 'final review decision rejects network dispatch'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"request_sent":false' 'final review decision no send'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"post_order_called":false' 'final review decision post order not called'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"post_orders_called":false' 'final review decision post orders not called'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"journaled":true' 'final review decision journaled'
+	require_file_contains "$FINAL_REVIEW_DECISION_FILE" '"journal_event_id":' 'final review decision journal event id'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"paper_only":true' 'final review decisions paper-only'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"real_orders_enabled":false' 'final review decisions real-orders disabled'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"ready_for_real_orders":false' 'final review decisions not ready'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"approved_for_real_orders":false' 'final review decisions cannot approve real orders'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"gaps_only":false' 'final review decisions normal mode'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"displayed_event_count":' 'final review decisions displayed event count'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"event_type":"clob_final_review_decision"' 'final review decisions event type'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"decision_counts":' 'final review decisions counts'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"boundary_evidence_count":' 'final review decisions boundary evidence count'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"no_network_evidence_count":' 'final review decisions no-network evidence count'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"missing_boundary_evidence_count":' 'final review decisions missing boundary evidence count'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"missing_no_network_evidence_count":' 'final review decisions missing no-network evidence count'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"all_events_have_boundary_evidence":' 'final review decisions all boundary evidence marker'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"all_events_have_no_network_evidence":' 'final review decisions all no-network evidence marker'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"coverage_status":' 'final review decisions coverage status'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"coverage_gaps":' 'final review decisions coverage gaps'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"latest_boundary_status":' 'final review decisions latest boundary status'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"boundary_name":"LiveOrderSender"' 'final review decisions live sender boundary name'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"implementation_name":"FailClosedLiveOrderSender"' 'final review decisions fail-closed sender'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"network_sender_present":false' 'final review decisions no network sender'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"accepted_for_network_dispatch":false' 'final review decisions rejects network dispatch'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"acknowledge_blocked":' 'final review decisions blocked count'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"latest_decision":' 'final review decisions latest decision'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"events":' 'final review decisions events'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"decision":"acknowledge_blocked"' 'final review decisions include verifier decision'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"review_decision_effect":"audit_only_no_unlock"' 'final review decisions no-unlock effect'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"request_sent":false' 'final review decisions no send'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"post_order_called":false' 'final review decisions post order not called'
+	require_file_contains "$FINAL_REVIEW_DECISIONS_FILE" '"post_orders_called":false' 'final review decisions post orders not called'
+	require_file_contains "$FINAL_REVIEW_GAPS_FILE" '"paper_only":true' 'final review gap-only audit paper-only'
+	require_file_contains "$FINAL_REVIEW_GAPS_FILE" '"real_orders_enabled":false' 'final review gap-only audit real-orders disabled'
+	require_file_contains "$FINAL_REVIEW_GAPS_FILE" '"ready_for_real_orders":false' 'final review gap-only audit not ready'
+	require_file_contains "$FINAL_REVIEW_GAPS_FILE" '"approved_for_real_orders":false' 'final review gap-only audit cannot approve real orders'
+	require_file_contains "$FINAL_REVIEW_GAPS_FILE" '"gaps_only":true' 'final review gap-only audit mode'
+	require_file_contains "$FINAL_REVIEW_GAPS_FILE" '"displayed_event_count":' 'final review gap-only displayed event count'
+	require_file_contains "$FINAL_REVIEW_GAPS_FILE" '"coverage_gaps":' 'final review gap-only coverage gaps'
+	require_file_contains "$FINAL_REVIEW_GAPS_FILE" '"missing_boundary_evidence":' 'final review gap-only missing boundary marker'
+	require_file_contains "$FINAL_REVIEW_GAPS_FILE" '"missing_no_network_evidence":' 'final review gap-only missing no-network marker'
+	require_file_contains "$FINAL_REVIEW_GAPS_FILE" '"events":' 'final review gap-only events'
+	require_file_contains "$FINAL_REVIEW_GAPS_FILE" '"request_sent":false' 'final review gap-only no send'
+	require_file_contains "$FINAL_REVIEW_GAPS_FILE" '"post_order_called":false' 'final review gap-only post order not called'
+	require_file_contains "$FINAL_REVIEW_GAPS_FILE" '"post_orders_called":false' 'final review gap-only post orders not called'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"paper_only":true' 'Hermes safety loop paper-only'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"real_orders_enabled":false' 'Hermes safety loop real-orders disabled'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"ready_for_real_orders":false' 'Hermes safety loop not ready for real orders'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"approved_for_real_orders":false' 'Hermes safety loop cannot approve real orders'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"status":"' 'Hermes safety loop status'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"reflection":' 'Hermes safety loop latest reflection'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"age_seconds":' 'Hermes safety loop reflection age'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"summary":' 'Hermes safety loop summary'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"recommendations":' 'Hermes safety loop recommendations'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"clob_safety_loop":' 'Hermes safety loop metrics payload'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"final_review_decision_boundary_evidence_events_24h":' 'Hermes safety loop boundary evidence count'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"final_review_decision_no_network_evidence_events_24h":' 'Hermes safety loop no-network evidence count'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"final_review_decision_missing_boundary_evidence_events_24h":' 'Hermes safety loop missing boundary evidence count'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"final_review_decision_missing_no_network_evidence_events_24h":' 'Hermes safety loop missing no-network evidence count'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"final_review_decision_boundary_coverage":' 'Hermes safety loop boundary coverage'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"missing_boundary_evidence_events":' 'Hermes safety loop nested missing boundary evidence'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"coverage_status":' 'Hermes safety loop boundary coverage status'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"complete_fail_closed_no_network_evidence":' 'Hermes safety loop complete boundary coverage marker'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"latest_final_review_decision_boundary_status":' 'Hermes safety loop latest boundary status'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"network_sender_present":false' 'Hermes safety loop no network sender'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"accepted_for_network_dispatch":false' 'Hermes safety loop rejects network dispatch'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"request_sent":false' 'Hermes safety loop no send'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"post_order_called":false' 'Hermes safety loop post order not called'
+	require_file_contains "$HERMES_SAFETY_LOOP_FILE" '"post_orders_called":false' 'Hermes safety loop post orders not called'
+	require_file_contains "$MARKET_VALIDATION_FILE" '"paper_only":true' 'market metadata validation paper-only'
+	require_file_contains "$MARKET_VALIDATION_FILE" '"real_orders_enabled":false' 'market metadata validation real-orders disabled'
+	require_file_contains "$MARKET_VALIDATION_FILE" '"market_metadata_validation_available":true' 'market metadata validation available'
+	require_file_contains "$MARKET_VALIDATION_FILE" '"request_sent":false' 'market metadata validation no send'
+	require_file_contains "$MARKET_VALIDATION_FILE" '"post_order_called":false' 'market metadata validation post order not called'
+	require_file_contains "$MARKET_VALIDATION_FILE" '"post_orders_called":false' 'market metadata validation post orders not called'
+	require_file_contains "$MARKET_VALIDATION_FILE" '"journaled":true' 'market metadata validation journaled for Hermes'
+	require_file_contains "$MARKET_VALIDATION_FILE" '"blockers":' 'market metadata validation blockers'
+	require_file_contains "$SIGNATURE_DRY_RUN_FILE" '"paper_only":true' 'signed payload dry-run paper-only'
+	require_file_contains "$SIGNATURE_DRY_RUN_FILE" '"real_orders_enabled":false' 'signed payload dry-run real-orders disabled'
+	require_file_contains "$SIGNATURE_DRY_RUN_FILE" '"ready_for_real_orders":false' 'signed payload dry-run not ready'
+	require_file_contains "$SIGNATURE_DRY_RUN_FILE" '"signature_redacted":true' 'signed payload dry-run redacted'
+	require_file_contains "$SIGNATURE_DRY_RUN_FILE" '"would_post":false' 'signed payload dry-run no post'
+	require_file_contains "$SIGNATURE_DRY_RUN_FILE" '"post_order_called":false' 'signed payload dry-run post order not called'
+	require_file_contains "$SIGNATURE_DRY_RUN_FILE" '"post_orders_called":false' 'signed payload dry-run post orders not called'
+	require_file_contains "$SIGNATURE_DRY_RUN_FILE" '"signed_payload_built":false' 'signed payload dry-run no-sign confirmation guard'
+	require_file_contains "$SIGNATURE_DRY_RUN_FILE" '"signed_payload_dry_run_confirmation_missing"' 'signed payload dry-run confirmation blocker'
+	require_file_contains "$POST_REQUEST_DRY_RUN_FILE" '"paper_only":true' 'post request dry-run paper-only'
+	require_file_contains "$POST_REQUEST_DRY_RUN_FILE" '"real_orders_enabled":false' 'post request dry-run real-orders disabled'
+	require_file_contains "$POST_REQUEST_DRY_RUN_FILE" '"ready_for_real_orders":false' 'post request dry-run not ready'
+	require_file_contains "$POST_REQUEST_DRY_RUN_FILE" '"signature_redacted":true' 'post request dry-run signature redacted'
+	require_file_contains "$POST_REQUEST_DRY_RUN_FILE" '"l2_hmac_redacted":true' 'post request dry-run HMAC redacted'
+	require_file_contains "$POST_REQUEST_DRY_RUN_FILE" '"would_send":false' 'post request dry-run no send'
+	require_file_contains "$POST_REQUEST_DRY_RUN_FILE" '"would_post":false' 'post request dry-run no post'
+	require_file_contains "$POST_REQUEST_DRY_RUN_FILE" '"post_order_called":false' 'post request dry-run post order not called'
+	require_file_contains "$POST_REQUEST_DRY_RUN_FILE" '"post_orders_called":false' 'post request dry-run post orders not called'
+	require_file_contains "$POST_REQUEST_DRY_RUN_FILE" '"post_request_dry_run_built":false' 'post request dry-run confirmation guard'
+	require_file_contains "$POST_REQUEST_DRY_RUN_FILE" '"order_post_request_dry_run_confirmation_missing"' 'post request dry-run confirmation blocker'
+	require_file_contains "$POST_REQUEST_DRY_RUN_FILE" '"journaled":true' 'post request dry-run journaled for Hermes'
+	require_file_contains "$HUMAN_APPROVAL_FILE" '"approved_for_facade":true' 'human approval approved for facade'
+	require_file_contains "$HUMAN_APPROVAL_FILE" '"journaled":true' 'human approval journaled'
+	require_file_contains "$HUMAN_APPROVAL_FILE" '"request_sent":false' 'human approval no send'
+	require_file_contains "$HUMAN_APPROVAL_FILE" '"post_order_called":false' 'human approval post order not called'
+	require_file_contains "$HUMAN_APPROVAL_FILE" '"post_orders_called":false' 'human approval post orders not called'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"submission_facade_only":true' 'submit facade only marker'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"real_order_submit_journal_ready":true' 'submit facade submit journal ready'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"submit_decision":"rejected_fail_closed"' 'submit facade fail-closed decision'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"reconciliation_status":"reconciled_no_send"' 'submit facade reconciliation status'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"reconciled":true' 'submit facade reconciled marker'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"paper_only":true' 'submit facade paper-only'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"real_orders_enabled":false' 'submit facade real-orders disabled'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"ready_for_real_orders":false' 'submit facade not ready'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"human_approval_event_valid":true' 'submit facade approval event valid'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"journaled_human_approval_valid"' 'submit facade approval validation check'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"fresh_collateral_readiness_valid"' 'submit facade fresh collateral readiness gate'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"fresh_collateral_balance_positive"' 'submit facade fresh collateral balance blocker'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"fresh_collateral_allowance_positive"' 'submit facade fresh collateral allowance blocker'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"kill_switch_and_risk_limits_available":true' 'submit facade risk gate available'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"projected_order_notional_within_limit"' 'submit facade per-order risk check'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"projected_total_exposure_within_limit"' 'submit facade total exposure check'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"daily_loss_within_limit"' 'submit facade daily loss check'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"max_order_notional"' 'submit facade max order notional'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"max_daily_loss"' 'submit facade max daily loss'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"request_sent":false' 'submit facade no send'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"would_send":false' 'submit facade would not send'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"post_order_called":false' 'submit facade post order not called'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"post_orders_called":false' 'submit facade post orders not called'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"expected_exchange_state":"no_order_created"' 'submit facade no exchange order expected'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"observed_exchange_state":"not_queried_no_send"' 'submit facade no-send observed state'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"reconciliation_journaled":true' 'submit facade reconciliation journaled'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"kill_switch_open"' 'submit facade kill-switch blocker'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"explicit_real_trading_config_unlock"' 'submit facade explicit unlock blocker'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"paper_mode_still_active"' 'submit facade paper-mode blocker'
+	require_file_contains "$SUBMIT_FACADE_FILE" '"journaled":true' 'submit facade journaled for Hermes'
+	require_file_contains "$SUBMIT_RECONCILIATIONS_FILE" '"paper_only":true' 'submit reconciliation paper-only'
+	require_file_contains "$SUBMIT_RECONCILIATIONS_FILE" '"real_orders_enabled":false' 'submit reconciliation real-orders disabled'
+	require_file_contains "$SUBMIT_RECONCILIATIONS_FILE" '"event_type":"clob_order_submit_reconciliation"' 'submit reconciliation event type'
+	require_file_contains "$SUBMIT_RECONCILIATIONS_FILE" '"submit_facade_event_id":' 'submit reconciliation facade link'
+	require_file_contains "$SUBMIT_RECONCILIATIONS_FILE" '"request_sent":false' 'submit reconciliation no send'
+	require_file_contains "$HEALTH_FILE" '"status":"(empty|ok|needs_attention)"' 'review-health status'
+	require_file_contains "$HEALTH_FILE" '"reason_details":' 'review-health reason details'
+	require_file_contains "$HEALTH_FILE" '"recommended_actions":\[' 'review-health recommended actions array'
+	require_file_contains "$HEALTH_FILE" '"id":"(inspect_guidance_exceptions|inspect_review_latency|review_unreviewed_dry_runs|none|no_recent_dry_runs)"' 'known review-health action id'
+	if grep -Eq '"id":"inspect_guidance_exceptions"' "$HEALTH_FILE"; then
+		require_file_contains "$HEALTH_FILE" '"guidance_exception_count":' 'review-health guidance action count'
+	fi
+	if grep -Eq '"id":"inspect_review_latency"' "$HEALTH_FILE"; then
+		require_file_contains "$HEALTH_FILE" '"max_latency_seconds":' 'review-health latency action max age'
+		require_file_contains "$HEALTH_FILE" '"slow_latency_after_seconds":' 'review-health latency action threshold'
+	fi
+	if grep -Eq '"id":"review_unreviewed_dry_runs"' "$HEALTH_FILE"; then
+		require_file_contains "$HEALTH_FILE" '"unreviewed_count":' 'review-health queue action count'
+		require_file_contains "$HEALTH_FILE" '"review_stale_after_seconds":' 'review-health queue action stale threshold'
+	fi
+	require_file_contains "$DRY_RUNS_FILE" '"paper_only":true' 'subpath dry-runs paper-only'
+	require_file_contains "$DRY_RUNS_FILE" '"real_orders_enabled":false' 'subpath dry-runs real-orders disabled'
+	require_file_contains "$DRY_RUNS_FILE" '"event_type":"clob_order_intent_dry_run"' 'subpath dry-runs event type'
+	require_file_contains "$DRY_RUNS_FILE" '"events":' 'subpath dry-runs events'
+	require_file_contains "$REVIEWS_FILE" '"paper_only":true' 'subpath reviews paper-only'
+	require_file_contains "$REVIEWS_FILE" '"real_orders_enabled":false' 'subpath reviews real-orders disabled'
+	require_file_contains "$REVIEWS_FILE" '"event_type":"clob_order_intent_review"' 'subpath reviews event type'
+	require_file_contains "$REVIEWS_FILE" '"decision_counts":' 'subpath review decision counts'
+	require_file_contains "$REVIEW_SUMMARY_FILE" '"paper_only":true' 'subpath review summary paper-only'
+	require_file_contains "$REVIEW_SUMMARY_FILE" '"real_orders_enabled":false' 'subpath review summary real-orders disabled'
+	require_file_contains "$REVIEW_SUMMARY_FILE" '"summary":' 'subpath review summary'
+	require_file_contains "$REVIEW_SUMMARY_FILE" '"items":' 'subpath review summary items'
+	require_file_contains "$REVIEW_BACKLOG_FILE" '"paper_only":true' 'subpath review backlog paper-only'
+	require_file_contains "$REVIEW_BACKLOG_FILE" '"real_orders_enabled":false' 'subpath review backlog real-orders disabled'
+	require_file_contains "$REVIEW_BACKLOG_FILE" '"status":"(empty|fresh|stale)"' 'subpath review backlog status'
+	require_file_contains "$REVIEW_QUEUE_FILE" '"paper_only":true' 'subpath review queue paper-only'
+	require_file_contains "$REVIEW_QUEUE_FILE" '"real_orders_enabled":false' 'subpath review queue real-orders disabled'
+	require_file_contains "$REVIEW_QUEUE_FILE" '"review_stale_after_seconds":' 'subpath review queue stale threshold'
+	require_file_contains "$REVIEW_QUEUE_FILE" '"items":' 'subpath review queue items'
+	require_file_contains "$REVIEW_QUEUE_FILE" '"review_priority":"(stale_unreviewed|blocked_unreviewed|standard_unreviewed)"|"count":0' 'subpath review queue priority metadata'
+	require_file_contains "$GUIDANCE_EXCEPTIONS_FILE" '"paper_only":true' 'subpath guidance exceptions paper-only'
+	require_file_contains "$GUIDANCE_EXCEPTIONS_FILE" '"real_orders_enabled":false' 'subpath guidance exceptions real-orders disabled'
+	require_file_contains "$GUIDANCE_EXCEPTIONS_FILE" '"items":' 'subpath guidance exceptions items'
+	require_file_contains "$GUIDANCE_OVERRIDES_FILE" '"paper_only":true' 'subpath guidance overrides paper-only'
+	require_file_contains "$GUIDANCE_OVERRIDES_FILE" '"real_orders_enabled":false' 'subpath guidance overrides real-orders disabled'
+	require_file_contains "$GUIDANCE_OVERRIDES_FILE" '"items":' 'subpath guidance overrides items'
+echo "     Base href:     $(echo "$HTML" | grep -o '<base href="[^"]*"' | head -1 || echo 'MISSING')"
+echo "     L2 status:     $(echo "$HTML" | grep -o 'id="l2-chip"[^<]*' | head -c 120 || echo 'MISSING L2 chip')"
+echo "     Derive btn:    $(echo "$HTML" | grep -o 'Derive from Server Key' | head -1 || echo 'MISSING')"
+	echo "     CLOB ready:    $(echo "$HTML" | grep -o 'CLOB Readiness\|clob-readiness-panel\|updateClobReadiness' | sort | uniq -c | tr '\n' ' ' || echo 'MISSING CLOB readiness')"
+	echo "     CLOB diag:     $(echo "$HTML" | grep -o 'CLOB Diagnostics\|clob-diagnostics-panel\|updateClobDiagnosticsPanel' | sort | uniq -c | tr '\n' ' ' || echo 'MISSING CLOB diagnostics')"
+	echo "     CLOB operator: $(echo "$HTML" | grep -o 'CLOB Operator Status\|clob-operator-status-panel\|clob-operator-status-actions\|updateClobOperatorStatus\|renderClobOperatorActions\|runClobOperatorAction' | sort | uniq -c | tr '\n' ' ' || echo 'MISSING CLOB operator')"
+	echo "     OP summary:    $(echo "$OPERATOR_STATUS_JSON" | grep -o '"action_summary":{[^}]*}' | head -1 || echo 'MISSING operator action summary')"
+	echo "     OP final:      $(echo "$OPERATOR_STATUS_JSON" | grep -o '"final_review":{[^}]*}\|"approved_for_real_orders":false\|"event_type":"clob_final_review_decision"' | head -5 | tr '\n' ' ' || echo 'MISSING operator final review')"
+	echo "     OP freshness:  $(echo "$OPERATOR_STATUS_JSON" | grep -o '"freshness":{[^}]*}' | head -1 || echo 'MISSING operator freshness')"
+	echo "     OP actions:    $(echo "$OPERATOR_STATUS_JSON" | grep -o '"id":"[^"]*"' | grep -E 'inspect_clob_diagnostics|inspect_clob_preflight|inspect_review_summary|inspect_review_health|inspect_guidance_exceptions|inspect_review_latency|inspect_final_review_decisions|inspect_final_review_coverage_gaps|inspect_hermes_gap_alignment|inspect_hermes_safety_loop|inspect_live_sender_boundary|review_unreviewed_dry_runs|submit_paper_dry_run|none' | tr '\n' ' ' || echo 'MISSING operator actions')"
+	echo "     Order gap:     $(echo "$ORDER_READINESS_JSON" | grep -o '"stage":"[^"]*"\|"completed_count":[0-9]*\|"required_count":[0-9]*\|"blocker_count":[0-9]*\|"fail_closed_live_sender_boundary"\|"network_sender_present":false\|"accepted_for_network_dispatch":false' | tr '\n' ' ' || echo 'MISSING order placement readiness')"
+	echo "     Unlock:        $(cat "$UNLOCK_STATUS_FILE" | grep -o '"explicit_real_order_submission_configured":false\|"live_order_sender_implemented":false\|"paper_mode_active":true\|"journaled":true\|"request_sent":false' | tr '\n' ' ' || echo 'MISSING unlock status')"
+	echo "     Live sender:   $(cat "$LIVE_SENDER_DESIGN_FILE" | grep -o '"ready_for_live_sender_implementation":false\|"stage":"live_sender_design_blocked"\|"approved_for_real_orders":false\|"journaled":true\|"request_sent":false' | tr '\n' ' ' || echo 'MISSING live sender design')"
+	echo "     Sender review: $(cat "$LIVE_SENDER_DESIGN_REVIEW_FILE" | grep -o '"ready_for_design_review":true\|"implementation_permitted":false\|"stage":"design_review_contract_ready"\|"boundary_name":"LiveOrderSender"\|"journaled":true\|"request_sent":false' | tr '\n' ' ' || echo 'MISSING live sender design review')"
+	echo "     Sender bound:  $(cat "$LIVE_SENDER_BOUNDARY_FILE" | grep -o '"boundary_name":"LiveOrderSender"\|"implementation_name":"FailClosedLiveOrderSender"\|"network_sender_present":false\|"accepted_for_network_dispatch":false\|"submit_decision":"rejected_before_network"\|"journaled":true\|"request_sent":false' | tr '\n' ' ' || echo 'MISSING live sender boundary')"
+	echo "     Final review:  $(cat "$FINAL_REVIEW_FILE" | grep -o '"ready_for_final_review":false\|"stage":"final_review_blocked"\|"journaled":true\|"request_sent":false\|"live_order_sender_implemented"\|"fail_closed_live_sender_boundary"\|"network_sender_present":false\|"accepted_for_network_dispatch":false' | tr '\n' ' ' || echo 'MISSING final review readiness')"
+	echo "     Final decision:$(echo "$FINAL_REVIEW_DECISION_JSON" | grep -o '"final_review_decision_recorded":true\|"decision":"acknowledge_blocked"\|"approved_for_real_orders":false\|"review_decision_effect":"audit_only_no_unlock"\|"live_sender_boundary_fail_closed":true\|"network_sender_present":false\|"accepted_for_network_dispatch":false\|"journaled":true\|"request_sent":false' | tr '\n' ' ' || echo 'MISSING final review decision')"
+	echo "     Final decisions:$(echo "$FINAL_REVIEW_DECISIONS_JSON" | grep -o '"event_type":"clob_final_review_decision"\|"decision_counts":\|"boundary_evidence_count":[0-9]*\|"all_events_have_boundary_evidence":[a-z]*\|"decision":"acknowledge_blocked"\|"approved_for_real_orders":false\|"network_sender_present":false\|"accepted_for_network_dispatch":false\|"request_sent":false' | tr '\n' ' ' || echo 'MISSING final review decisions')"
+	echo "     Hermes CLOB:   $(echo "$HERMES_SAFETY_LOOP_JSON" | grep -o '"status":"[^"]*"\|"final_review_decision_boundary_evidence_events_24h":[0-9]*\|"final_review_decision_no_network_evidence_events_24h":[0-9]*\|"final_review_decision_missing_boundary_evidence_events_24h":[0-9]*\|"coverage_status":"[^"]*"\|"complete_fail_closed_no_network_evidence":[a-z]*\|"network_sender_present":false\|"accepted_for_network_dispatch":false\|"real_orders_enabled":false' | tr '\n' ' ' || echo 'MISSING Hermes safety loop')"
+	echo "     Signature dry: $(echo "$SIGNATURE_DRY_RUN_JSON" | grep -o '"signed_payload_built":false\|"signature_redacted":true\|"would_post":false\|"post_order_called":false\|"post_orders_called":false\|"signed_payload_dry_run_confirmation_missing"' | tr '\n' ' ' || echo 'MISSING signature dry-run safety markers')"
+	echo "     POST dry:      $(echo "$POST_REQUEST_DRY_RUN_JSON" | grep -o '"post_request_dry_run_built":false\|"signature_redacted":true\|"l2_hmac_redacted":true\|"would_send":false\|"post_order_called":false\|"post_orders_called":false\|"order_post_request_dry_run_confirmation_missing"\|"journaled":true' | tr '\n' ' ' || echo 'MISSING post request dry-run safety markers')"
+	echo "     Approval:      $(echo "$HUMAN_APPROVAL_JSON" | grep -o '"approved_for_facade":true\|"journaled":true\|"request_sent":false\|"post_order_called":false\|"post_orders_called":false' | tr '\n' ' ' || echo 'MISSING approval workflow safety markers')"
+	echo "     Submit facade: $(echo "$SUBMIT_FACADE_JSON" | grep -o '"submission_facade_only":true\|"submit_decision":"[^"]*"\|"reconciliation_status":"[^"]*"\|"reconciliation_journaled":true\|"human_approval_event_valid":true\|"fresh_collateral_readiness_valid"\|"fresh_collateral_balance_positive"\|"fresh_collateral_allowance_positive"\|"kill_switch_and_risk_limits_available":true\|"projected_order_notional_within_limit"\|"projected_total_exposure_within_limit"\|"daily_loss_within_limit"\|"request_sent":false\|"would_send":false\|"post_order_called":false\|"post_orders_called":false\|"kill_switch_open"\|"explicit_real_trading_config_unlock"\|"paper_mode_still_active"\|"journaled":true' | tr '\n' ' ' || echo 'MISSING submit facade safety markers')"
+	echo "     Submit recon:  $(echo "$SUBMIT_RECONCILIATIONS_JSON" | grep -o '"event_type":"clob_order_submit_reconciliation"\|"request_sent":false\|"submit_facade_event_id":\|"reconciled":true' | tr '\n' ' ' || echo 'MISSING submit reconciliation markers')"
+	echo "     CLOB account:  $(echo "$HTML" | grep -o 'CLOB Account\|clob-account-panel\|updateClobAccountPanel' | sort | uniq -c | tr '\n' ' ' || echo 'MISSING CLOB account')"
+echo "     CLOB preflt:   $(echo "$HTML" | grep -o 'CLOB Preflight\|clob-preflight-panel\|updatePreflightPanel' | sort | uniq -c | tr '\n' ' ' || echo 'MISSING CLOB preflight')"
+	echo "     Subpath CLOB:  status=$(echo "$STATUS_JSON" | grep -o '"read_only_live_check":true' | head -1 || echo 'MISSING') account=$(echo "$ACCOUNT_JSON" | grep -o '"read_only_live_check":true' | head -1 || echo 'MISSING') preflight=$(echo "$PREFLIGHT_JSON" | grep -o '"ready_for_real_orders":false' | head -1 || echo 'MISSING') diagnostics=$(echo "$DIAGNOSTICS_JSON" | grep -o '"ready_for_real_orders":false' | head -1 || echo 'MISSING') operator=$(echo "$OPERATOR_STATUS_JSON" | grep -o '"operator_status":"[^"]*"' | head -1 || echo 'MISSING')"
+echo "     Legacy SSO:    $(echo "$HTML" | grep -o '(legacy edge SSO)' | head -1 || echo 'MISSING (good if hidden)') "
+echo "     Phase 0/ids:   $(echo "$HTML" | grep -oE 'Phase 0|snapshot-card|usdc-val' | sort | uniq -c | tr '\n' ' ' || echo 'MISSING branding')"
+echo "     Scripts:       $(echo "$HTML" | grep -o 'deriveL2FromServerKey\|whoami' | sort | uniq -c | tr '\n' ' ' || echo 'MISSING JS')"
+echo "     Review health: $(echo "$HEALTH" | grep -o '"status":"[^"]*"' | head -1 || echo 'MISSING status')"
+	echo "     RH actions:    $(echo "$HEALTH" | grep -o '"id":"[^"]*"' | grep -E 'inspect_guidance_exceptions|inspect_review_latency|review_unreviewed_dry_runs|none|no_recent_dry_runs' | tr '\n' ' ' || echo 'MISSING actions')"
+	echo "     RH UI hooks:   $(echo "$HTML" | grep -o 'review-health-actions\|renderReviewHealthActions\|runReviewHealthAction' | sort | uniq -c | tr '\n' ' ' || echo 'MISSING review-health UI hooks')"
+	echo "     Dry-runs:      $(echo "$DRY_RUNS_JSON" | grep -o '"count":[0-9]*' | head -1 || echo 'MISSING count') $(echo "$DRY_RUNS_JSON" | grep -o '"event_type":"clob_order_intent_dry_run"' | head -1 || true)"
+	echo "     Reviews:       $(echo "$REVIEWS_JSON" | grep -o '"count":[0-9]*' | head -1 || echo 'MISSING count') $(echo "$REVIEWS_JSON" | grep -o '"decision_counts":' | head -1 || true)"
+	echo "     Review sum:    $(echo "$REVIEW_SUMMARY_JSON" | grep -o '"dry_run_count":[0-9]*' | head -1 || echo 'MISSING dry_run_count')"
+	echo "     Backlog:       $(echo "$REVIEW_BACKLOG_JSON" | grep -o '"status":"[^"]*"' | head -1 || echo 'MISSING status')"
+	echo "     Queue:         $(echo "$REVIEW_QUEUE_JSON" | grep -o '"count":[0-9]*\|"review_priority":"[^"]*"\|"dry_run_age_seconds":[0-9]*' | head -5 | tr '\n' ' ' || echo 'MISSING queue metadata')"
+	echo "     Guidance:      exceptions=$(echo "$GUIDANCE_EXCEPTIONS_JSON" | grep -o '"count":[0-9]*' | head -1 || echo 'MISSING') overrides=$(echo "$GUIDANCE_OVERRIDES_JSON" | grep -o '"count":[0-9]*' | head -1 || echo 'MISSING')"
+	echo "     Dry audit UI:  $(echo "$HTML" | grep -o 'dry-runs-list\|reviews-list\|review-summary-panel\|review-backlog-panel\|guidance-exceptions-list\|guidance-overrides-list\|review-queue-list\|dry-run-detail-panel\|dry-run-result' | sort | uniq -c | tr '\n' ' ' || echo 'MISSING dry-run audit UI')"
+if command -v node >/dev/null 2>&1; then
+  SCRIPT_FILE="/tmp/polytrader-dashboard-verify.js"
+  node - "$HTML_FILE" "$SCRIPT_FILE" <<'NODE'
+const fs = require('fs');
+const htmlFile = process.argv[2];
+const scriptFile = process.argv[3];
+const html = fs.readFileSync(htmlFile, 'utf8');
+const start = html.indexOf('<script>');
+const end = html.indexOf('</script>', start);
+if (start < 0 || end < 0) {
+  throw new Error('dashboard <script> block not found');
+}
+fs.writeFileSync(scriptFile, html.slice(start + '<script>'.length, end));
+NODE
+  node --check "$SCRIPT_FILE" >/dev/null
+  echo "     JS syntax:     OK (node --check)"
+else
+  echo "     JS syntax:     SKIPPED (node not found)"
+fi
+cleanup_pf
+PF_PID=""
+echo ""
+
+# 5. Hermes + overall cluster
+echo "==> 5. Hermes + namespace overview"
+kubectl get deploy/hermes -n "$NAMESPACE" 2>/dev/null || true
+HERMES_CLOB_SAFETY_FILE=$(mktemp)
+kubectl exec -n "$NAMESPACE" polytrader-postgres-1 -- psql -U postgres -d polytrader -tAc "SELECT metrics->'clob_safety_loop' FROM journal.reflections ORDER BY created_at DESC LIMIT 1" > "$HERMES_CLOB_SAFETY_FILE"
+require_file_contains "$HERMES_CLOB_SAFETY_FILE" '"final_review_decision_boundary_evidence_events_24h"[[:space:]]*:' 'Hermes final review decision boundary evidence metric'
+require_file_contains "$HERMES_CLOB_SAFETY_FILE" '"final_review_decision_no_network_evidence_events_24h"[[:space:]]*:' 'Hermes final review decision no-network evidence metric'
+require_file_contains "$HERMES_CLOB_SAFETY_FILE" '"final_review_decision_boundary_coverage"[[:space:]]*:' 'Hermes final review decision boundary coverage summary'
+require_file_contains "$HERMES_CLOB_SAFETY_FILE" '"missing_boundary_evidence_events"[[:space:]]*:' 'Hermes missing boundary evidence metric'
+require_file_contains "$HERMES_CLOB_SAFETY_FILE" '"coverage_status"[[:space:]]*:' 'Hermes boundary coverage status metric'
+require_file_contains "$HERMES_CLOB_SAFETY_FILE" '"complete_fail_closed_no_network_evidence"[[:space:]]*:' 'Hermes complete fail-closed no-network coverage marker'
+require_file_contains "$HERMES_CLOB_SAFETY_FILE" '"latest_final_review_decision_boundary_status"[[:space:]]*:' 'Hermes latest final review decision boundary status'
+require_file_contains "$HERMES_CLOB_SAFETY_FILE" '"real_orders_enabled"[[:space:]]*:[[:space:]]*false' 'Hermes still reports real orders disabled'
+echo "     Hermes CLOB:   $(cat "$HERMES_CLOB_SAFETY_FILE" | grep -Eo '"final_review_decision_events_24h"[[:space:]]*:[[:space:]]*[0-9]*|"final_review_decision_boundary_evidence_events_24h"[[:space:]]*:[[:space:]]*[0-9]*|"final_review_decision_no_network_evidence_events_24h"[[:space:]]*:[[:space:]]*[0-9]*|"missing_boundary_evidence_events"[[:space:]]*:[[:space:]]*[0-9]*|"coverage_status"[[:space:]]*:[[:space:]]*"[^"]*"|"complete_fail_closed_no_network_evidence"[[:space:]]*:[[:space:]]*[a-z]*|"real_orders_enabled"[[:space:]]*:[[:space:]]*false' | tr '\n' ' ' || echo 'MISSING Hermes CLOB metrics')"
+kubectl get all,agentendpoints -n "$NAMESPACE" 2>/dev/null | cat || true
+echo ""
+
+# 6. Public spot check (must 200 or 302 to SSO/login)
+echo "==> 6. Public ngrok spot-check (expect 200 or 302 to login if Google/L2 gated)"
+PUBLIC_RESULT=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' --max-time 8 "$PUBLIC_URL/" || echo "000")
+PUBLIC_STATUS=$(echo "$PUBLIC_RESULT" | awk '{print $1}')
+PUBLIC_REDIRECT=$(echo "$PUBLIC_RESULT" | cut -d' ' -f2-)
+echo "     HTTP $PUBLIC_STATUS  $PUBLIC_REDIRECT"
+if [[ "$PUBLIC_STATUS" != "200" && "$PUBLIC_STATUS" != "302" ]]; then
+  echo "ERROR: unexpected public ngrok status for $PUBLIC_URL/ (HTTP $PUBLIC_STATUS)"
+  exit 1
+fi
+if [[ "$PUBLIC_STATUS" == "302" && -z "$PUBLIC_REDIRECT" ]]; then
+  echo "ERROR: public ngrok returned 302 without redirect_url"
+  exit 1
+fi
+echo "     (Full public SSR requires valid session cookie; unauthenticated 302 is expected.)"
+echo ""
+
+echo "============================================================"
+echo "  VERIFY COMPLETE"
+echo "  - If pod Ready + image has :local- TS + no restarts + L2 'server key (auto)' in logs + SSR has l2-chip + Derive button + <base href=\"/polytrader/\">"
+echo "  - Then this deploy/verify succeeded (guardrails + rust_daytrader patterns held)."
+echo "============================================================"

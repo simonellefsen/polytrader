@@ -77,10 +77,21 @@ pub struct Config {
     /// Whether auth cookies should be marked Secure (true for https prod; false ok for local http paper dev).
     #[arg(long, env = "AUTH_COOKIE_SECURE", default_value_t = false)]
     pub auth_cookie_secure: bool,
+
+    // === Polymarket L2 Trading Auth (2026-05-25 L2 pivot) ===
+    // The private key used for L1 EIP-712 signing to derive L2 apiKey/secret/passphrase.
+    // This is the key from your Polymarket account / deposit wallet.
+    // Loaded via dotenvy (supports .env.local etc).
+    // RISK: This key can create real L2 trading credentials. Never commit it.
+    // We support both POLYMARKET_PRIVATE_KEY (recommended) and PRIVATE_KEY for compatibility
+    // with the polymarket_credentials.py helper.
+    #[arg(long, env = "POLYMARKET_PRIVATE_KEY", default_value = "")]
+    pub polymarket_private_key: String,
 }
 
 impl Config {
     pub fn load() -> Self {
+        dotenvy::from_filename(".env.local").ok();
         dotenvy::dotenv().ok();
         let mut cfg = Self::parse();
 

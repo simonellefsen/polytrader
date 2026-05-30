@@ -21,6 +21,7 @@ mod ui; // Dioxus UI (Phase 2: rsx App now SSR-rendered source + client fetch re
 // Phase 3.2 smallest skeleton (wiki-first per plan/AGENTS; after all docs/decisions/log prepend).
 // mod strategy declares the new artifact (FusionEngine + processors using exact existing patterns: rust_decimal, anyhow, tracing, journal attribution hooks, heavy risk comments, paper-only).
 // No behavior change to any existing path; unused in this increment (full wiring in follow-ups). #[allow] inside strategy/mod.rs for clean clippy.
+mod clob; // gated real/authenticated CLOB client (foundation for future order placement using derived L2 creds)
 mod strategy;
 
 use crate::config::Config;
@@ -32,6 +33,9 @@ use crate::server::{start_server, AppState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Very early fallback logging (in case tracing doesn't flush before fast exit)
+    eprintln!("=== POLYTRADER MAIN ENTERED (pre-tracing) ===");
+
     // Structured logging (json for easy parsing by Hermes later)
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("info,polytrader=debug,sqlx=warn,axum=info,tower_http=debug")
@@ -47,16 +51,55 @@ async fn main() -> Result<()> {
         "🚀 polytrader starting — PAPER MODE ONLY (safety gate active per AGENTS.md)"
     );
 
+    eprintln!("=== TRACING INITIALIZED ===");
+
     // === CONFIG (with dotenv + hard paper gate) ===
+    eprintln!("=== ABOUT TO LOAD CONFIG ===");
     let cfg = Config::load();
+    eprintln!("=== CONFIG LOADED SUCCESSFULLY ===");
     info!(
         mode = %cfg.mode,
         fee_bps = cfg.paper_fee_bps,
         ingest_interval = cfg.ingest_interval_secs,
         bootstrap = ?cfg.bootstrap_market_list(),
+        auth_enabled = cfg.auth_enabled(),
         "config loaded and validated (paper-only)"
     );
     assert_eq!(cfg.mode.to_lowercase(), "paper"); // belt + suspenders
+
+    // === L2 Polymarket Auth (auto-derive on startup if key present) ===
+    // Note: we treat a non-empty POLYMARKET_PRIVATE_KEY_FILE the same as a direct key
+    // (K8s secret injection path). The actual reading + derivation logic lives in
+    // try_auto_derive_l2_on_startup (which also emits useful DEBUG lines).
+    if !std::env::var("POLYMARKET_PRIVATE_KEY")
+        .map(|s| s.is_empty())
+        .unwrap_or(true)
+        || !std::env::var("PRIVATE_KEY")
+            .map(|s| s.is_empty())
+            .unwrap_or(true)
+        || !std::env::var("POLYMARKET_PRIVATE_KEY_FILE")
+            .map(|s| s.is_empty())
+            .unwrap_or(true)
+    {
+        info!("POLYMARKET_PRIVATE_KEY detected — attempting native L2 credential derivation on startup...");
+        // We call the same logic the UI button uses.
+        // Errors are logged but do not crash the server (paper mode safety).
+        match crate::server::try_auto_derive_l2_on_startup().await {
+            Ok(Some(masked)) => {
+                info!(masked_api_key = %masked, "L2 credentials successfully derived on startup using server key");
+            }
+            Ok(None) => {
+                info!("No L2 credentials derived (key present but derivation returned empty)");
+            }
+            Err(e) => {
+                tracing::error!("L2 auto-derive on startup failed: {}. The /l2/* endpoints will still work if you trigger derivation manually.", e);
+            }
+        }
+    } else {
+        info!(
+            "No POLYMARKET_PRIVATE_KEY found — L2 will stay in 'not connected' state until derived"
+        );
+    }
 
     // === DB + MIGRATIONS (embedded sqlx) ===
     let pool = create_pool(&cfg.database_url).await?;
@@ -122,16 +165,18 @@ async fn main() -> Result<()> {
     info!("Endpoints: /health | /markets | /paper/portfolio | /");
     info!("==================================================================");
 
-    // Shutdown future for axum graceful (POC: pending forever so server stays up in k8s;
-    // real signal handling can be restored once root cause of early firing in this env is diagnosed.
-    // K8s will SIGTERM on pod delete/rollout which will terminate the process anyway.)
-    let shutdown = std::future::pending::<()>();
+    // Proper graceful shutdown on SIGTERM/SIGINT (robust for k8s/docker-desktop).
+    // Replaces the previous pending() which had "early firing" issues in this env.
+    // The server will now stay up until k8s sends SIGTERM on rollout/delete.
+    let shutdown = shutdown_signal();
 
     // Run the server directly in main (standard axum + graceful shutdown pattern).
     // The spawned ingestion task will be dropped on shutdown (acceptable for Phase 0;
     // full cancellation token can be added later).
     info!("Starting server (direct await with graceful shutdown)...");
+    eprintln!("=== ABOUT TO CALL start_server (this should block until SIGTERM) ===");
     start_server(server_state, shutdown).await?;
+    eprintln!("=== start_server RETURNED after graceful shutdown ===");
 
     info!("polytrader shutdown complete cleanly.");
     info!("polytrader exiting. All paper activity was journaled.");
@@ -160,4 +205,22 @@ async fn seed_initial_portfolio_if_needed(pool: &sqlx::PgPool, initial_usdc: u64
         info!(initial_usdc, "seeded initial virtual portfolio snapshot");
     }
     Ok(())
+}
+
+/// Create a future that resolves on SIGTERM or SIGINT.
+/// This provides reliable graceful shutdown in k8s (replaces the previous pending() that had early-firing issues in this env).
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+
+    tokio::select! {
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM, initiating graceful shutdown");
+        }
+        _ = sigint.recv() => {
+            info!("Received SIGINT, initiating graceful shutdown");
+        }
+    }
 }

@@ -33,13 +33,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
 
 # Minimal HTTP server for dashboard (Phase 0; full Dioxus later)
 axum = { version = "0.7", features = ["macros"] }
 tower-http = { version = "0.5", features = ["trace"] }
 
-# Ethereum / signing (for future real SDK + L1 auth)
-# alloy will come transitively via polymarket_client_sdk_v2 when added
+# Polymarket CLOB v2 SDK (native L2 derivation via LocalSigner + authentication_builder).
+# This is a heavy dependency (brings in alloy + native crypto crates) that currently
+# requires a newer Rust toolchain (1.91+) and extra build packages to compile.
+# It is therefore optional.
+polymarket_client_sdk_v2 = { version = "0.6.0-canary.1", optional = true, features = ["clob"] }
 
 # Utils
 anyhow = "1"
@@ -57,6 +63,7 @@ tokio-tungstenite = { version = "0.21", optional = true, features = ["rustls-tls
 
 [features]
 default = []
+native-l2 = ["dep:polymarket_client_sdk_v2"]
 clob-ws = ["dep:tokio-tungstenite"]
 
 [dev-dependencies]
