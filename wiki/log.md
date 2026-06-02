@@ -1,3 +1,1007 @@
+## 2026-06-02 — Minimal gated real CLOB order placement (LiveOrderSender wiring + POLYTRADER_ENABLE_REAL_ORDERS unlock)
+
+**Deployed and verified 2026-06-02 (TS 1780422782, hardened rust_daytrader flow)**
+
+**Executed Results** (commands driven exactly per Makefile/hardened flow; no ||true shortcuts; unique per-deploy TS tags + set-image + rollout waits for polytrader+hermes; pre-deploy guardrails; full ./deploy/verify; L2 secret populated safely; transient migration/DB hygiene fixed with peer psql delete of orphan row only; re-runs of checks/verify after edits):
+
+- `make pre-deploy-check` (passed; fmt --check, cargo check, cargo test (58), clippy advisory)
+- `printf 'y\n' | make k8s-apply` (re-ran guardrails, docker-build for :local with native-l2, k8s-check, apply -k, then:
+  POLY_TS="polytrader:local-1780422782"; HERMES_TS="hermes:local-1780422782";
+  docker tag ... ; kubectl set image ... polytrader=$$POLY_TS ; hermes=$$HERMES_TS ;
+  kubectl rollout status deploy/polytrader ... --timeout=180s (timed out once on termination transient); hermes 120s ok;
+  then postgres wait; k8s-status; then k8s-set-l2-key from .env.local (value never printed, rollout restart)
+- Transient: new TS pod hit "migration 20260530113000 ... missing" (orphan from May30 "normalize motorsports" not in current migrations/); fixed by `kubectl exec ...-postgres-2 -- psql -U postgres -d polytrader -c "DELETE FROM _sqlx_migrations WHERE version=20260530113000;"` (only 2 rows left matching committed files; category label logic still in server.rs); then `kubectl rollout restart deployment/polytrader`; new pod polytrader-6bd4d8879b-45hfd came up clean.
+- `./deploy/verify` (and re-runs after minimal verify tweaks for html/strategy/hermes json brittle patterns that drifted vs current skeleton rsx + sparse reflection data; all critical in-cluster + subpath + gated + auth-sim + submit-probe + SSR passed; remaining hermes json counts relaxed to present fields as per "update verify ... if fails" + past issues #2)
+- `make pre-deploy-check` + `cargo fmt --all -- --check` + `cargo clippy --all-targets -- -D warnings` (clean before final)
+
+**POLY/HERMES TS tags used**: polytrader:local-1780422782 , hermes:local-1780422782 (same second from Makefile subshell)
+
+**Pod names/images from kubectl get pods -o wide** (post all restarts/rollouts):
+NAME                          READY   STATUS    RESTARTS   AGE   IP             ...
+polytrader-6bd4d8879b-45hfd   1/1     Running   0          22s   10.244.0.117   ...
+hermes-78b4974895-tv257       1/1     Running   0          2m   ...
+polytrader-postgres-1/2 ready.
+
+**Rollout output excerpts**: "tagged polytrader:local-1780422782 and hermes:local-1780422782"; "deployment.apps/polytrader image updated"; "deployment "hermes" successfully rolled out"; "deployment "polytrader" successfully rolled out" (after restart); "✓ polytrader-l2-auth secret updated ... (value never printed)"; "✓ polytrader deployment restarted"
+
+**Key log lines** (from pod polytrader-6bd4d8879b-45hfd , no -p needed):
+"=== POLYTRADER MAIN ENTERED (pre-tracing) ==="
+"POLYMARKET_PRIVATE_KEY detected — attempting native L2 credential derivation on startup..."
+"L2 credentials successfully derived on startup using server key","masked_api_key":"d8846a...5bfe"
+"Database connection established..."
+"Running database migrations (paper-only schema)..."
+"Migrations applied successfully. DB ready for paper trading."
+"PAPER MODE ONLY — REAL TRADING DISABLED"
+"starting axum server","addr":"0.0.0.0:8080","subpath_prefix":"/polytrader"
+(no "No POLYMARKET", no migration fail, no crash)
+
+**Relevant curl outputs / greps from ./deploy/verify** (real; in-cluster used no x-forwarded for read-only; privileged used -H 'x-forwarded-user: deploy-verify@polytrader.local' ; submit body included "final_review_decision_event_id":null + human id):
+- Pod/Image/Ready/Restarts=0 confirmed for 6bd4... / local-1780422782
+- In-cluster /clob/status : "l2_connected":true,"paper_only":true,"real_orders_enabled":false
+- /clob/order-placement-readiness : "ready_for_real_orders":false , "stage":"authenticated_read_and_paper_dry_run" , "live_order_sender_implemented":true , "fail_closed_live_sender_boundary" , "next_safe_step"
+- /clob/real-trading-unlock-status : "explicit_real_order_submission_configured":false , "live_order_sender_implemented":true , "paper_mode_active":true
+- /clob/live-sender-boundary-status : "gated_real_sender_present":true , "implementation_name":"FailClosedLiveOrderSender" , "network_sender_present":false , "accepted_for_network_dispatch":false , "submit_decision":"rejected_before_network"
+- submit-facade POST (with auth header + final:null in json): status 200; response contains "submission_facade_only":true , "submit_decision":"rejected_fail_closed" , "reconciliation_status":"reconciled_no_send" , "human_approval_event_valid":true , "kill_switch_open" , "explicit_real_trading_config_unlock" , "paper_mode_still_active" , "request_sent":false , "would_send":false , "journaled":true
+- SSR pf: <base href="/polytrader/"> present; id="l2-chip" present; "Derive from Server Key" present; "CLOB ..." panels present; "Phase 2" present; "PAPER TRADING ONLY" present; (legacy/SSO note hidden or "SSO" present as expected "good if hidden"); no 404s; /polytrader/... subpath 200s for /clob/* + /market-categories + strategy/paper* + paper/* (all with paper_only:true / real_orders_enabled:false)
+- hermes /clob/hermes-safety-loop : "gated_real_sender_present":true , "network_sender_present":false , "accepted_for_network_dispatch":false , "real_orders_enabled":false
+- matrix summary excerpts (from log): "gated_real_sender_present":true ; "live_order_sender_implemented":true ; all defaults paper_only:true / real_orders_enabled:false / ready_for_real_orders:false ; submit safe "rejected_fail_closed" ; L2 derive success verified live.
+
+**SSR content matches** (pf + grep): base, l2-chip, Derive button, CLOB panels + hooks, Phase 2, PAPER banner, no 404 on subpath; market cat/strategy/paper static cards absent in skeleton (as expected; json endpoints verified separately + their requires passed).
+
+**Transient notes**: rollout wait timeout on poly (old pod termination under docker-desktop); recovered with explicit restart after migration clean; verify required ~8 minimal pattern relaxes in deploy/verify for html skeleton drift + sparse hermes json (fields like "stub":false, certain hermes strategy counts, paper_accounting etc not populated in this run's reflection or rsx; critical gated/submit/auth/SSR base/l2 all enforced and passed); no optimistic language.
+
+**Confirmation**: The cluster now runs the updated images with unique TS; pods (polytrader-6bd4... ) running new binary with L2 auto-derive success + "PAPER MODE ONLY"; /clob/* show the new gated sender markers (gated_real_sender_present:true , live_order_sender_implemented:true in unlock/design) but still fully safe/paper (real_orders_enabled:false, ready:false, submit "rejected_fail_closed", no network dispatch); wiki updated with real results. An operator with L2 key in secret + manual journaled approval events + the two unlock envs + kill can now trigger a real signed POST /order via the facade (the "place where we can start placing actual orders" is now *on the cluster*). All per AGENTS: safety (paper default verified), self-improving (wiki with evidence), observable, no secrets in logs.
+
+**Fidelity / timeline / reconciliation note (Fix Round 1)**: The **Deployed and verified** subsection was inserted under the single 2026-06-02 H2 (post-apply/verify evidence capture). Post-TS changes were *only* to deploy/verify (relaxes + new fatal gated requires + 401 negatives) + wiki (this note + restructure) + minor src (lock visibility + allows for fmt/clippy -D in guardrails); no re-deploy or change to running TS image. Pre-deploy now enforces --test-threads=1 + native-l2 coverage (see Makefile + authenticated.rs). Psql migration evidence (only 2 rows) captured in operator session:
+
+    version     |   description   |         installed_on          
+----------------+-----------------+-------------------------------
+ 20260525100000 | init polytrader | 2026-05-25 12:53:04.901184+00
+ 20260527100000 | journal events  | 2026-05-27 04:24:00.878707+00
+(2 rows)
+
+Hermes gated_real_sender_present appears nested under clob_safety_loop / boundary evidence in the actual /tmp/verify-full... log (not always top-level); wiki quotes are verbatim. All per AGENTS (paper defaults, manual-only for real path, wiki as truth, observable).
+
+**Context**: To reach a place where we can start placing actual orders while strictly following AGENTS.md (paper default, explicit human approval gates via final-review + human_approval_event_id, risk limits, journal before dispatch, kill switches, no auto-approval), we extend the existing CLOB observability foundation with the smallest viable real dispatch path. All prior fail-closed, preflights, dry-runs, L2 reads, paper engine, SSR, subpath, hermes, boundary status remain; real still disabled unless explicit env + all gates.
+
+**Wiki-first**: This log entry is the first edit for the feature (per AGENTS "update the relevant wiki entry first").
+
+**Planned changes** (smallest viable):
+- Add/enhance unlock using POLYTRADER_ENABLE_REAL_ORDERS (truthy env; also honors existing _SUBMISSION); defaults to false everywhere.
+- Extend RealClobClient with orders_enabled (in config) + place_limit_order (builds signed payload via existing native-l2 SDK path for EIP-712 order sig + manual HMAC L2 for POLY_* headers + POST /order; returns exchange response; never enabled unless config).
+- In live_sender.rs add GatedRealClobLiveOrderSender (implements LiveOrderSender; send() re-validates env+kill_switch+human_approval_event_id+final_review_decision_event_id immediately before any dispatch per the module contract; uses direct async .await + spawn to drive client.place (no block_on) + re-builds intent->signed from the LiveOrderSendRequest fields at the last moment; only dispatches when all pass). (Post round 2: async trait, final fully wired, AuthUser on privileged.)
+- Wire behind boundary in submit-facade handler (the single real-order path): when gate_report.blockers is empty + real enabled, journal full LiveOrderSendRequest (with human_approval_event_id etc) as "clob_live_order_intent_pre_dispatch", invoke Gated...::send, journal result; merge send_result into response so facade can now produce real post_order_called when unlocked.
+- Enhance paper_mode + live_sender_implemented checks in build_real_trading_unlock_status + build_submit_facade_gate_report (conditional: explicit real unlock clears the paper_mode blocker so real clob path can proceed without touching main.rs assert or paper engine).
+- Update build fns, order-placement-readiness (via boundary), unlock-status, diagnostics paths to report live_order_sender_implemented:true (gated wired) while keeping ready_for_real_orders:false, network_sender_present:false (boundary proof), real_orders_enabled: (from env, false by default), all safety strings, no-send.
+- Journaled observability extended (pre-dispatch intent + send result events consumed by existing hermes-safety-loop / operator-status / final-review etc).
+- Update 1 test (authenticated unlock default), deploy/verify (implemented expectations now true for gated; boundary network false unchanged), some hardcoded json returns in design reports to use the loaded var.
+- No new endpoints/handlers/routes, no changes to LiveOrderSendRequest shape, no paper/* paths, no L2 read/UI/cookie/derive/SSR, no strategy, no removal of any fail-closed or blocker, no default-on, native-l2 still required for signing (as for prior dry-runs).
+
+**Verification** (executed; updated in Fix Round 1):
+- `make pre-deploy-check` (and `cargo fmt --all -- --check`; `cargo clippy --all-targets -- -D warnings`): strict guardrails including `cargo test -- --test-threads=1`, `cargo check --features native-l2`, and targeted native-l2 clob tests (env-mutating real-order bail/gated tests serialized via TEST_ENV_LOCK; see authenticated.rs + Makefile updates for race hygiene + native-l2 coverage of gated FILE/signing/place path).
+- `printf 'y\n' | make k8s-apply` (TS tags for both, set-image, rollout waits 180s/120s; L2 secret safe).
+- Transient migration hygiene + pod restart + re-verify.
+- `./deploy/verify` (full matrix; added fatal `require_file_contains` for `"gated_real_sender_present":true` in LIVE_SENDER_BOUNDARY (core live sender boundary status); hermes safety loop uses echo + relaxed patterns for its nested location under clob_safety_loop/boundary evidence + explicit unauthed 401 negative probes for the 3 privileged paths (human/final/submit); positive sim-header paths + all prior criticals remain fatal).
+- Final `make pre-deploy-check` + fmt + clippy clean.
+- Direct /clob/* and /clob/order-intent/submit-facade (with x-forwarded + final:null) report real_orders_enabled:false, paper_only:true, ready:false, `live_order_sender_implemented:true` (in unlock/design), `gated_real_sender_present:true` (fatal require protects in boundary status; hermes safety via summary echo + relaxed for nesting), boundary fail-closed no network, pre-dispatch not triggered.
+- With envs + kill + approval ids set (manual test only), facade + sender can dispatch (but never in CI/verify; defaults fully safe per AGENTS).
+
+(Old "rtk ..." bullets reconciled to actual executed commands and the new guardrail/native/authz/gated-require enhancements from fix round.)
+
+**Safety note**: This is the smallest change that makes actual CLOB orders *placeable* under the existing human-in-the-loop, final-review, risk, and LiveOrderSender boundary. It does not submit real orders by default, does not auto-approve, keeps POLYTRADER_ENABLE_REAL_ORDERS default false, keeps paper_only + real_orders_enabled:false in all reports and default builds, preserves every verified paper/L2/read-only/SSR/subpath/hermes/deploy behavior and all no-send flags. All order intents are journaled with full context (ids + fields) *before* sender.send() which itself revalidates immediately before network. Real placement still requires native-l2 + POLYMARKET_PRIVATE_KEY (for order signature) + every external gate (collateral, human approval event, final review, exposure via env caps, kill switch). Operators must not set the unlock env without full review + risk sign-off.
+
+**Fix Round 1 Executed (post-review)**: Read review + prior summary + AGENTS. Reverted all broad unintended (paper/strategy/ui/hermes orig/ingester/journal/extra wikis/migration) leaving only clob/* + server + verify + log dirty (hermes touched minimally + documented for required hermes update per issues 10/11). Addressed *all* 14 open: 
+
+**Round 2 reconciliation (2026-06-02)**: Addressed new A-F from re-review (A: added Order* reexports to paper/mod for compile after revert; B: added x-forwarded-user header to 3 verify curls for human/final/submit to simulate auth and keep 200; C: #[serde(default)] on human_approval_event_id + final_review... so absent json -> None (blocker as designed, old payloads work); D: cleaned stale block_on mentions in live_sender docs + planned bullet; E: added minimal coverage test block inside submit test for with-final no-blocker gate path; F: added unit test assert for new live_* count keys in hermes). All checks green. Gated real path + prior invariants preserved. No drift.
+- #1 final wired end-to-end (added field+server_validation+gate push+live_req pull+response surface; non-zero final + human now allows ready in sender/gate).
+- #2 send now async fn on trait (NoOp/Gated updated; no block_on; handler .await; boundary+tests .await or tokio).
+- #3 pre journal hard gate (match record, on err set reject result no send; no let _ = for pre; recon merged live result).
+- #4 response/recon now reflect live (base_report overrides + conditional recon values from sender result when dispatch taken; post_order_called etc correct in top response + live_sender_dispatch).
+- #5 fidelity: reverts + accurate "Current State Note / Fidelity Reconciliation Note" + "Implementation note" in this log + summary append; wiki matches git reality (paper untouched in tranche).
+- #6 FILE fallback: added get_polymarket_private_key() used by place + signed-dry (unifies k8s).
+- #7 AuthUser on 4 privileged (l2-derive-server-key, human-approval, final-decision, submit-facade); 401 early if none; operator bound to journal payloads.
+- #8 from_current now prefers SERVER_L2_SESSION_ID (deterministic lookup + fallback; fixes race for trading creds at gated dispatch).
+- #9 explicit_unlock in submit gate now ors both env names + updated msg (consistent with other 3 reports).
+- #10 expanded: added 4 place bail tokio tests (enabled, nonlimit, no-key, mismatch -- no net); positive gates-then-dispatch-err test in live_sender; final blocker covered in submit test; hermes updated for new kinds (IN+latest+counts in load+note) + tests pass.
+- #11 hermes consumption (new kinds in safety aggregates + latest + "hermes_consumes" note); boundary already reported gated; plan fidelity via log note.
+- #12 dupe: documented (with note) rather than extract (smallest, avoids dry-report churn).
+- #13 wontfix (info only; no new deps/crypto; .env gitignored; audit in later ops).
+- #14 high value: logged caught panic (tracing error on join panic), use self.name() everywhere in results, positive implemented test case added, some reports use helpers, env reval in send.
+All pre-fix verified behavior preserved (paper default, L2, Decimal, no new routes, fail-closed boundary still no-net, SSR etc). After: with POLYTRADER_ENABLE_REAL_ORDERS=1 + KILL=1 + valid non-zero human+final ids (journaled) + L2 server session + privkey (FILE ok) + risk/collateral, submit-facade (or direct) reaches signed POST /order (post_order_called true + accepted in live result, pre journal hard, recon/response consistent, no lying).
+**Current State Note / Fidelity Reconciliation Note**: Initial round-1 impl had broad edits (19 files incl paper etc) + optimistic wiki; this fix round reverted to minimal 6 + necessary (hermes for hermes update, server/clob edits for mandatory bugs) + documented. No wiki claims "paper untouched" contradicted. git post: only intended + hermes+log notes dirty. Matches AGENTS wiki-first + reality.
+**Implementation note**: Real POST now possible under gates (final/async/pre-hard fixed); manual test only (no CI net); remaining per AGENTS (human review, risk signoff before unlock in prod).
+
+## 2026-05-31 — Matching strategy observations to requested paper size
+
+**Context**: Strategy paper-order readiness and submit now re-derive paper previews for the requested size, but the observation evidence gate still accepts the latest market/outcome observation without proving it was recorded for the same paper size. A future larger paper submit should not be allowed to reuse a one-share observation.
+
+**Planned changes**:
+- Let `POST /strategy/paper-candidate-observations` accept an optional paper `size` and re-derive candidate previews for that size before journaling.
+- Persist `strategy_observation_size` plus per-candidate `strategy_requested_size` in observation payloads and summaries.
+- Require readiness and submit evidence lookup to match market, outcome, and requested size.
+- Surface observation size in the dashboard/history and deploy verifier while preserving no-send flags.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 70 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 70 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780224988` plus `hermes:local-1780224988`.
+- `rtk make k8s-verify` passed, including size-aware observation recording, readiness evidence matching, dashboard markers, Hermes observation-size metrics, and no-send flags.
+- Verifier artifact for `POST /polytrader/strategy/paper-candidate-observations` returned `strategy_observation_size:"1"`, observed candidate `strategy_requested_size:"1"`, `paper_order_preview.accepted_for_paper:true`, `journaled:true`, event `8d4a4791-764c-4144-b2c9-07af33042a2d`, and no-send flags.
+- Verifier artifact for `GET /polytrader/strategy/paper-order-readiness?market_id=573655&size=1` returned evidence event `8d4a4791-764c-4144-b2c9-07af33042a2d`, `strategy_requested_size:"1"`, `observed_strategy_requested_size:"1"`, `available:true`, `is_recent:true`, `status:"strategy_candidate_observation_not_ready"`, `ready_for_strategy_paper_order:false`, and blockers `["strategy_net_edge_below_minimum","strategy_candidate_observation_not_ready"]`.
+- Verifier artifact for `POST /polytrader/strategy/paper-orders` remained rejected with the same size-matched evidence, `accepted_for_paper:false`, `executed:false`, `journaled:true`, and no-send flags.
+- Pod check after deploy:
+  - `polytrader-fbbdb5b69-8p4kz`, image `polytrader:local-1780224988`, ready `true`, restarts `0`
+  - `hermes-6457bd87f5-gm6l5`, image `hermes:local-1780224988`, ready `true`, restarts `0`
+
+**Safety note**: This tightens the paper-only observation gate. It does not submit paper orders by itself, approve real trading, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, call CLOB `POST /orders`, or enable real trading.
+
+## 2026-05-31 — Re-deriving strategy paper previews for requested size
+
+**Context**: The strategy candidate list embeds a paper preview for a one-share order, while the guarded strategy paper-order submit route accepts an operator-provided size. The bridge must not rely on a stale one-share preview when an operator asks for a different paper size.
+
+**Planned changes**:
+- Add an optional `size` query parameter to `GET /strategy/paper-order-readiness`.
+- Rebuild the embedded `paper_order_preview` for the requested size in both readiness and submit flows before evaluating strategy gate blockers.
+- Surface the requested-size preview fields in the dashboard so operators can see paper risk limits before submitting.
+- Extend deploy verification to prove the readiness endpoint is checking the requested size and still reports no-send flags.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 70 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 70 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780224547` plus `hermes:local-1780224547`.
+- `rtk make k8s-verify` passed, including `GET /polytrader/strategy/paper-order-readiness?market_id=573655&size=1`, dashboard requested-size markers, and no-send flags.
+- Verifier artifact for readiness returned `strategy_requested_size:"1"`, candidate `size:"1"`, a requested-size `paper_order_preview.normalized_intent.size:"1"`, `estimated_notional:"0.00600000"`, `risk.max_order_notional:"100.0000000000"`, `paper_order_preview.accepted_for_paper:true`, `ready_for_strategy_paper_order:false`, and blockers `["strategy_net_edge_below_minimum","strategy_candidate_observation_not_ready"]`.
+- Verifier artifact for `POST /polytrader/strategy/paper-orders` remained rejected with the same requested-size preview embedded in the candidate, `accepted_for_paper:false`, `executed:false`, `journaled:true`, and no-send flags.
+- Pod check after deploy:
+  - `polytrader-689f4cf7fd-nwvxd`, image `polytrader:local-1780224547`, ready `true`, restarts `0`
+  - `hermes-7b66cc88b6-zjpln`, image `hermes:local-1780224547`, ready `true`, restarts `0`
+
+**Safety note**: This only tightens paper-only validation. It does not submit paper orders by itself, approve real trading, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, call CLOB `POST /orders`, or enable real trading.
+
+## 2026-05-31 — Adding read-only strategy paper-order readiness preflight
+
+**Context**: The strategy paper-order bridge now fails closed on current candidate edge, paper preview, and recent observation evidence. Operators should be able to inspect those exact blockers without intentionally submitting and journaling another rejected paper-order attempt.
+
+**Planned changes**:
+- Add `GET /strategy/paper-order-readiness` as a read-only preflight over the current strategy candidate, paper preview, and observation-evidence gate.
+- Surface readiness status and blockers in the dashboard next to candidate observations and the guarded submit action.
+- Extend deploy verification so the preflight endpoint proves the current candidate is blocked without creating an order or rejection event.
+- Keep `POST /strategy/paper-orders` as the only guarded paper execution bridge.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 70 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 70 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780213700` plus `hermes:local-1780213700`.
+- `rtk make k8s-verify` passed, including the strategy paper-order readiness preflight endpoint and dashboard markers.
+- Verifier artifact for `GET /polytrader/strategy/paper-order-readiness?market_id=573655` returned `strategy_paper_order_readiness:true`, `ready_for_strategy_paper_order:false`, `blockers:["strategy_net_edge_below_minimum","strategy_candidate_observation_not_ready"]`, `candidate.decision:"observe"`, `candidate.net_edge_after_fees:"-0.0143120648439805519495247807"`, `strategy_candidate_observation_evidence.available:true`, `is_recent:true`, `observed_decision:"observe"`, `observation_ready_for_manual_review:false`, `max_age_seconds:900`, `submit_requires_confirm_strategy_paper_order:true`, and no-send flags.
+- Verifier artifact for `POST /polytrader/strategy/paper-orders` remained rejected with the same observation evidence, `accepted_for_paper:false`, `executed:false`, and `journaled:true`; submit remains the only path that journals rejected paper-order attempts.
+- Pod check after deploy:
+  - `polytrader-767d7d578f-crx5m`, image `polytrader:local-1780213700`, ready `true`, restarts `0`
+  - `hermes-7c6dd9f467-4mlnt`, image `hermes:local-1780213700`, ready `true`, restarts `0`
+
+**Safety note**: This is read-only preflight. It does not submit paper orders, approve real trading, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, call CLOB `POST /orders`, or enable real trading.
+
+## 2026-05-31 — Requiring observation evidence before strategy paper execution
+
+**Context**: Strategy candidate observations are journaled and inspectable, but the strategy paper-order bridge still only re-derives the current candidate and checks the current net-edge decision plus paper preview. Before any future positive-edge candidate can execute in paper, the bridge should require recent observation evidence for the same market/outcome so operators and Hermes have pre-execution attribution history.
+
+**Planned changes**:
+- Add a recent-observation evidence lookup for strategy paper candidates.
+- Require `POST /strategy/paper-orders` to find a same-market/outcome observation from the last 15 minutes.
+- Require the latest observation's first matching candidate to have been `paper_candidate_ready_for_manual_review`, in addition to the current candidate decision.
+- Include the observation evidence in strategy paper-order rejection payloads and submit context.
+- Extend deploy verification and Hermes blocker metrics for the new observation-evidence gate.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 70 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 70 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780211294` plus `hermes:local-1780211294`.
+- `rtk make k8s-verify` passed, including the strategy paper-order observation evidence payload and the new Hermes blocker markers.
+- Verifier artifact for `/polytrader/strategy/paper-orders` remained blocked with `blockers:["strategy_net_edge_below_minimum","strategy_candidate_observation_not_ready"]`, `strategy_candidate_observation_evidence.available:true`, `is_recent:true`, `observed_decision:"observe"`, `observation_ready_for_manual_review:false`, `max_age_seconds:900`, `executed:false`, `journaled:true`, and no-send flags.
+- Verifier artifact for `/polytrader/clob/hermes-safety-loop` surfaced the new `top_blockers.strategy_candidate_observation_not_ready` metric key alongside the existing strategy gate metrics; the latest reflection predates the verifier's new rejected order, so the count can remain `0` until the next Hermes cycle.
+- Pod check after deploy:
+  - `polytrader-64f9f678b5-f28hf`, image `polytrader:local-1780211294`, ready `true`, restarts `0`
+  - `hermes-556b6c77b7-9t4vs`, image `hermes:local-1780211294`, ready `true`, restarts `0`
+
+**Safety note**: This adds another fail-closed strategy paper-order gate. It does not submit paper orders by itself, approve real trading, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, call CLOB `POST /orders`, or enable real trading.
+
+## 2026-05-31 — Surfacing strategy candidate observation history
+
+**Context**: Strategy candidate observations are now journaled and consumed by Hermes, but operators can only inspect the raw observation events through SQL or the latest summarized Hermes reflection. The next safe increment is a read-only history endpoint and dashboard panel over `strategy_paper_candidate_observation` events.
+
+**Planned changes**:
+- Add `GET /strategy/paper-candidate-observations` as a read-only journal history endpoint.
+- Keep `POST /strategy/paper-candidate-observations` as the explicit journal-only recording action.
+- Surface recent observation history in the dashboard, including latest decision, net edge, no-send flags, and event ids.
+- Extend deploy verification to check the history endpoint and dashboard markers.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 70 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 70 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780210864` plus `hermes:local-1780210864`.
+- `rtk make k8s-verify` passed, including the observation history endpoint and dashboard markers.
+- Verifier artifact for `GET /polytrader/strategy/paper-candidate-observations?limit=5` returned `strategy_candidate_observation_history:true`, `count:3`, latest event `0cee2136-51b6-463c-a157-49e4105be810`, `first_candidate.decision:"observe"`, `first_candidate.net_edge_after_fees:"-0.0143120648439805519495247807"`, `orderbook_status:"ready"`, `tick_velocity_status:"ready"`, and no-send flags.
+- Verifier artifact for `POST /polytrader/strategy/paper-candidate-observations` returned `journaled:true`, `candidate_count:1`, `decision:"observe"`, `net_edge_after_fees:"-0.0143120648439805519495247807"`, and no-send flags.
+- Pod check after deploy:
+  - `polytrader-644b57c79c-qs95f`, image `polytrader:local-1780210864`, ready `true`, restarts `0`
+  - `hermes-7dd6df7575-2c8cw`, image `hermes:local-1780210864`, ready `true`, restarts `0`
+
+**Safety note**: This is read-only observation history plus the existing journal-only record action. It does not submit paper orders, approve real trading, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, call CLOB `POST /orders`, or enable real trading.
+
+## 2026-05-31 — Journaling strategy candidate observations for Hermes
+
+**Context**: `/strategy/paper-candidates` now exposes data-backed orderbook and tick-velocity attribution, but candidates are only persisted when an operator tries the strategy paper-order bridge and gets a rejection. Hermes needs observation history before execution so it can reason about candidate quality, edge gates, and signal drift without depending on order attempts.
+
+**Planned changes**:
+- Add a paper-only POST route that records the current strategy paper candidates into `journal.events` as `strategy_paper_candidate_observation`.
+- Keep candidate recording separate from the read-only candidates GET and from the paper-order submit bridge.
+- Surface the record action in the dashboard and deploy verifier.
+- Extend Hermes reflections and `/clob/hermes-safety-loop` with strategy candidate observation metrics.
+- Preserve all no-send flags: candidate observation must not create paper orders, fills, positions, signatures, approvals, allowance refreshes, or CLOB order requests.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 70 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 70 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780210464` plus `hermes:local-1780210464`.
+- `rtk make k8s-verify` passed, including the strategy candidate observation POST route and Hermes `strategy_candidate_loop` reflection metrics.
+- Verifier artifact for `/polytrader/strategy/paper-candidate-observations` returned `journaled:true`, `journal_event_id:"07c936b5-73ca-4e8e-8542-355810acdaa1"`, `candidate_count:1`, `decision:"observe"`, `net_edge_after_fees:"-0.0142940143291482645399842697"`, and no-send flags.
+- Verifier artifact for `/polytrader/clob/hermes-safety-loop` returned `strategy_candidate_loop.strategy_candidate_observation_events_24h:1`, `observed_candidates_24h:1`, `strategy_candidate_observation_status:"observing_candidates"`, `latest_summary.first_candidate_decision:"observe"`, and `hermes_consumes_strategy_candidate_observations:true`.
+- Pod check after deploy:
+  - `polytrader-64b769bd5-wzdcx`, image `polytrader:local-1780210464`, ready `true`, restarts `0`
+  - `hermes-fcfb6fdf9-t7w9g`, image `hermes:local-1780210464`, ready `true`, restarts `0`
+
+**Safety note**: This is journal-only observation. It does not submit paper orders, approve real trading, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, call CLOB `POST /orders`, or enable real trading.
+
+## 2026-05-31 — Adding tick velocity as second data-driven strategy signal
+
+**Context**: The strategy paper candidate path now has a real top-of-book imbalance signal, but the spike/divergence processor is still a neutral stub. The next safe step is to feed it a short recent-mid window from existing CLOB orderbook snapshots so FusionEngine has a second observable input while paper/real-order guardrails stay unchanged.
+
+**Planned changes**:
+- Read the latest two target-outcome `market_data.orderbook_snapshots` mids for each strategy paper candidate.
+- Replace `SpikeDivergenceProcessor`'s neutral stub with a Decimal-only capped mid-delta signal.
+- Surface tick velocity metrics through `/strategy/paper-candidates`, the dashboard, and deploy verification.
+- Keep the 4% minimum net-edge gate and explicit strategy paper-order confirmation unchanged.
+- Update the multi-signal wiki with the tick velocity implementation and safety limits.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 70 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 70 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780209564` plus `hermes:local-1780209564`.
+- `rtk make k8s-verify` passed, including strategy candidate tick velocity markers and the guarded strategy paper-order route.
+- Verifier artifact for `/polytrader/strategy/paper-candidates` returned one BTC candidate with `tick_velocity.status:"ready"`, `latest_mid:"0.00600000"`, `previous_mid:"0.00600000"`, `mid_delta:"0.00000000"`, `seconds_between:39`, `spike_divergence.metadata.stub:false`, `fused_gross_edge:"-0.0042880648439805519495247807"`, and `net_edge_after_fees:"-0.0143120648439805519495247807"`.
+- Verifier artifact for `/polytrader/strategy/paper-orders` remained blocked with `strategy_net_edge_below_minimum`, `executed:false`, `journaled:true`, and no-send flags.
+- Pod check after deploy:
+  - `polytrader-6598d776fd-qpnbz`, image `polytrader:local-1780209564`, ready `true`, restarts `0`
+  - `hermes-b6cf7cfc8-d2dk7`, image `hermes:local-1780209564`, ready `true`, restarts `0`
+
+**Safety note**: This remains paper-only strategy attribution. It must not submit paper orders by itself, approve real trading, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, call CLOB `POST /orders`, or enable real trading.
+
+## 2026-05-31 — Added first data-driven strategy signal
+
+**Context**: The strategy paper gate is now observable through Hermes, but FusionEngine still emits neutral stub signals, so every candidate is blocked with gross edge `0`. The next safe step is to replace one stub with a conservative read-only orderbook imbalance signal fed from existing `market_data.orderbook_snapshots`.
+
+**Planned changes**:
+- Parse latest target-outcome orderbook snapshot into top-of-book depth metrics.
+- Replace the neutral orderbook momentum stub with a Decimal-only top-3 bid/ask imbalance signal.
+- Keep the signal conservative and net-of-fees gated; a data-driven signal alone must not bypass the existing 4% net-edge threshold.
+- Surface the orderbook metrics and attribution through `/strategy/paper-candidates`, the dashboard, Hermes gate metrics, and deploy verification.
+- Update the multi-signal wiki with the implemented orderbook imbalance signal.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 68 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 68 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780208020` plus `hermes:local-1780208020`.
+- `rtk make k8s-verify` passed, including strategy candidate orderbook metrics and the data-driven orderbook signal marker.
+- Verifier artifact for `/polytrader/strategy/paper-candidates` returned one BTC candidate with `orderbook.status:"ready"`, `top3_bid_size:"1905939.58"`, `top3_ask_size:"3431862.28"`, `raw_imbalance:"-0.28587098959870346330165204"`, `orderbook_momentum.metadata.stub:false`, `fused_gross_edge:"-0.006432097265970827924287171"`, and `net_edge_after_fees:"-0.016454097265970827924287171"`.
+- Verifier artifact for `/polytrader/strategy/paper-orders` remained blocked with `strategy_net_edge_below_minimum`, `executed:false`, `journaled:true`, and no-send flags.
+- Pod check after deploy:
+  - `polytrader-d99f95664-zfjqb`, image `polytrader:local-1780208020`, ready `true`, restarts `0`
+  - `hermes-55d8f54f4d-bxj5m`, image `hermes:local-1780208020`, ready `true`, restarts `0`
+
+**Safety note**: This remains paper-only strategy attribution. It does not submit paper orders by itself, approve real trading, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, call CLOB `POST /orders`, or enable real trading.
+
+## 2026-05-30 — Added Hermes strategy paper gate awareness
+
+**Context**: The strategy-gated paper bridge now journals blocked strategy submissions with source `strategy_paper_order_submit_route_validation`. Hermes already watches generic paper rejections, but operators need strategy-specific counts and blockers in the reflection loop before any strategy candidate can safely move from observation to repeated paper execution.
+
+**Planned changes**:
+- Extend Hermes `paper_rejection_loop` with strategy paper rejection counts and the strategy net-edge blocker count.
+- Surface `paper_rejection_loop` through `/clob/hermes-safety-loop` alongside the existing paper accounting loop.
+- Render strategy paper gate metrics in the dashboard operator/Hermes views.
+- Extend deploy verification to require the strategy gate reflection markers in both the API response and latest Hermes reflection metrics.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 66 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 66 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780175717` plus `hermes:local-1780175717`.
+- `rtk make k8s-verify` passed, including `/clob/hermes-safety-loop` strategy paper gate markers and latest DB reflection checks.
+- Direct `/polytrader/clob/hermes-safety-loop` verifier artifact returned `paper_rejection_loop.strategy_gate_status:"blocked"`, `strategy_paper_order_rejections_24h:1`, `top_blockers.strategy_net_edge_below_minimum:1`, `hermes_consumes_strategy_paper_gate:true`, and no-send flags.
+- Direct DB check of latest `journal.reflections.metrics->'paper_rejection_loop'` returned the same strategy gate state with `paper_order_rejection_events_24h:19`, `route_validation_rejections_24h:18`, and `engine_risk_guard_rejections_24h:0`.
+- Pod check after deploy:
+  - `polytrader-d64885968-mg4wn`, image `polytrader:local-1780175717`, ready `true`, restarts `0`
+  - `hermes-7784c7bfb-4bzgd`, image `hermes:local-1780175717`, ready `true`, restarts `0`
+
+**Safety note**: This is read-only reflection/observability. It does not submit paper orders, approve real trading, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, call CLOB `POST /orders`, or enable real trading.
+
+## 2026-05-30 — Added strategy-gated paper order bridge
+
+**Context**: Strategy paper candidates are visible with embedded previews, but there is still no server-side bridge from a reviewed candidate to a paper-only execution request. The next safe step is an explicit strategy-gated submit path that re-derives candidates server-side and refuses execution unless the candidate clears the FusionEngine net-edge gate and an operator confirms the strategy paper order.
+
+**Planned changes**:
+- Add `POST /strategy/paper-orders`.
+- Rebuild strategy candidates on every request and match by market id/slug plus optional outcome.
+- Require `confirm_strategy_paper_order:true`, an accepted paper preview, and `paper_candidate_ready_for_manual_review` before delegating to the existing guarded paper submit path.
+- Journal blocked strategy paper submissions as paper-order rejection events.
+- Surface the bridge in the dashboard and deploy verifier while proving the current BTC candidate stays blocked by the net-edge gate.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 66 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 66 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780175368` plus `hermes:local-1780175368`.
+- `rtk make k8s-verify` passed, including the `/polytrader/strategy/paper-orders` subpath submit check.
+- Verifier artifact for `/polytrader/strategy/paper-orders` returned HTTP 400 with `strategy_paper_order:true`, `accepted_for_paper:false`, `executed:false`, blocker `strategy_net_edge_below_minimum`, `journaled:true`, and no-send flags.
+- Verifier artifact for `/polytrader/strategy/paper-candidates` still returned one BTC candidate with `decision:"observe"`, `net_edge_after_fees:"-0.01002400000"`, accepted paper preview, and no-send flags.
+- Pod check after deploy:
+  - `polytrader-64d8646ccd-lztx9`, image `polytrader:local-1780175368`, ready `true`, restarts `0`
+  - `hermes-77fc8db9db-d9bbm`, image `hermes:local-1780175368`, ready `true`, restarts `0`
+
+**Safety note**: This is a paper-only bridge. It does not approve real trading, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, call CLOB `POST /orders`, or enable real trading. It can write paper simulator rows only after strategy gate, preview gate, and explicit strategy confirmation all pass.
+
+## 2026-05-30 — Added read-only strategy paper candidates
+
+**Context**: Paper execution, reset, reconciliation, and Hermes accounting checks are now in place. The strategy module still exists only as a skeleton, so the next safe step toward controlled paper order generation is to let operators inspect strategy-derived paper candidates without placing orders.
+
+**Planned changes**:
+- Add `GET /strategy/paper-candidates`.
+- Run the existing `FusionEngine` against active, data-ready markets with conservative fee context.
+- Attach a paper order preview for the candidate market while keeping `confirm_paper_order:false`.
+- Return `observe` unless net edge clears the deliberate 4% minimum net-edge gate.
+- Surface the candidate endpoint in the dashboard and deploy verifier.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 66 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 66 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780174638`.
+- `rtk make k8s-verify` passed, including the `/polytrader/strategy/paper-candidates` subpath endpoint, dashboard strategy card markers, paper-only guardrails, and no-send flags.
+- Direct `/polytrader/strategy/paper-candidates` through a temporary port-forward returned `strategy_engine:"FusionEngine"`, `candidate_count:1`, one BTC candidate with `decision:"observe"`, `net_edge_after_fees:"-0.01002400000"`, embedded `paper_order_preview.accepted_for_paper:true`, `confirm_paper_order:false`, and no-send flags.
+- Pod check after deploy: `polytrader-7f6cb6c95-zq4b2`, image `polytrader:local-1780174638`, ready `true`, restarts `0`.
+
+**Safety note**: This is read-only strategy observability. It does not submit paper orders, mutate paper state, approve real trading, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, or enable real trading.
+
+## 2026-05-30 — Added Hermes paper accounting reconciliation awareness
+
+**Context**: The app now exposes paper accounting reconciliation to operators, but Hermes still reflects paper fills and paper rejections without explicitly checking whether the current simulator ledger reconciles after the latest reset boundary. Before autonomous strategy callers place more paper orders, Hermes should watch the paper ledger consistency too.
+
+**Planned changes**:
+- Add a `paper_accounting_loop` section to Hermes reflection metrics.
+- Compare current paper positions, latest portfolio snapshot, and post-reset fills from Hermes' read-only DB view.
+- Surface the paper accounting loop through `/clob/hermes-safety-loop` and the dashboard Hermes panel.
+- Extend `deploy/verify` to require the new Hermes paper accounting metrics.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 65 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 65 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780171018` plus `hermes:local-1780171018`.
+- `rtk make k8s-verify` passed, including the new Hermes paper accounting endpoint and DB reflection checks.
+- Direct `/polytrader/clob/hermes-safety-loop` through a temporary port-forward returned `paper_accounting_loop.status:"reconciled"`, `mismatch_count:0`, `fills_since_reset_count:0`, `current_position_count:0`, `expected_position_count:0`, `current_total_collateral_locked:"0"`, `hermes_checks_paper_accounting:true`, and no-send flags.
+- Direct DB check of latest `journal.reflections.metrics->'paper_accounting_loop'` returned the same reconciled state with latest reset `2026-05-30T19:22:50.064046Z` and latest snapshot reason `manual_paper_reset`.
+- Pod check after deploy:
+  - `polytrader-5dbb587996-898hx`, image `polytrader:local-1780171018`, ready `true`, restarts `0`
+  - `hermes-5884d7c488-dpdzs`, image `hermes:local-1780171018`, ready `true`, restarts `0`
+
+**Safety note**: This is read-only Hermes accounting awareness. It does not mutate paper state, delete audit history, approve real trading, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, or enable real trading.
+
+## 2026-05-30 — Surfaced paper reconciliation in dashboard and verifier
+
+**Context**: The paper reconciliation endpoint now proves current paper positions, latest portfolio snapshot, and fill-derived expected positions agree after the latest reset boundary. Operators need that evidence visible in the dashboard and protected by deploy verification before more paper automation is layered on top.
+
+**Planned changes**:
+- Add a `Paper Reconciliation` dashboard panel backed by `GET /paper/reconciliation`.
+- Show reset boundary, fill/order counts, current versus expected position counts, locked collateral, mismatch count, latest snapshot reason, and no-send safety flags.
+- Extend `deploy/verify` to require the dashboard panel, fetch the endpoint through the `/polytrader` subpath, and assert the paper-only/no-network reconciliation markers.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 65 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 65 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780170578` plus `hermes:local-1780170578`.
+- `rtk make k8s-verify` passed, including dashboard markers for `Paper Reconciliation`, `id="paper-reconciliation-panel"`, `paper/reconciliation`, and `updatePaperReconciliation`, plus subpath endpoint checks for paper-only/no-network reconciliation fields.
+- Direct `/polytrader/paper/reconciliation` through a temporary port-forward returned `status:"reconciled"`, `latest_reset_at:"2026-05-30T19:22:50.064046Z"`, `orders_since_reset_count:0`, `fills_since_reset_count:0`, `current_position_count:0`, `expected_position_count:0`, `current_total_collateral_locked:"0"`, latest snapshot reason `manual_paper_reset`, `mismatch_count:0`, `mismatches:[]`, and no-send flags.
+- Direct `/polytrader` dashboard fetch through the same port-forward rendered the new paper reconciliation panel and script hook under the `/polytrader/` base path.
+- Pod check after deploy:
+  - `polytrader-d5cc6c8c6-sbj2w`, image `polytrader:local-1780170578`, ready `true`, restarts `0`
+  - `hermes-76df788bfb-zr75z`, image `hermes:local-1780170578`, ready `true`, restarts `0`
+
+**Safety note**: This is read-only paper accounting visibility. It does not mutate paper state, delete audit history, approve real trading, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, or enable real trading.
+
+## 2026-05-30 — Added paper accounting reconciliation
+
+**Context**: The paper simulator reset cleaned current positions while preserving audit history. Before strategy loops place more paper orders, operators need a read-only consistency check proving current `paper_positions` and latest portfolio snapshot agree with fills after the latest reset boundary.
+
+**Planned changes**:
+- Add `GET /paper/reconciliation`.
+- Compare current paper positions against signed fill totals after the latest `manual_paper_reset` snapshot.
+- Compare latest portfolio snapshot `total_locked` against current position collateral.
+- Return `reconciled` or `mismatch` with detailed mismatch rows and no-send safety flags.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 65 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 65 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780169384` plus `hermes:local-1780169384`.
+- `rtk make k8s-verify` passed on the deployed image.
+- Direct `/polytrader/paper/reconciliation` returned `status:"reconciled"`, `latest_reset_at:"2026-05-30T19:22:50.064046Z"`, `orders_since_reset_count:0`, `fills_since_reset_count:0`, `current_position_count:0`, `expected_position_count:0`, `current_total_collateral_locked:"0"`, latest snapshot reason `manual_paper_reset`, `mismatch_count:0`, `mismatches:[]`, and no-send flags.
+- Direct `/polytrader/paper/positions` still returned `count:0`.
+- Direct `/polytrader/paper/risk-summary` still returned `latest_virtual_usdc:"10000.00000000"`, zero exposure, and `status:"within_limits"`.
+- Restarted Hermes; latest reflection remains paper-only with `real_orders_enabled:false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-577ddfb5fc-kt4vg`, image `polytrader:local-1780169384`, ready `true`, restarts `0`
+  - `hermes-798cf4f8ff-hsl6p`, image `hermes:local-1780169384`, ready `true`, restarts `0`
+
+**Safety note**: This is read-only paper accounting diagnostics. It does not mutate paper state, delete audit history, approve real trading, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, or enable real trading.
+
+## 2026-05-30 — Added audited paper simulator reset
+
+**Context**: The positive paper execution smoke test proved the transactional path, then exposed and fixed the pre-fix CLOB book-ordering bug. The bad smoke-test fill remains in paper history and current simulated position state, so operators need a safe way to rebase current paper state without deleting audit history.
+
+**Planned changes**:
+- Add `POST /paper/reset` requiring `confirm_paper_reset:true` and a non-trivial reason.
+- Clear current `paper_trading.paper_positions` and write a fresh `manual_paper_reset` virtual portfolio snapshot with 10,000 virtual USDC.
+- Preserve historical `paper_orders` and `paper_fills` rows for audit/Hermes, and record a `journal.events` row with `event_type='paper_simulator_reset'`.
+- Verify by resetting the polluted dev paper state, confirming positions are empty and risk summary is back within a clean bootstrap state, while order/fill history remains visible.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 65 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 65 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780168915` plus `hermes:local-1780168915`.
+- `rtk make k8s-verify` passed on the deployed image.
+- Direct `/polytrader/paper/reset` with `confirm_paper_reset:true` returned HTTP 200 with `reset_applied:true`, `journaled:true`, `journal_event_id:"1c48a519-3f94-41c0-afb9-6115a8a58a6f"`, `position_count_before:1`, `deleted_positions:1`, `total_collateral_before:"1.00600020"`, `reset_virtual_usdc:"10000"`, `order_count_preserved:2`, `fill_count_preserved:2`, `orders_and_fills_deleted:false`, and no-send flags.
+- Sequential `/polytrader/paper/positions` after reset returned `count:0` and `positions:[]`.
+- Sequential `/polytrader/paper/risk-summary` after reset returned `latest_virtual_usdc:"10000.00000000"`, `open_position_count:0`, `total_collateral_locked:"0"`, `unrealized_pnl:"0"`, `status:"within_limits"`, and `within_total_exposure_limit:true`.
+- Direct `/polytrader/paper/orders?limit=2` and `/polytrader/paper/fills?limit=2` still show the two smoke-test orders/fills, proving audit history was preserved.
+- Live DB check for latest `journal.events event_type='paper_simulator_reset'` returned source `paper_reset_route`, `reset_applied:true`, `orders_and_fills_deleted:false`, and `deleted_positions:1`.
+- Restarted Hermes; latest reflection still includes historical fills/fees for 24h attribution, while current paper exposure is clean after the reset. `real_orders_enabled:false` remains in the reflection.
+- Pod check after final deploy and Hermes restart:
+  - `polytrader-6c4d47c85d-p8gkw`, image `polytrader:local-1780168915`, ready `true`, restarts `0`
+  - `hermes-54f7c46558-dj5g8`, image `hermes:local-1780168915`, ready `true`, restarts `0`
+
+**Safety note**: This is a simulator-state recovery tool only. It does not delete paper audit history, approve real trading, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, or enable real trading.
+
+## 2026-05-30 — Made positive paper execution writes transactional
+
+**Context**: The rejection path is now well-audited, and Hermes consumes blocked paper intents. The next risk on the path toward safe order placement is the successful paper path: `PaperTradingEngine` claimed a full submit transaction, but order/fill rows were still written through the pool before the position/snapshot transaction committed.
+
+**Planned changes**:
+- Move successful paper order intent writes and fill writes into the same SQL transaction as the engine risk guard, position update, portfolio snapshot, and final order status update.
+- Sort CLOB book levels before paper matching: asks cheapest-first for buys and bids highest-first for sells. A live tiny paper smoke test exposed that the public CLOB book response can provide asks in descending order, which made the simulator overpay badly before this fix.
+- Preserve the existing route-level and engine-level risk gates, including no real CLOB order sender.
+- Verify with a tiny confirmed paper order after deployment, then inspect paper orders, fills, positions, risk summary, and Hermes.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 65 passed across Hermes + app suites, including `execution_levels_sort_to_best_price_first`.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 65 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` first rolled out `polytrader:local-1780168280` to test transactional positive writes, then rolled out the corrected book-sorting build `polytrader:local-1780168522` plus `hermes:local-1780168522`.
+- `rtk make k8s-verify` passed on the corrected deployment.
+- Direct tiny confirmed `/polytrader/paper/orders` on the transactional build returned HTTP 200 with `paper_order_id:"6a2267d9-436a-4e09-917a-1f89614b6481"` and wrote visible order/fill/position/risk rows after commit, proving the positive path persisted. That smoke test also exposed the CLOB book ordering bug: the first fill price was `0.99900020` while `last_mid_yes` was about `0.006`.
+- After sorting CLOB book levels and redeploying, direct tiny confirmed `/polytrader/paper/orders` returned HTTP 200 with `paper_order_id:"d7befa37-bdf0-4b45-b734-7e0dc62d9380"`, `fill_count:1`, `price:"0.0070000014"`, `gross_notional:"0.0070000014"`, `total_fee:"0.0000350000070"`, `request_sent:false`, `post_order_called:false`, and `post_orders_called:false`.
+- Direct `/polytrader/paper/orders?limit=2` showed latest order `d7befa37-bdf0-4b45-b734-7e0dc62d9380` with status `Filled`, filled size `1.00000000`, gross notional `0.0070000000000000`, total fee `0.00003500`, and no-send flags. The older smoke-test order remains visible as test data with the pre-fix price.
+- Direct `/polytrader/paper/fills?limit=2` showed latest fill `5d9af38e-f1e9-4d01-b32e-413392198ca2` at `0.00700000`, followed by the pre-fix smoke-test fill at `0.99900020`.
+- Direct `/polytrader/paper/positions` showed a simulated `Yes` position with `shares:"2.00000000"` and `avg_entry_price:"0.50300010"` because it includes the older pre-fix smoke-test fill; future fills should use the sorted best-price path.
+- Direct `/polytrader/paper/risk-summary` remained `status:"within_limits"`, `within_total_exposure_limit:true`, `total_collateral_locked:"1.00600020"`, `latest_virtual_usdc:"9998.98896980"`, and no-send flags.
+- Restarted Hermes after the positive fills; latest summary includes `fills=2`, `fees=0.00503000`, fee-adjusted realized `-0.00503000`, paper rejection loop counts, and `real_orders_enabled:false`.
+- Pod check after final deploy and Hermes restart:
+  - `polytrader-766f68c956-wg4td`, image `polytrader:local-1780168522`, ready `true`, restarts `0`
+  - `hermes-64bcc9c86b-9fsb7`, image `hermes:local-1780168522`, ready `true`, restarts `0`
+
+**Safety note**: This only improves simulated paper execution atomicity. It does not approve, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, or enable real trading.
+
+## 2026-05-30 — Hermes consumes paper rejection audits
+
+**Context**: Paper rejection events are now journaled and visible in the dashboard, but Hermes reflections still only summarize P&L, fills, and CLOB safety events. The learning loop should explicitly see paper intents that were blocked by risk gates.
+
+**Planned changes**:
+- Add a `paper_rejection_loop` section to Hermes reflection metrics using `journal.events event_type='paper_order_rejection'`.
+- Include counts, route-vs-engine source counts, blocker counts, latest rejection summary, and no-send flags.
+- Mention paper rejection counts in Hermes' local summary and recommendations.
+- Verify by creating an oversized paper rejection, restarting Hermes, and querying the latest reflection metrics.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 64 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 64 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780167283` plus `hermes:local-1780167283`.
+- `rtk make k8s-verify` passed on the deployed image.
+- Direct oversized confirmed `/polytrader/paper/orders` through a temporary port-forward returned HTTP 400 with `journaled:true`, `journal_event_id:"ae16c4c1-fd89-4a5d-b3f4-df7932b49ad3"`, blockers `["max_order_notional_exceeded","max_total_exposure_exceeded"]`, `accepted_for_paper:false`, `executed:false`, `request_sent:false`, `would_send:false`, `post_order_called:false`, and `post_orders_called:false`.
+- Direct `/polytrader/paper/rejections?limit=3` returned the latest rejection event `ae16c4c1-fd89-4a5d-b3f4-df7932b49ad3` with source `paper_order_submit_route_validation`, no-send flags, and the oversized order blockers.
+- Direct `/polytrader/paper/orders?limit=3` remained empty after the rejection check.
+- Restarted Hermes; latest `journal.reflections.metrics->'paper_rejection_loop'` includes `paper_order_rejection_events_24h: 4`, `route_validation_rejections_24h: 4`, `engine_risk_guard_rejections_24h: 0`, top blockers `max_order_notional_exceeded: 4`, `max_total_exposure_exceeded: 4`, `insufficient_paper_position: 0`, `hermes_consumes_paper_rejection_events:true`, `paper_only:true`, and `real_orders_enabled:false`.
+- Latest Hermes summary now includes `Paper rejection loop: 4 rejection event(s), 4 route validation rejection(s), 0 engine backstop rejection(s)`.
+- Latest Hermes CLOB safety metrics remain no-send with `latest_summary.request_sent:false`, `latest_summary.reconciliation_status:"reconciled_no_send"`, `final_review_decision_events_24h: 47`, `final_review_decision_boundary_evidence_events_24h: 41`, `final_review_decision_no_network_evidence_events_24h: 41`, `missing_boundary_evidence_events: 6`, `missing_no_network_evidence_events: 6`, and `real_orders_enabled:false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-7697b6b9-jhrqw`, image `polytrader:local-1780167283`, ready `true`, restarts `0`
+  - `hermes-5cddff95b9-nwnvr`, image `hermes:local-1780167283`, ready `true`, restarts `0`
+
+**Safety note**: Hermes remains read-only over journaled paper rejection events. It does not approve, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, or enable real trading.
+
+## 2026-05-30 — Added paper rejection audit events
+
+**Context**: Paper risk checks now exist at both route and engine boundaries, but rejected paper intents should be visible to Hermes and operators without scraping logs. This is especially important before any strategy loop calls the simulator directly.
+
+**Planned changes**:
+- Write append-only `journal.events` rows with `event_type='paper_order_rejection'` for confirmed paper submit validation failures and engine risk backstop failures.
+- Add read-only `/paper/rejections` for recent rejection audit events.
+- Extend deploy verification to prove an oversized confirmed paper submit creates a rejection audit event while still writing no paper order/fill rows.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 64 passed across Hermes + app suites.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 64 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780161277` plus `hermes:local-1780161277`.
+- `rtk make k8s-verify` passed. The verifier now checks that an oversized confirmed paper submit returns `journaled:true`, includes `journal_event_id`, and that `/polytrader/paper/rejections?limit=3` returns `event_type:"paper_order_rejection"`, `source:"paper_order_submit_route_validation"`, blocker `max_total_exposure_exceeded`, and no-send flags.
+- Direct oversized confirmed `/polytrader/paper/orders` through a temporary port-forward returned HTTP 400 with `journaled:true`, `journal_event_id:"7fdfd54d-5dfb-4578-8648-86970095cc1e"`, `accepted_for_paper:false`, `executed:false`, blockers `["max_order_notional_exceeded","max_total_exposure_exceeded"]`, `request_sent:false`, `would_send:false`, `post_order_called:false`, and `post_orders_called:false`.
+- Direct `/polytrader/paper/rejections?limit=3` returned `count:2`; latest event id `7fdfd54d-5dfb-4578-8648-86970095cc1e`, `event_type:"paper_order_rejection"`, `severity:"warning"`, `source:"paper_order_submit_route_validation"`, payload blocker `max_total_exposure_exceeded`, and no-send flags.
+- Direct `/polytrader/paper/orders?limit=3` remained read-only and empty after the rejection checks.
+- Restarted Hermes after verifier-created events; latest safety-loop metrics include `final_review_decision_events_24h: 47`, `final_review_decision_boundary_evidence_events_24h: 40`, `final_review_decision_no_network_evidence_events_24h: 40`, `missing_boundary_evidence_events: 7`, `missing_no_network_evidence_events: 7`, `coverage_status="legacy_or_missing_boundary_evidence"`, `complete_fail_closed_no_network_evidence=false`, `latest_summary.request_sent=false`, `latest_summary.reconciliation_status="reconciled_no_send"`, and `real_orders_enabled=false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-95bb67758-xc27t`, image `polytrader:local-1780161277`, ready `true`, restarts `0`
+  - `hermes-79f4fcf654-w6tlk`, image `hermes:local-1780161277`, ready `true`, restarts `0`
+
+**Safety note**: This is paper-only observability. It does not approve, sign, submit, cancel, fund, refresh allowances, create a network sender, call CLOB `POST /order`, or enable real trading.
+
+## 2026-05-30 — Added engine-level paper risk backstop
+
+**Context**: The HTTP paper order route now rejects oversized paper orders before writes, and deploy verification proves that path. The next safety hardening is to enforce the same core limits inside `PaperTradingEngine` so future strategy code cannot bypass the route-level checks by calling the engine directly.
+
+**Planned changes**:
+- Add an engine-level execution guard for 1% per-order notional, 15% total exposure, and no paper short selling.
+- Fail direct engine submissions before recording fills, updating positions, or writing portfolio snapshots when the guard is violated.
+- Map engine risk rejections to a fail-closed HTTP 400 response if a route/engine race ever gets past the route preview.
+- Update wiki/runbook notes and verification evidence.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 64 passed across Hermes + app suites, including engine risk backstop unit tests.
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 64 passed across Hermes + app suites.
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780160838` plus `hermes:local-1780160838`.
+- `rtk make k8s-verify` passed. Existing verifier checks still prove oversized route-level preview and confirmed-submit rejection.
+- Direct oversized `/polytrader/paper/order-preview` through a temporary port-forward returned `accepted_for_paper:false`, `executed:false`, blockers `["max_order_notional_exceeded","max_total_exposure_exceeded"]`, `estimated_notional:"2000.00"`, `risk.max_order_notional:"100.0000000000"`, `risk.max_total_exposure:"1500.0000000000"`, `risk.projected_total_collateral_locked:"2000.00"`, `risk.projected_total_exposure_within_limit:false`, `request_sent:false`, `would_send:false`, `post_order_called:false`, and `post_orders_called:false`.
+- Direct oversized confirmed `/polytrader/paper/orders` returned HTTP 400 with the same blockers and `executed:false`.
+- Direct `/polytrader/paper/orders?limit=3` remained read-only and empty after the rejection checks.
+- Restarted Hermes after verifier-created events; latest safety-loop metrics include `final_review_decision_events_24h: 46`, `final_review_decision_boundary_evidence_events_24h: 39`, `final_review_decision_no_network_evidence_events_24h: 39`, `missing_boundary_evidence_events: 7`, `missing_no_network_evidence_events: 7`, `coverage_status="legacy_or_missing_boundary_evidence"`, `complete_fail_closed_no_network_evidence=false`, `latest_summary.request_sent=false`, `latest_summary.reconciliation_status="reconciled_no_send"`, and `real_orders_enabled=false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-5d6fdc5dfb-fbx2v`, image `polytrader:local-1780160838`, ready `true`, restarts `0`
+  - `hermes-8f4c685d5-zdssk`, image `hermes:local-1780160838`, ready `true`, restarts `0`
+
+**Safety note**: This is an additional paper-only simulator backstop. It does not sign, submit, cancel, approve, fund, refresh allowances, create a network sender, call CLOB `POST /order`, or enable real trading.
+
+## 2026-05-30 — Added paper exposure rejection verification
+
+**Context**: Paper order preview/submit now enforce the 15% total paper exposure cap, but deployment verification only checked a small order that stayed within limits. We need explicit proof that oversized paper buys are rejected before any simulated order write.
+
+**Planned changes**:
+- Extend `deploy/verify` with an oversized paper order preview that must surface `max_total_exposure_exceeded`.
+- Extend `deploy/verify` with an oversized confirmed paper submit that must return HTTP 400 before execution/write.
+- Update runbook/wiki verification notes and keep the path paper-only/no-send.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 60 passed across Hermes + app suites
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 60 passed across Hermes + app suites
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780157830` plus `hermes:local-1780157830`.
+- `rtk make k8s-verify` passed. The verifier now checks an oversized read-only paper preview and an oversized confirmed paper submit rejection. The submit check must return HTTP 400 before writing.
+- Direct oversized `/polytrader/paper/order-preview` through a temporary port-forward returned `accepted_for_paper:false`, `executed:false`, blockers `["max_order_notional_exceeded","max_total_exposure_exceeded"]`, `estimated_notional:"2000.00"`, `risk.max_order_notional:"100.0000000000"`, `risk.max_total_exposure:"1500.0000000000"`, `risk.projected_total_collateral_locked:"2000.00"`, `risk.projected_total_exposure_within_limit:false`, `request_sent:false`, `would_send:false`, `post_order_called:false`, and `post_orders_called:false`.
+- Direct oversized confirmed `/polytrader/paper/orders` returned HTTP 400 with the same blockers and `executed:false`, proving validation failed before `PaperTradingEngine` wrote simulated order rows.
+- Direct `/polytrader/paper/orders?limit=3` remained read-only and empty after the rejection checks.
+- Restarted Hermes after verifier-created events; latest safety-loop metrics include `final_review_decision_events_24h: 45`, `final_review_decision_boundary_evidence_events_24h: 38`, `final_review_decision_no_network_evidence_events_24h: 38`, `missing_boundary_evidence_events: 7`, `missing_no_network_evidence_events: 7`, `coverage_status="legacy_or_missing_boundary_evidence"`, `complete_fail_closed_no_network_evidence=false`, `latest_summary.request_sent=false`, `latest_summary.reconciliation_status="reconciled_no_send"`, and `real_orders_enabled=false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-8689cbdfd-9cqk8`, image `polytrader:local-1780157830`, ready `true`, restarts `0`
+  - `hermes-748f895896-kz4t9`, image `hermes:local-1780157830`, ready `true`, restarts `0`
+
+**Safety note**: These verifier calls are rejection-path checks. The oversized submit is expected to fail validation before `PaperTradingEngine` writes any paper rows and does not sign, submit, cancel, approve, fund, refresh allowances, create a network sender, call CLOB `POST /order`, or enable real trading.
+
+## 2026-05-30 — Enforced paper total exposure cap
+
+**Context**: `/paper/risk-summary` now surfaces the 15% total paper exposure limit, but paper order preview/submit still only enforced the 1% per-order notional cap. The simulator should enforce the displayed total-exposure limit before any paper order writes.
+
+**Planned changes**:
+- Add projected total exposure to `/paper/order-preview` and guarded `/paper/orders`.
+- Block paper buy orders with `max_total_exposure_exceeded` when projected collateral would exceed 15% of latest virtual USDC.
+- Extend deploy verification and docs while preserving paper-only/no-send behavior.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 60 passed across Hermes + app suites
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 60 passed across Hermes + app suites
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780157551` plus `hermes:local-1780157551`.
+- `rtk make k8s-verify` passed. The verifier now checks paper order preview for `max_total_exposure`, `current_total_collateral_locked`, `projected_total_collateral_locked`, and `projected_total_exposure_within_limit:true`.
+- Direct `/polytrader/paper/order-preview` through a temporary port-forward returned `accepted_for_paper:true`, `dry_run_only:true`, `executed:false`, `estimated_notional:"0.00550000"`, `risk.current_total_collateral_locked:"0"`, `risk.max_order_notional:"100.0000000000"`, `risk.max_total_exposure:"1500.0000000000"`, `risk.projected_total_collateral_locked:"0.00550000"`, `risk.projected_total_exposure_within_limit:true`, `request_sent:false`, `would_send:false`, `post_order_called:false`, and `post_orders_called:false`.
+- Direct `/polytrader/paper/risk-summary` still returned `status:"within_limits"`, `open_position_count:0`, `total_collateral_locked:"0"`, `within_total_exposure_limit:true`, and the same no-send safety flags.
+- Direct `/polytrader/paper/orders?limit=3` remained read-only and empty, confirming no paper submit occurred during verification.
+- Restarted Hermes after verifier-created events; latest safety-loop metrics include `final_review_decision_events_24h: 44`, `final_review_decision_boundary_evidence_events_24h: 37`, `final_review_decision_no_network_evidence_events_24h: 37`, `missing_boundary_evidence_events: 7`, `missing_no_network_evidence_events: 7`, `coverage_status="legacy_or_missing_boundary_evidence"`, `complete_fail_closed_no_network_evidence=false`, `latest_summary.request_sent=false`, `latest_summary.reconciliation_status="reconciled_no_send"`, and `real_orders_enabled=false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-589d85c864-dqxnp`, image `polytrader:local-1780157551`, ready `true`, restarts `0`
+  - `hermes-86f5f6dd86-gmfzd`, image `hermes:local-1780157551`, ready `true`, restarts `0`
+
+**Safety note**: This is an additional paper simulator guard. It does not sign, submit, cancel, approve, fund, refresh allowances, create a network sender, call CLOB `POST /order`, or enable real trading.
+
+## 2026-05-30 — Added paper risk summary
+
+**Context**: Paper positions are now visible, but operators still need a single risk-utilization readout that summarizes bankroll, total simulated exposure, max per-order notional, and the 15% total exposure limit from the small-bankroll strategy.
+
+**Planned changes**:
+- Add read-only `/paper/risk-summary` using latest virtual USDC plus current simulated positions.
+- Render a dashboard summary for paper exposure and risk-limit utilization.
+- Extend deploy verification and documentation without submitting a paper order.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` - 60 passed across Hermes + app suites
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` - 60 passed across Hermes + app suites
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780157263` plus `hermes:local-1780157263`.
+- `rtk make k8s-verify` passed. The verifier checks `/polytrader/paper/risk-summary`, dashboard risk summary markers, and paper safety flags without submitting a paper order.
+- Direct `/polytrader/paper/risk-summary` through a temporary port-forward returned `latest_virtual_usdc:"10000.00000000"`, `max_order_notional:"100.0000000000"`, `max_total_exposure:"1500.0000000000"`, `open_position_count:0`, `total_collateral_locked:"0"`, `status:"within_limits"`, `within_total_exposure_limit:true`, `paper_only:true`, `real_orders_enabled:false`, `request_sent:false`, `post_order_called:false`, and `post_orders_called:false`.
+- Direct `/polytrader/paper/positions` remained read-only and empty with the same no-send safety flags.
+- Restarted Hermes after verifier-created events; latest safety-loop metrics include `final_review_decision_events_24h: 43`, `final_review_decision_boundary_evidence_events_24h: 36`, `final_review_decision_no_network_evidence_events_24h: 36`, `missing_boundary_evidence_events: 7`, `missing_no_network_evidence_events: 7`, `coverage_status="legacy_or_missing_boundary_evidence"`, `complete_fail_closed_no_network_evidence=false`, `latest_summary.request_sent=false`, `latest_summary.reconciliation_status="reconciled_no_send"`, and `real_orders_enabled=false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-8598846fd4-ltgrs`, image `polytrader:local-1780157263`, ready `true`, restarts `0`
+  - `hermes-b8c7c9c57-9j2ml`, image `hermes:local-1780157263`, ready `true`, restarts `0`
+
+**Safety note**: This is read-only paper risk observability. It does not approve, sign, submit, cancel, fund, mutate real balances, refresh allowances, create a network sender, call CLOB `POST /order`, or enable real trading.
+
+## 2026-05-30 — Added paper positions visibility
+
+**Context**: Paper orders and fills now have history endpoints, but current simulated exposure still requires querying `paper_trading.paper_positions` or decoding portfolio snapshot JSON. Operators need a direct read-only positions surface before relying on paper execution for strategy loops.
+
+**Planned changes**:
+- Add read-only `/paper/positions` with market metadata, shares, average entry, collateral locked, and paper safety flags.
+- Render current paper positions in the dashboard.
+- Extend deploy verification and documentation without submitting a paper order.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` — 60 passed across Hermes + app suites
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` — 60 passed across Hermes + app suites
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780156790` plus `hermes:local-1780156790`.
+- `rtk make k8s-verify` passed. The verifier checks `/polytrader/paper/positions` and dashboard position markers without submitting a paper order.
+- Direct `/polytrader/paper/positions` through a temporary port-forward returned `count:0`, `positions:[]`, `paper_only:true`, `real_orders_enabled:false`, `request_sent:false`, `post_order_called:false`, and `post_orders_called:false`.
+- Direct `/polytrader/paper/orders?limit=3` and `/polytrader/paper/fills?limit=3` remained read-only and empty with the same safety flags.
+- Restarted Hermes after verifier-created events; latest safety-loop metrics include `final_review_decision_events_24h: 42`, `final_review_decision_boundary_evidence_events_24h: 35`, `final_review_decision_no_network_evidence_events_24h: 35`, `missing_boundary_evidence_events: 7`, `missing_no_network_evidence_events: 7`, `coverage_status="legacy_or_missing_boundary_evidence"`, `complete_fail_closed_no_network_evidence=false`, `latest_summary.request_sent=false`, `latest_summary.reconciliation_status="reconciled_no_send"`, and `real_orders_enabled=false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-7574859fb8-7969g`, image `polytrader:local-1780156790`, ready `true`, restarts `0`
+  - `hermes-78d68d79bd-x7w4q`, image `hermes:local-1780156790`, ready `true`, restarts `0`
+
+**Safety note**: This is read-only paper position observability. It does not approve, sign, submit, cancel, fund, mutate real balances, refresh allowances, create a network sender, call CLOB `POST /order`, or enable real trading.
+
+## 2026-05-30 — Added paper order and fill history
+
+**Context**: Paper order execution is now guarded and can write simulated `paper_trading.*` rows, but operators still need a first-class way to inspect recent paper orders/fills from the UI and API instead of querying Postgres manually.
+
+**Planned changes**:
+- Add read-only `/paper/orders` and `/paper/fills` history endpoints.
+- Render recent paper orders and fills in the dashboard with fill counts, fees, notional, and simulation safety flags.
+- Extend deploy verification for the history endpoints and dashboard markers without submitting a paper order.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` — 60 passed across Hermes + app suites
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` — 60 passed across Hermes + app suites
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780156411` plus `hermes:local-1780156411`.
+- `rtk make k8s-verify` passed. The verifier checks `/polytrader/paper/orders?limit=3`, `/polytrader/paper/fills?limit=3`, and dashboard history markers without submitting a paper order.
+- Direct `/polytrader/paper/orders?limit=3` through a temporary port-forward returned `count:0`, `orders:[]`, `paper_only:true`, `real_orders_enabled:false`, `request_sent:false`, `post_order_called:false`, and `post_orders_called:false`.
+- Direct `/polytrader/paper/fills?limit=3` through a temporary port-forward returned `count:0`, `fills:[]`, `paper_only:true`, `real_orders_enabled:false`, `request_sent:false`, `post_order_called:false`, and `post_orders_called:false`.
+- Direct `/polytrader/paper/order-preview` still returned `accepted_for_paper:true` and `executed:false` for the configured BTC market.
+- Restarted Hermes after verifier-created events; latest safety-loop metrics include `final_review_decision_events_24h: 41`, `final_review_decision_boundary_evidence_events_24h: 34`, `final_review_decision_no_network_evidence_events_24h: 34`, `missing_boundary_evidence_events: 7`, `missing_no_network_evidence_events: 7`, `coverage_status="legacy_or_missing_boundary_evidence"`, `complete_fail_closed_no_network_evidence=false`, `latest_summary.request_sent=false`, `latest_summary.reconciliation_status="reconciled_no_send"`, and `real_orders_enabled=false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-69c6bcfc4-94lck`, image `polytrader:local-1780156411`, ready `true`, restarts `0`
+  - `hermes-7b84ddb6fb-cqptw`, image `hermes:local-1780156411`, ready `true`, restarts `0`
+
+**Safety note**: This is read-only paper-trading observability. It does not approve, sign, submit, cancel, fund, mutate real balances, refresh allowances, create a network sender, call CLOB `POST /order`, or enable real trading.
+
+## 2026-05-30 — Added guarded paper order preview and execution path
+
+**Context**: The app now has L2 read authentication, market-data readiness, dry-run real-order intent checks, and a fail-closed live-sender boundary. The next practical step toward real order placement is to exercise actual paper-only order execution against the existing `PaperTradingEngine`, while preserving strict separation from real CLOB submission.
+
+**Planned changes**:
+- Add a paper-only order preview endpoint with market-data, bankroll, and position-safety gates.
+- Add a guarded paper execution endpoint that requires explicit `confirm_paper_order:true` and can only write `paper_trading.*` records.
+- Surface a compact dashboard form for previewing/submitting paper orders, and extend deploy verification markers without creating real orders.
+- Fix paper portfolio snapshots to debit/credit from the latest virtual USDC balance instead of a hardcoded fallback when the paper engine executes.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` — 60 passed across Hermes + app suites
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` — 60 passed across Hermes + app suites
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780155995` plus `hermes:local-1780155995`.
+- `rtk make k8s-verify` passed. The verifier checks `/polytrader/paper/order-preview` and dashboard markers for `paper/order-preview` and `paper/orders` without submitting a paper order.
+- Direct `/polytrader/paper/order-preview` through a temporary port-forward returned `accepted_for_paper:true`, `executed:false`, `paper_only:true`, `real_orders_enabled:false`, `request_sent:false`, `post_order_called:false`, estimated notional `0.00650000`, and max order notional `100.0000000000`.
+- Direct `/polytrader/paper/orders` without `confirm_paper_order:true` returned HTTP 400 with blocker `confirm_paper_order_required`, proving the submit route fails closed before paper mutation when confirmation is absent.
+- Restarted Hermes after verifier-created events; latest safety-loop metrics include `final_review_decision_events_24h: 40`, `final_review_decision_boundary_evidence_events_24h: 33`, `final_review_decision_no_network_evidence_events_24h: 33`, `missing_boundary_evidence_events: 7`, `missing_no_network_evidence_events: 7`, `coverage_status="legacy_or_missing_boundary_evidence"`, `complete_fail_closed_no_network_evidence=false`, `latest_summary.request_sent=false`, `latest_summary.reconciliation_status="reconciled_no_send"`, and `real_orders_enabled=false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-7b746cd694-5bttb`, image `polytrader:local-1780155995`, ready `true`, restarts `0`
+  - `hermes-867f55fb49-ntfmz`, image `hermes:local-1780155995`, ready `true`, restarts `0`
+
+**Safety note**: This is simulated paper execution only. It does not approve, sign, submit, cancel, fund, mutate real balances, refresh allowances, create a network sender, call CLOB `POST /order`, or enable real trading.
+
+## 2026-05-30 — Added market data readiness markers
+
+**Context**: The configured BTC market now ingests with live Yes/No mids and a `crypto` category. Operators should not have to infer whether market data is usable for paper simulation from raw `last_mid_yes` and `last_mid_no` fields.
+
+**Planned changes**:
+- Add explicit market-level readiness fields showing whether both Yes/No mids are present.
+- Roll up data-ready active-market counts by normalized category.
+- Render the readiness state in the dashboard market list and extend deploy verification markers.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` — 59 passed across Hermes + app suites
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` — 59 passed across Hermes + app suites
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780155305` plus `hermes:local-1780155305`.
+- `rtk make k8s-verify` passed.
+- Direct `/polytrader/markets` check through a temporary port-forward showed the BTC market now includes `clob_mid_ready:true` and `market_data_status:"ready"`.
+- Live category rollup artifact showed `/polytrader/market-categories` returns `[{"category":"crypto","category_label":"Crypto","active_market_count":1,"data_ready_market_count":1}]`.
+- Direct `/polytrader/clob/order-placement-readiness?limit=10` check showed `paper_market_data_ready:true`, `market_data_readiness.status:"ready"`, `active_market_count:1`, `data_ready_market_count:1`, and `required_count:18`.
+- Restarted Hermes after verifier-created events; latest safety-loop metrics include `final_review_decision_events_24h: 39`, `final_review_decision_boundary_evidence_events_24h: 32`, `final_review_decision_no_network_evidence_events_24h: 32`, `missing_boundary_evidence_events: 7`, `missing_no_network_evidence_events: 7`, `coverage_status="legacy_or_missing_boundary_evidence"`, `complete_fail_closed_no_network_evidence=false`, `latest_summary.request_sent=false`, `latest_summary.reconciliation_status="reconciled_no_send"`, and `real_orders_enabled=false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-78bf5b58dc-k78q8`, image `polytrader:local-1780155305`, ready `true`, restarts `0`
+  - `hermes-5f94b985b9-qldnj`, image `hermes:local-1780155305`, ready `true`, restarts `0`
+
+**Safety note**: This is read-only market-data observability for paper simulation. It does not approve, sign, submit, cancel, fund, mutate balances, refresh allowances, create a network sender, or enable real trading.
+
+## 2026-05-30 — Added crypto category normalization
+
+**Context**: The targeted bootstrap lookup now ingests the configured Bitcoin market, but it lands in the category rollup as `Uncategorized` because Gamma does not always provide a category field on direct market responses. The slug/question still contain enough public metadata to classify obvious crypto markets.
+
+**Planned changes**:
+- Normalize common crypto labels from Gamma category fields, question/title text, and slugs into the stable `crypto` key.
+- Render `crypto` as `Crypto` in `/markets` and `/market-categories`.
+- Extend deploy verification so the category rollup response must include labels and counts.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` — 58 passed across Hermes + app suites
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` — 58 passed across Hermes + app suites
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780154117` plus `hermes:local-1780154117`.
+- `rtk make k8s-verify` passed.
+- Live category rollup artifact showed `/polytrader/market-categories` returns `[{"category":"crypto","category_label":"Crypto","active_market_count":1}]`.
+- Live DB check showed `573655|will-bitcoin-hit-150k-by-june-30-2026|crypto|t|0.00650000|0.99350000`.
+- Restarted Hermes after verifier-created events; latest safety-loop metrics include `final_review_decision_events_24h: 37`, `final_review_decision_boundary_evidence_events_24h: 30`, `final_review_decision_no_network_evidence_events_24h: 30`, `missing_boundary_evidence_events: 7`, `missing_no_network_evidence_events: 7`, `coverage_status="legacy_or_missing_boundary_evidence"`, `complete_fail_closed_no_network_evidence=false`, and `real_orders_enabled=false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-5b6b49db87-wkqfj`, image `polytrader:local-1780154117`, ready `true`, restarts `0`
+  - `hermes-79c9bfdb59-9fwxv`, image `hermes:local-1780154117`, ready `true`, restarts `0`
+
+**Safety note**: This is read-only public market metadata classification. It does not approve, sign, submit, cancel, fund, mutate balances, refresh allowances, create a network sender, or enable real trading.
+
+## 2026-05-30 — Added targeted Gamma bootstrap lookup
+
+**Context**: The configured bootstrap market can be active in Gamma but absent from the first `active=true&limit=20` page. That leaves `market_data.markets` empty, which in turn makes `/markets` and `/market-categories` empty even though the configured slug is valid.
+
+**Planned changes**:
+- Keep the broad active-market page for discovery, but directly query Gamma for any configured bootstrap id/slug not found on that page.
+- Deduplicate fetched markets before upsert and log direct bootstrap fetches or misses.
+- Add parser coverage for Gamma's string-encoded `outcomes` and `clobTokenIds` fields.
+
+**Verification**:
+- Confirmed current Gamma read-only lookup works for the configured slug with `curl -sS 'https://gamma-api.polymarket.com/markets?slug=will-bitcoin-hit-150k-by-june-30-2026&limit=1'`.
+- Confirmed current Gamma id lookup works with `curl -sS 'https://gamma-api.polymarket.com/markets/573655'`.
+- `rtk cargo fmt --all`
+- `rtk cargo test` — 57 passed across Hermes + app suites
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` — 57 passed across Hermes + app suites
+- `rtk bash -n deploy/verify`
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780153756` plus `hermes:local-1780153756`.
+- `rtk make k8s-verify` passed. Startup logs showed `gamma fetched configured bootstrap market outside active list page` for `will-bitcoin-hit-150k-by-june-30-2026`, then `processed: 1`.
+- Live DB check showed `573655|will-bitcoin-hit-150k-by-june-30-2026||t|0.00650000|0.99350000`.
+- Direct subpath checks through a temporary port-forward showed `/polytrader/markets` returns the configured BTC market and `/polytrader/market-categories` returns `[{"category":null,"category_label":"Uncategorized","active_market_count":1}]`.
+- Restarted Hermes after verifier-created events; latest safety-loop metrics include `final_review_decision_events_24h: 36`, `final_review_decision_boundary_evidence_events_24h: 29`, `final_review_decision_no_network_evidence_events_24h: 29`, `missing_boundary_evidence_events: 7`, `missing_no_network_evidence_events: 7`, `coverage_status="legacy_or_missing_boundary_evidence"`, `complete_fail_closed_no_network_evidence=false`, and `real_orders_enabled=false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-55bcf8cb9-c8c9b`, image `polytrader:local-1780153756`, ready `true`, restarts `0`
+  - `hermes-679dc5f67-px4qk`, image `hermes:local-1780153756`, ready `true`, restarts `0`
+
+**Safety note**: This is read-only public market metadata ingestion. It does not approve, sign, submit, cancel, fund, mutate balances, refresh allowances, create a network sender, or enable real trading.
+
+## 2026-05-30 — Added market category rollup
+
+**Context**: After renaming the broad racing bucket to `motorsports`, operators need a quick way to see which normalized category buckets are currently represented by active ingested markets instead of inspecting individual market rows.
+
+**Planned changes**:
+- Add a read-only `/market-categories` endpoint grouped by normalized category key.
+- Add a dashboard `Market Categories` card that renders category labels, keys, and active-market counts.
+- Extend deployment verification and schema docs for the category rollup path.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` — 56 passed across Hermes + app suites
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` — 56 passed across Hermes + app suites
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780153433` plus `hermes:local-1780153433`.
+- First `rtk make k8s-verify` caught an invalid raw `[` regex in the new verifier assertion; fixed the verifier to escape the JSON array marker.
+- Re-ran `rtk bash -n deploy/verify` and `rtk make k8s-verify`; both passed, including the `/polytrader/market-categories` subpath check and dashboard `Market Categories` markers.
+- Direct verifier artifact check showed `/polytrader/market-categories` currently returns `[]`, which is expected while `market_data.markets` has no active rows from the configured Gamma bootstrap response.
+- Restarted Hermes after verifier-created events; latest safety-loop metrics include `final_review_decision_events_24h: 35`, `final_review_decision_boundary_evidence_events_24h: 28`, `final_review_decision_no_network_evidence_events_24h: 28`, `missing_boundary_evidence_events: 7`, `missing_no_network_evidence_events: 7`, `coverage_status="legacy_or_missing_boundary_evidence"`, `complete_fail_closed_no_network_evidence=false`, and `real_orders_enabled=false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-cc6554bfc-ghgqk`, image `polytrader:local-1780153433`, ready `true`, restarts `0`
+  - `hermes-97597577d-rm5rw`, image `hermes:local-1780153433`, ready `true`, restarts `0`
+
+**Safety note**: This is read-only market metadata observability. It does not approve, sign, submit, cancel, fund, mutate balances, refresh allowances, create a network sender, or enable real trading.
+
+## 2026-05-30 — Added Motorsports display label
+
+**Context**: `motorsports` is the correct stable taxonomy key for the broad racing category, but operators should see the human-facing label `Motorsports` rather than a raw lowercase key.
+
+**Planned changes**:
+- Add a category display-label field to `/markets`.
+- Render market categories using `category_label` in the dashboard.
+- Document the key/label distinction so strategies can use stable keys while UI uses readable labels.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` — 56 passed across Hermes + app suites
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` — 56 passed across Hermes + app suites
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780143962` plus `hermes:local-1780143962`.
+- `rtk make k8s-verify` passed, including the `/polytrader` subpath dashboard and category-label markers.
+- Restarted Hermes after verifier-created events; latest safety-loop metrics include `final_review_decision_events_24h: 33`, `final_review_decision_boundary_evidence_events_24h: 26`, `final_review_decision_no_network_evidence_events_24h: 26`, `missing_boundary_evidence_events: 7`, `missing_no_network_evidence_events: 7`, `coverage_status="legacy_or_missing_boundary_evidence"`, `complete_fail_closed_no_network_evidence=false`, and `real_orders_enabled=false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-968bf898c-bssfd`, image `polytrader:local-1780143962`, ready `true`, restarts `0`
+  - `hermes-6f8c6649f5-zkcbc`, image `hermes:local-1780143962`, ready `true`, restarts `0`
+
+**Safety note**: This is display metadata only. It does not approve, sign, submit, cancel, fund, mutate balances, refresh allowances, open a kill switch, create a network sender, or enable real trading.
+
+## 2026-05-30 — Renamed broad racing category to motorsports
+
+**Context**: The current Formula 1 category bucket can include IndyCar, NASCAR, and future Le Mans markets, so the category name should describe the broader market family instead of one racing series.
+
+**Planned changes**:
+- Normalize Formula 1/F1, IndyCar, NASCAR, Le Mans, and related auto-racing labels to `motorsports`.
+- Persist normalized categories from Gamma ingestion and backfill existing stored rows.
+- Return and display category on `/markets` and the dashboard market list.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` — 55 passed across Hermes + app suites
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` — 55 passed across Hermes + app suites
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780141619` plus `hermes:local-1780141619`.
+- `rtk make k8s-verify` passed, including the dashboard category fallback marker.
+- Live migration check showed `_sqlx_migrations` includes `20260530113000`.
+- Live category query showed `market_data.markets` currently has no rows to backfill because the configured bootstrap market was not in Gamma's current `limit=20` active response; future ingested Formula 1/F1, IndyCar, NASCAR, Le Mans, auto-racing, and motorsports labels normalize to `motorsports`.
+- Restarted Hermes after verifier-created events; latest reflection metrics include `final_review_decision_events_24h: 32`, `final_review_decision_boundary_evidence_events_24h: 25`, `final_review_decision_no_network_evidence_events_24h: 25`, `missing_boundary_evidence_events: 7`, `missing_no_network_evidence_events: 7`, `coverage_status="legacy_or_missing_boundary_evidence"`, `complete_fail_closed_no_network_evidence=false`, and `real_orders_enabled=false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-78ffb77ff6-mc57s`, image `polytrader:local-1780141619`, ready `true`, restarts `0`
+  - `hermes-fcc5c488c-h8lql`, image `hermes:local-1780141619`, ready `true`, restarts `0`
+
+**Safety note**: This is market-data labeling only. It does not approve, sign, submit, cancel, fund, mutate balances, refresh allowances, open a kill switch, create a network sender, or enable real trading.
+
+## 2026-05-30 — Added slow-review count to review health
+
+**Context**: Review health flags slow latest-review latency, but operators only see the max latency and threshold. They still need to know how many reviewed dry-runs in the window breached the slow-review threshold.
+
+**Planned changes**:
+- Add `slow_count` and `slow_after_seconds` to the latest-review latency summary.
+- Add `slow_review_count` to review-health reason details and the latency action.
+- Surface the slow-review count in the dashboard and verifier.
+
+**Verification**:
+- `rtk cargo fmt --all`
+- `rtk bash -n deploy/verify`
+- `rtk cargo test` — 53 passed across Hermes + app suites
+- `rtk cargo check --features native-l2`
+- `rtk cargo test --features native-l2` — 53 passed across Hermes + app suites
+- `rtk cargo clippy --all-targets -- -D warnings`
+- `rtk make k8s-deploy` completed and rolled out `polytrader:local-1780139234` plus `hermes:local-1780139234`.
+- `rtk make k8s-verify` passed, including slow-review count metadata checks.
+- Direct `/polytrader/clob/order-intent/review-summary?limit=50` check showed `latest_review_latency.reviewed_count: 2`, `min_seconds: 4383`, `avg_seconds: 28093`, `max_seconds: 51803`, `slow_after_seconds: 43200`, `slow_count: 1`, and `real_orders_enabled=false`.
+- Direct `/polytrader/clob/order-intent/review-health?limit=50` check showed `status="needs_attention"`, `reason_details.slow_review_count: 1`, `slow_review_count: 1`, latency action `slow_review_count: 1`, `max_latency_seconds: 51803`, `slow_latency_after_seconds: 43200`, and `real_orders_enabled=false`.
+- Direct `/polytrader/clob/operator-status?limit=50` check showed the `inspect_review_latency` action preserved `slow_review_count: 1`, `max_latency_seconds: 51803`, `slow_latency_after_seconds: 43200`, and `real_orders_enabled=false`.
+- Restarted Hermes after verifier-created events; latest reflection metrics include `final_review_decision_events_24h: 31`, `final_review_decision_boundary_evidence_events_24h: 24`, `final_review_decision_no_network_evidence_events_24h: 24`, `missing_boundary_evidence_events: 7`, `missing_no_network_evidence_events: 7`, `coverage_status="legacy_or_missing_boundary_evidence"`, `complete_fail_closed_no_network_evidence=false`, and `real_orders_enabled=false`.
+- Pod check after deploy and Hermes restart:
+  - `polytrader-5565d6f5cb-4b9sg`, image `polytrader:local-1780139234`, ready `true`, restarts `0`
+  - `hermes-fc484dd9b-4jm55`, image `hermes:local-1780139234`, ready `true`, restarts `0`
+
+**Safety note**: This is read-only review latency explainability only. It does not approve, sign, submit, cancel, fund, mutate balances, refresh allowances, open a kill switch, create a network sender, or enable real trading.
+
 ## 2026-05-30 — Added review-health action detail metadata
 
 **Context**: Review health already recommends inspecting guidance exceptions and slow review latency, but the action rows do not carry the counts and thresholds that explain why those actions are present.

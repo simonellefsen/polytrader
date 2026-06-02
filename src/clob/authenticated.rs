@@ -11,9 +11,10 @@
 //!
 //! Current gates (as of this writing):
 //! - Read-only live calls can be disabled with `POLYTRADER_ENABLE_REAL_CLOB_READS=0`.
+//! - Real order writes (place) are disabled unless `POLYTRADER_ENABLE_REAL_ORDERS=1` (or legacy _SUBMISSION); default false.
 //! - Must have successfully derived real L2 credentials (the session must exist in L2_SECRETS).
 //! - Paper mode is still the default; this client is orthogonal to the PaperTradingEngine.
-//! - No actual `place_order`, `cancel_order`, or other write implementation exists here.
+//! - place_limit_order exists (sign + POST /order) but is only reachable via GatedRealClobLiveOrderSender + submit-facade when all pre-gates, human_approval_event_id, final_review_decision_event_id, kill switch, and risk revalidation pass inside the sender immediately before dispatch.
 //!
 //! When you are ready for the next phase (after risk review), this is where the real CLOB client + order logic lives.
 
@@ -35,6 +36,11 @@ pub struct RealClobConfig {
     pub base_url: String,
     /// Whether read-only live CLOB calls are allowed.
     pub read_enabled: bool,
+    /// Whether real order placement (write) to CLOB is allowed.
+    /// Controlled by POLYTRADER_ENABLE_REAL_ORDERS (or legacy _SUBMISSION).
+    /// DEFAULT FALSE. Per AGENTS: explicit human gates + kill switch + risk
+    /// required even when true; this flag is only the top-level unlock.
+    pub orders_enabled: bool,
     /// Polymarket wallet signature type used for balance/allowance reads.
     /// Defaults to EOA (0). Proxy/deposit-wallet users can override with
     /// POLYMARKET_SIGNATURE_TYPE=1,2,3 after verifying their funder setup.
@@ -49,11 +55,22 @@ impl Default for RealClobConfig {
             .filter(|v| *v <= 3)
             .unwrap_or(0);
 
+        // Explicit unlock for writes (orders). Separate from reads. Default false.
+        // Task requires support for POLYTRADER_ENABLE_REAL_ORDERS (and preserves
+        // the prior _SUBMISSION name for compatibility with existing gates).
+        let orders_enabled = std::env::var("POLYTRADER_ENABLE_REAL_ORDERS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+            || std::env::var("POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
         Self {
             base_url: "https://clob.polymarket.com".to_string(),
             read_enabled: std::env::var("POLYTRADER_ENABLE_REAL_CLOB_READS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(true),
+            orders_enabled,
             signature_type,
         }
     }
@@ -126,12 +143,21 @@ pub struct OrderSubmitFacadeRequest {
     #[serde(flatten)]
     pub post_request_dry_run_request: OrderPostRequestDryRunRequest,
     pub confirm_real_order_submission: bool,
+    #[serde(default)]
     pub human_approval_event_id: Option<uuid::Uuid>,
+    /// The journal event id of a prior clob_final_review_decision (recorded via
+    /// /clob/final-review-decision). Carried into LiveOrderSendRequest and
+    /// validated in gate_report so that final_ok + human_ok can enable the ready
+    /// path in Gated sender (non-zero id required even for audit-only decisions).
+    #[serde(default)]
+    pub final_review_decision_event_id: Option<uuid::Uuid>,
     pub human_approval_token: Option<String>,
     pub human_approval_note: Option<String>,
     pub operator: Option<String>,
     #[serde(default, skip_deserializing)]
     pub server_human_approval: Option<HumanApprovalValidation>,
+    #[serde(default, skip_deserializing)]
+    pub server_final_review_decision: Option<FinalReviewDecisionValidation>,
     #[serde(default, skip_deserializing)]
     pub server_collateral_readiness: Option<CollateralReadinessValidation>,
 }
@@ -146,6 +172,21 @@ pub struct HumanApprovalValidation {
     pub event_id: Option<uuid::Uuid>,
     pub decision: Option<String>,
     pub subject_hash: Option<String>,
+    pub blockers: Vec<String>,
+}
+
+/// Server-side validation result for a journaled final review decision event.
+///
+/// Populated by server (from journal) after client supplies the id in the
+/// submit facade request. Non-zero + valid decision event is required (with
+/// human) for the Gated sender's final_ok gate (even though decisions are
+/// audit-only and never auto-approve).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalReviewDecisionValidation {
+    pub valid: bool,
+    pub event_id: Option<uuid::Uuid>,
+    pub decision: Option<String>,
+    pub operator: Option<String>,
     pub blockers: Vec<String>,
 }
 
@@ -177,11 +218,25 @@ impl RealClobClient {
     /// Try to construct from the currently active L2 session (if any).
     ///
     /// Returns None if no L2 credentials are currently derived / stored.
+    ///
+    /// Deterministic: prefers SERVER_L2_SESSION_ID (set by derive-from-server-key
+    /// and auto-derive) to fix race/TOCTOU with .values().next() when map has
+    /// multiple entries or concurrent derive/disconnect (critical for gated send
+    /// rebuild at dispatch using correct trading creds + address match).
     pub fn from_current_l2_session() -> Option<Self> {
         // This reaches into the server module's secret store (made pub for the gated real client).
         // In a cleaner architecture this would be injected via AppState or a dedicated CLOB service.
         let secrets = crate::server::get_l2_secrets().lock().ok()?;
-        if let Some(creds) = secrets.values().next().cloned() {
+        let server_sid = crate::server::get_server_l2_session_id()
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
+        // Prefer server session (the one for real trading / k8s); fallback to any for
+        // read paths after non-server UI demo derives (which do not set SERVER id).
+        let creds = server_sid
+            .and_then(|sid| secrets.get(&sid).cloned())
+            .or_else(|| secrets.values().next().cloned());
+        if let Some(creds) = creds {
             if creds.address.is_empty()
                 || creds.secret.is_empty()
                 || creds.passphrase.is_empty()
@@ -193,6 +248,10 @@ impl RealClobClient {
             let config = RealClobConfig::default();
             if !config.read_enabled {
                 warn!("RealClobClient constructed but POLYTRADER_ENABLE_REAL_CLOB_READS is disabled; live read-only calls will fail closed.");
+            }
+            if config.orders_enabled {
+                // Still gated by per-send revalidation inside GatedRealClobLiveOrderSender + facade + final review.
+                warn!("RealClobClient constructed with orders_enabled=true (from POLYTRADER_ENABLE_REAL_ORDERS or _SUBMISSION). Real order placement remains blocked unless every human approval, kill switch, risk, and revalidation gate also passes at dispatch time.");
             }
 
             Some(Self {
@@ -519,6 +578,153 @@ impl RealClobClient {
         Ok(order_submit_facade_response(request, post_report))
     }
 
+    /// Place a real limit order on the CLOB (authenticated POST /order).
+    ///
+    /// This is the minimal implementation that can actually place a live order.
+    ///
+    /// RISK (non-negotiable, per AGENTS.md + Trading Safety Rules):
+    /// - Only callable when config.orders_enabled (POLYTRADER_ENABLE_REAL_ORDERS=1
+    ///   or POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION). Default: never.
+    /// - Signing the order payload requires the native-l2 feature + POLYMARKET_PRIVATE_KEY
+    ///   (must match the active L2 session address). This is the same key path used
+    ///   for signed-payload dry-runs.
+    /// - The caller (GatedRealClobLiveOrderSender or facade) *must* have already
+    ///   validated + journaled human_approval_event_id, final_review_decision_event_id,
+    ///   collateral readiness, risk sizing (max_order_notional etc from env), and
+    ///   kill switch. This fn does a last re-build of the payload immediately before
+    ///   the HTTP POST (the "revalidate immediately before network dispatch" rule).
+    /// - Full context (intent + source event ids) must be journaled by caller
+    ///   *before* invoking the path that reaches here.
+    /// - No auto-approval. Human in the loop via the event ids is mandatory.
+    /// - Position sizing, exposure, daily loss etc are enforced in the pre-gates
+    ///   (see build_submit_facade_gate_report and risk_details in strategy/paper);
+    ///   this fn does not re-derive full risk but inherits the caller's decision.
+    /// - Observable: the POST result + any error is returned for journaling.
+    /// - This path is orthogonal to PaperTradingEngine; it talks to real CLOB.
+    ///
+    /// The LiveOrderSendRequest (with its *_event_id fields) is the contract for
+    /// passing the pre-approval context into the sender that calls this.
+    pub async fn place_limit_order(
+        &self,
+        intent: &RealOrderIntentDryRun,
+    ) -> Result<serde_json::Value> {
+        if !self.config.orders_enabled {
+            anyhow::bail!(
+                "Real order placement is disabled (POLYTRADER_ENABLE_REAL_ORDERS or POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION must be truthy). Rejected before signing or network POST."
+            );
+        }
+        if !intent.order_type.trim().eq_ignore_ascii_case("limit") {
+            anyhow::bail!("place_limit_order currently supports limit orders only (GTC)");
+        }
+
+        #[cfg(feature = "native-l2")]
+        {
+            self.do_signed_limit_order_place(intent).await
+        }
+        #[cfg(not(feature = "native-l2"))]
+        {
+            anyhow::bail!(
+                "native-l2 feature is required for real order signing and placement (order signature uses SDK LocalSigner path)"
+            )
+        }
+    }
+
+    #[cfg(feature = "native-l2")]
+    async fn do_signed_limit_order_place(
+        &self,
+        intent: &RealOrderIntentDryRun,
+    ) -> Result<serde_json::Value> {
+        use polymarket_client_sdk_v2::auth::{Credentials, LocalSigner, Signer};
+        use polymarket_client_sdk_v2::clob::types::{OrderType, Side};
+        use polymarket_client_sdk_v2::clob::{Client, Config};
+        use polymarket_client_sdk_v2::types::U256;
+        use polymarket_client_sdk_v2::POLYGON;
+
+        // NOTE (dupe signing): the SDK auth+limit_order+sign+creds block below is
+        // intentionally duplicated from try_build_signed_limit_order_payload (for
+        // smallest viable change; dry-run path has complex redaction/report logic
+        // that we avoid touching). Extract to shared prepare_signed... in future
+        // tranche. Risk of divergence noted; both paths use get_polymarket_private_key.
+
+        let private_key = get_polymarket_private_key()?;
+        let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
+        let signer_address = signer.address().to_checksum(None);
+        if !signer_address.eq_ignore_ascii_case(&self.address) {
+            anyhow::bail!(
+                "POLYMARKET_PRIVATE_KEY signer address does not match active L2 session address"
+            );
+        }
+
+        let api_key = uuid::Uuid::parse_str(&self.api_key)
+            .context("active L2 api key is not a UUID understood by the SDK")?;
+        let credentials = Credentials::new(api_key, self.secret.clone(), self.passphrase.clone());
+        let signature_type = sdk_signature_type(self.config.signature_type)?;
+        let token_id =
+            U256::from_str(intent.token_id.trim()).context("token_id must be a uint256 string")?;
+        let side = match intent.side.trim().to_ascii_lowercase().as_str() {
+            "buy" => Side::Buy,
+            "sell" => Side::Sell,
+            _ => anyhow::bail!("side must be buy or sell"),
+        };
+        let price = intent.price.context("limit orders require price")?;
+
+        let client = Client::new(&self.config.base_url, Config::default())?
+            .authentication_builder(&signer)
+            .credentials(credentials)
+            .signature_type(signature_type)
+            .authenticate()
+            .await?;
+
+        let signable = client
+            .limit_order()
+            .token_id(token_id)
+            .side(side)
+            .price(price)
+            .size(intent.size)
+            .order_type(OrderType::GTC)
+            .post_only(false)
+            .build()
+            .await?;
+        let signed = client.sign(&signer, signable).await?;
+
+        // Now do the authenticated POST using *manual* L2 HMAC (same as our read path
+        // and the post-request dry-run construction). The `signed` is the CLOB order
+        // body containing the EIP-712 order signature.
+        let exact_body = serde_json::to_string(&signed)
+            .context("failed to serialize signed CLOB order body for real place")?;
+        let request_timestamp = current_timestamp_secs()?;
+        let l2_hmac_message = l2_message(request_timestamp, "POST", "/order", &exact_body);
+        let l2_hmac = compute_poly_signature(&self.secret, &l2_hmac_message)?;
+
+        let url = format!("{}/order", self.config.base_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .post(url)
+            .header("POLY_ADDRESS", &self.address)
+            .header("POLY_API_KEY", &self.api_key)
+            .header("POLY_PASSPHRASE", &self.passphrase)
+            .header("POLY_SIGNATURE", l2_hmac)
+            .header("POLY_TIMESTAMP", request_timestamp.to_string())
+            .header("Content-Type", "application/json")
+            .body(exact_body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!(
+                "CLOB real order POST /order failed with status {}: {}",
+                status,
+                truncate_for_error(&text)
+            );
+        }
+
+        let placed: serde_json::Value =
+            serde_json::from_str(&text).context("failed to parse CLOB place order response")?;
+        Ok(placed)
+    }
+
     #[cfg(feature = "native-l2")]
     async fn try_build_signed_limit_order_payload(
         &self,
@@ -530,8 +736,9 @@ impl RealClobClient {
         use polymarket_client_sdk_v2::types::U256;
         use polymarket_client_sdk_v2::POLYGON;
 
-        let private_key = std::env::var("POLYMARKET_PRIVATE_KEY")
-            .context("POLYMARKET_PRIVATE_KEY is required for signed payload dry-runs")?;
+        // NOTE (dupe signing): duplicated from do_signed... see comment there.
+
+        let private_key = get_polymarket_private_key()?;
         let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
         let signer_address = signer.address().to_checksum(None);
         if !signer_address.eq_ignore_ascii_case(&self.address) {
@@ -767,9 +974,7 @@ impl RealClobClient {
         Ok(json)
     }
 
-    // Future methods (heavily gated):
-    // pub async fn place_order(&self, order: RealOrder) -> Result<OrderResponse> { ... }
-    // pub async fn get_open_orders(&self) -> Result<Vec<OpenOrder>> { ... }
+    // place_limit_order is now implemented (minimal, gated). See above + live_sender.
     // pub async fn cancel_order(&self, id: &str) -> Result<()> { ... }
 }
 
@@ -973,12 +1178,15 @@ pub fn build_collateral_readiness_report(
 }
 
 pub fn build_real_trading_unlock_status() -> serde_json::Value {
-    let explicit_unlock = env_truthy("POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION");
+    let explicit_unlock = env_truthy("POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION")
+        || env_truthy("POLYTRADER_ENABLE_REAL_ORDERS");
     let kill_switch_open = env_truthy("POLYTRADER_REAL_ORDER_KILL_SWITCH_OPEN");
     let paper_mode_active = std::env::var("POLYTRADER_MODE")
         .map(|value| value.trim().eq_ignore_ascii_case("paper"))
         .unwrap_or(true);
-    let live_sender_implemented = false;
+    // GatedRealClobLiveOrderSender is now implemented (wired to place_limit_order).
+    // It still only dispatches when its internal revalidation + env gates pass.
+    let live_sender_implemented = true;
 
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
@@ -998,13 +1206,17 @@ pub fn build_real_trading_unlock_status() -> serde_json::Value {
         "blocker",
         "POLYTRADER_REAL_ORDER_KILL_SWITCH_OPEN must be true; default is closed.",
     );
+    // paper_mode check is conditional: an explicit real-orders unlock allows the
+    // CLOB write path even while the top-level mode remains "paper" (the assert in
+    // config + paper engine are preserved; real clob orders are an orthogonal gated path).
+    let paper_blocks_real = paper_mode_active && !explicit_unlock;
     push_check(
         &mut checks,
         &mut blockers,
         "paper_mode_still_active",
-        !paper_mode_active,
+        !paper_blocks_real,
         "blocker",
-        "POLYTRADER_MODE is paper or unset, so live submission is blocked.",
+        "POLYTRADER_MODE is paper or unset and no explicit real-orders unlock is configured, so live submission is blocked.",
     );
     push_check(
         &mut checks,
@@ -1021,7 +1233,7 @@ pub fn build_real_trading_unlock_status() -> serde_json::Value {
     serde_json::json!({
         "ready": false,
         "ready_for_real_orders": false,
-        "real_orders_enabled": false,
+        "real_orders_enabled": explicit_unlock,
         "paper_only": true,
         "unlock_status_available": true,
         "explicit_real_order_submission_configured": explicit_unlock,
@@ -1035,7 +1247,7 @@ pub fn build_real_trading_unlock_status() -> serde_json::Value {
         "would_post": false,
         "post_order_called": false,
         "post_orders_called": false,
-        "note": "Read-only real-trading unlock status. This does not enable live trading or create a live sender."
+        "note": "Read-only real-trading unlock status. This does not enable live trading or create a live sender unless every other gate (human approval, final review, collateral, risk, kill) also passes at submit time."
     })
 }
 
@@ -1386,8 +1598,12 @@ fn order_submit_facade_response(
     blockers.sort();
     blockers.dedup();
     let blocker_count = blockers.len();
+    // With gated real sender wired, if the facade gates all pass we no longer
+    // hard-reject as "no_live_sender"; the actual dispatch decision (and send)
+    // is made by the caller (submit handler) which invokes the LiveOrderSender.
+    // Keep the decision conservative here (the facade fn itself never sends).
     let submit_decision = if blockers.is_empty() {
-        "rejected_no_live_sender"
+        "rejected_before_live_send_even_with_gates" // caller may still dispatch via sender
     } else {
         "rejected_fail_closed"
     };
@@ -1420,12 +1636,14 @@ fn order_submit_facade_response(
         "reconciliation_status": reconciliation_status,
         "dry_run_only": true,
         "paper_only": true,
-        "real_orders_enabled": false,
+        "real_orders_enabled": env_truthy("POLYTRADER_ENABLE_REAL_ORDERS") || env_truthy("POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION"),
         "ready_for_real_orders": false,
         "facade_available": submitting_order_facade_available(),
         "confirm_real_order_submission": request.confirm_real_order_submission,
         "human_approval_event_id": request.human_approval_event_id,
         "human_approval_event_valid": request.server_human_approval.as_ref().map(|approval| approval.valid).unwrap_or(false),
+        "final_review_decision_event_id": request.final_review_decision_event_id,
+        "final_review_decision_event_valid": request.server_final_review_decision.as_ref().map(|f| f.valid).unwrap_or(false),
         "human_approval_present": request.human_approval_token.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false),
         "human_approval_note_present": request.human_approval_note.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false),
         "operator": request.operator.as_deref().unwrap_or("unspecified"),
@@ -1442,7 +1660,7 @@ fn order_submit_facade_response(
         "gate_report": gate_report,
         "reconciliation": reconciliation,
         "blockers": reconciliation.get("blockers").cloned().unwrap_or_else(|| serde_json::json!([])),
-        "note": "Fail-closed submission facade only. The app evaluated approval, kill-switch, exposure, config, and reconciliation gates, then refused to send. No CLOB order endpoint was called."
+        "note": "Submission facade. Gates evaluated (including live sender implemented + conditional paper). When all pass + real unlock, the *caller* (submit handler) dispatches via GatedRealClobLiveOrderSender which may call place_limit_order. This response itself is still pre-send."
     })
 }
 
@@ -1503,6 +1721,28 @@ fn build_submit_facade_gate_report(
     );
     blockers.extend(approval_validation.blockers.iter().cloned());
 
+    // Final review decision validation (wired end-to-end for sender final_ok gate).
+    let final_validation = request
+        .server_final_review_decision
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| FinalReviewDecisionValidation {
+            valid: false,
+            event_id: request.final_review_decision_event_id,
+            decision: None,
+            operator: None,
+            blockers: vec!["final_review_decision_event_missing".to_string()],
+        });
+    push_check(
+        &mut checks,
+        &mut blockers,
+        "journaled_final_review_decision_valid",
+        final_validation.valid,
+        "blocker",
+        "A matching journaled final review decision event is required for the submit facade (non-zero id + recorded decision).",
+    );
+    blockers.extend(final_validation.blockers.iter().cloned());
+
     let collateral_validation = request
         .server_collateral_readiness
         .as_ref()
@@ -1548,26 +1788,35 @@ fn build_submit_facade_gate_report(
         "The operator must set confirm_real_order_submission=true for the facade to proceed.",
     );
 
-    let explicit_unlock = env_truthy("POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION");
+    // Or both names for consistency with config default, live_sender, server handler,
+    // unlock status, and effective_real_enabled (review issue: was using legacy only,
+    // so setting only POLYTRADER_ENABLE_REAL_ORDERS left the blocker).
+    let explicit_unlock = env_truthy("POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION")
+        || env_truthy("POLYTRADER_ENABLE_REAL_ORDERS");
     push_check(
         &mut checks,
         &mut blockers,
         "explicit_real_trading_config_unlock",
         explicit_unlock,
         "blocker",
-        "POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION must be true before any future live send.",
+        "POLYTRADER_ENABLE_REAL_ORDERS (or legacy POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION) must be true before any live send.",
     );
 
     let paper_mode_active = std::env::var("POLYTRADER_MODE")
         .map(|v| v.trim().eq_ignore_ascii_case("paper"))
         .unwrap_or(true);
+    let explicit_real_for_gate = env_truthy("POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION")
+        || env_truthy("POLYTRADER_ENABLE_REAL_ORDERS");
+    // Conditional to allow gated real clob orders without regressing the paper-mode
+    // assert in Config or the paper engine (real clob is separate path).
+    let paper_blocks_real = paper_mode_active && !explicit_real_for_gate;
     push_check(
         &mut checks,
         &mut blockers,
         "paper_mode_still_active",
-        !paper_mode_active,
+        !paper_blocks_real,
         "blocker",
-        "The app currently asserts paper mode at startup, so live submission is blocked.",
+        "The app currently asserts paper mode at startup and no explicit real-orders unlock is set, so live submission is blocked.",
     );
 
     let intent = &request
@@ -1830,6 +2079,36 @@ fn env_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Pub helper for server handler code that needs the same truthy check without
+/// duplicating the env logic (used for live sender wiring in submit facade).
+pub fn env_truthy_for_clob_reports(name: &str) -> bool {
+    env_truthy(name)
+}
+
+/// Unified L1 private key lookup supporting direct env or _FILE (for k8s secret
+/// volume without putting secret value in process env). Matches the logic in
+/// server l2 derive handler. Used for both real place_limit_order (EIP-712 order
+/// sig via SDK) and the signed dry-run payload builder.
+/// NOTE: FILE/env resolve logic is duplicated (lightly) in server::try_auto_derive_l2_on_startup
+/// (they serve signing key vs L2 session derive entrypoints). Extracting a common helper was
+/// considered minor; left as-is for smallest change in fix round (no new cross-module churn).
+#[cfg(feature = "native-l2")]
+fn get_polymarket_private_key() -> Result<String> {
+    if let Ok(path) = std::env::var("POLYMARKET_PRIVATE_KEY_FILE") {
+        if !path.trim().is_empty() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let k = content.trim().to_string();
+                if !k.is_empty() {
+                    return Ok(k);
+                }
+            }
+        }
+    }
+    std::env::var("POLYMARKET_PRIVATE_KEY")
+        .or_else(|_| std::env::var("PRIVATE_KEY"))
+        .context("POLYMARKET_PRIVATE_KEY (or POLYMARKET_PRIVATE_KEY_FILE) is required for signed order placement and dry-run payload signing")
+}
+
 fn submitting_order_facade_available() -> bool {
     cfg!(feature = "native-l2")
 }
@@ -1964,8 +2243,16 @@ fn truncate_for_error(text: &str) -> String {
 }
 
 #[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    // The shared TEST_ENV_LOCK lives at the authenticated module level (pub(crate) under cfg(test))
+    // so that live_sender::tests and others can acquire it to serialize real-order env mutations.
+    // Makefile pre-deploy now runs with --test-threads=1 + native-l2 coverage.
+    #[allow(unused_imports)]
+    use super::TEST_ENV_LOCK;
 
     #[test]
     fn poly_signature_matches_sdk_vector() {
@@ -2099,20 +2386,30 @@ mod tests {
 
     #[test]
     fn real_trading_unlock_status_fails_closed_by_default() {
+        // Guard against env pollution from env-modding tests in same process.
+        std::env::remove_var("POLYTRADER_ENABLE_REAL_ORDERS");
+        std::env::remove_var("POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION");
         let report = build_real_trading_unlock_status();
         let blockers = report["blockers"].as_array().expect("blockers");
 
         assert_eq!(report["ready"], false);
         assert_eq!(report["ready_for_real_orders"], false);
-        assert_eq!(report["real_orders_enabled"], false);
-        assert_eq!(report["explicit_real_order_submission_configured"], false);
-        assert_eq!(report["live_order_sender_implemented"], false);
+        // implemented is now true (GatedRealClobLiveOrderSender exists and is wired)
+        assert_eq!(report["live_order_sender_implemented"], true);
         assert_eq!(report["request_sent"], false);
         assert_eq!(report["post_order_called"], false);
+        // real_orders_enabled reflects the env (default false in test process)
+        if !env_truthy("POLYTRADER_ENABLE_REAL_ORDERS")
+            && !env_truthy("POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION")
+        {
+            assert_eq!(report["real_orders_enabled"], false);
+            assert_eq!(report["explicit_real_order_submission_configured"], false);
+        }
         assert!(blockers
             .iter()
             .any(|value| value == "explicit_real_trading_config_unlock"));
-        assert!(blockers
+        // no longer a blocker (gated impl is present)
+        assert!(!blockers
             .iter()
             .any(|value| value == "live_order_sender_implemented"));
     }
@@ -2244,6 +2541,13 @@ mod tests {
 
     #[test]
     fn submit_facade_fails_closed_without_approval_or_unlocks() {
+        // Ensure no stray real orders env from sibling tests in same process.
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("POLYTRADER_ENABLE_REAL_ORDERS");
+        std::env::remove_var("POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION");
+        std::env::remove_var("POLYTRADER_REAL_ORDER_KILL_SWITCH_OPEN");
+        std::env::set_var("POLYTRADER_REAL_ORDER_KILL_SWITCH_OPEN", "0");
+        std::env::set_var("POLYTRADER_ENABLE_REAL_ORDERS", "0");
         let request = OrderSubmitFacadeRequest {
             post_request_dry_run_request: OrderPostRequestDryRunRequest {
                 signed_payload_request: SignedOrderPayloadDryRunRequest {
@@ -2263,10 +2567,12 @@ mod tests {
             },
             confirm_real_order_submission: false,
             human_approval_event_id: None,
+            final_review_decision_event_id: None,
             human_approval_token: None,
             human_approval_note: None,
             operator: Some("test".to_string()),
             server_human_approval: None,
+            server_final_review_decision: None,
             server_collateral_readiness: None,
         };
         let post_report = order_post_request_dry_run_response(
@@ -2324,5 +2630,267 @@ mod tests {
             .iter()
             .any(|v| v == "explicit_real_trading_config_unlock"));
         assert!(blockers.iter().any(|v| v == "paper_mode_still_active"));
+        // New final validation: missing id produces blocker (end-to-end wired).
+        assert!(blockers
+            .iter()
+            .any(|v| v == "journaled_final_review_decision_valid"));
+        assert!(blockers
+            .iter()
+            .any(|v| v == "final_review_decision_event_missing"));
+
+        // E coverage (minimal): exercise submit facade response with final_review_decision_event_id
+        // present + server validation valid -> no final blocker (full gate path for handler branch).
+        let req_with_final = OrderSubmitFacadeRequest {
+            post_request_dry_run_request: request.post_request_dry_run_request.clone(),
+            confirm_real_order_submission: true,
+            human_approval_event_id: Some(uuid::Uuid::nil()), // dummy, will be invalid but we override server
+            final_review_decision_event_id: Some(uuid::Uuid::nil()),
+            human_approval_token: None,
+            human_approval_note: None,
+            operator: Some("test".to_string()),
+            server_human_approval: Some(HumanApprovalValidation {
+                valid: true,
+                event_id: None,
+                decision: Some("approve_facade".into()),
+                subject_hash: None,
+                blockers: vec![],
+            }),
+            server_final_review_decision: Some(FinalReviewDecisionValidation {
+                valid: true,
+                event_id: None,
+                decision: Some("acknowledge_blocked".into()),
+                operator: None,
+                blockers: vec![],
+            }),
+            server_collateral_readiness: Some(CollateralReadinessValidation {
+                valid: true,
+                event_id: None,
+                created_at: None,
+                wallet_address: None,
+                collateral_balance: None,
+                collateral_balance_positive: true,
+                collateral_allowance_positive: true,
+                positive_allowance_count: Some(1),
+                max_age_seconds: 900,
+                age_seconds: Some(10),
+                blockers: vec![],
+            }),
+        };
+        // note: full post_report would have no blockers for some, but for this we use the gate report check
+        let gate =
+            build_submit_facade_gate_report(&req_with_final, &serde_json::json!({"blockers": []}));
+        let gblockers: Vec<String> = gate["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        assert!(!gblockers
+            .iter()
+            .any(|v| v == "journaled_final_review_decision_valid"));
+        assert!(!gblockers
+            .iter()
+            .any(|v| v == "final_review_decision_event_missing"));
+    }
+
+    // Expanded tests for place early bails (cover dispatch/place error arms without net).
+    // Uses secret injection (crate visible) + env guards + no real key/addr match to bail
+    // before any http/POST in do_signed.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn place_limit_order_bails_early_when_orders_disabled() {
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var("POLYTRADER_ENABLE_REAL_ORDERS").ok();
+        std::env::remove_var("POLYTRADER_ENABLE_REAL_ORDERS");
+        std::env::remove_var("POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION");
+        // ensure a creds entry so from_current succeeds (orders_enabled from default=false)
+        {
+            let mut g = crate::server::get_l2_secrets().lock().unwrap();
+            g.clear();
+            g.insert(
+                "test-sess".to_string(),
+                crate::server::L2Secret {
+                    address: "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf".to_string(),
+                    api_key: "00000000-0000-0000-0000-000000000000".to_string(),
+                    secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+                    passphrase: "p".to_string(),
+                },
+            );
+        }
+        let client = RealClobClient::from_current_l2_session().expect("injected for test");
+        let intent = RealOrderIntentDryRun {
+            token_id: "0".repeat(64),
+            side: "buy".to_string(),
+            order_type: "limit".to_string(),
+            size: dec!(1),
+            price: Some(dec!(0.5)),
+            expected_edge_bps: None,
+            market_id: None,
+            outcome: None,
+        };
+        let err = client.place_limit_order(&intent).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Real order placement is disabled")
+                || err.to_string().contains("disabled")
+        );
+        // restore env
+        match old {
+            Some(v) => std::env::set_var("POLYTRADER_ENABLE_REAL_ORDERS", v),
+            None => std::env::remove_var("POLYTRADER_ENABLE_REAL_ORDERS"),
+        }
+        {
+            let mut g = crate::server::get_l2_secrets().lock().unwrap();
+            g.clear();
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn place_limit_order_bails_early_on_non_limit() {
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("POLYTRADER_ENABLE_REAL_ORDERS", "1");
+        let old_key = std::env::var("POLYMARKET_PRIVATE_KEY").ok();
+        {
+            let mut g = crate::server::get_l2_secrets().lock().unwrap();
+            g.clear();
+            g.insert(
+                "test-sess".to_string(),
+                crate::server::L2Secret {
+                    address: "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf".to_string(),
+                    api_key: "00000000-0000-0000-0000-000000000000".to_string(),
+                    secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+                    passphrase: "p".to_string(),
+                },
+            );
+        }
+        let client = RealClobClient::from_current_l2_session().expect("injected");
+        let intent = RealOrderIntentDryRun {
+            token_id: "0".repeat(64),
+            side: "buy".to_string(),
+            order_type: "market".to_string(),
+            size: dec!(1),
+            price: Some(dec!(0.5)),
+            expected_edge_bps: None,
+            market_id: None,
+            outcome: None,
+        };
+        let err = client.place_limit_order(&intent).await.unwrap_err();
+        assert!(err.to_string().contains("supports limit orders only"));
+        match old_key {
+            Some(v) => std::env::set_var("POLYMARKET_PRIVATE_KEY", v),
+            None => std::env::remove_var("POLYMARKET_PRIVATE_KEY"),
+        }
+        std::env::remove_var("POLYTRADER_ENABLE_REAL_ORDERS");
+        {
+            let mut g = crate::server::get_l2_secrets().lock().unwrap();
+            g.clear();
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(feature = "native-l2")]
+    async fn place_limit_order_bails_on_missing_private_key() {
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("POLYTRADER_ENABLE_REAL_ORDERS", "1");
+        let old_key = std::env::var("POLYMARKET_PRIVATE_KEY").ok();
+        let old_file = std::env::var("POLYMARKET_PRIVATE_KEY_FILE").ok();
+        std::env::remove_var("POLYMARKET_PRIVATE_KEY");
+        std::env::remove_var("POLYMARKET_PRIVATE_KEY_FILE");
+        std::env::remove_var("PRIVATE_KEY");
+        {
+            let mut g = crate::server::get_l2_secrets().lock().unwrap();
+            g.clear();
+            g.insert(
+                "test-sess".to_string(),
+                crate::server::L2Secret {
+                    address: "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf".to_string(),
+                    api_key: "00000000-0000-0000-0000-000000000000".to_string(),
+                    secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+                    passphrase: "p".to_string(),
+                },
+            );
+        }
+        let client = RealClobClient::from_current_l2_session().expect("injected");
+        let intent = RealOrderIntentDryRun {
+            token_id: "0".repeat(64),
+            side: "buy".to_string(),
+            order_type: "limit".to_string(),
+            size: dec!(1),
+            price: Some(dec!(0.5)),
+            expected_edge_bps: None,
+            market_id: None,
+            outcome: None,
+        };
+        let err = client.place_limit_order(&intent).await.unwrap_err();
+        assert!(
+            err.to_string().contains("POLYMARKET_PRIVATE_KEY")
+                || err.to_string().contains("required for signed order")
+        );
+        // restore
+        match old_key {
+            Some(v) => std::env::set_var("POLYMARKET_PRIVATE_KEY", v),
+            None => std::env::remove_var("POLYMARKET_PRIVATE_KEY"),
+        }
+        match old_file {
+            Some(v) => std::env::set_var("POLYMARKET_PRIVATE_KEY_FILE", v),
+            None => std::env::remove_var("POLYMARKET_PRIVATE_KEY_FILE"),
+        }
+        std::env::remove_var("POLYTRADER_ENABLE_REAL_ORDERS");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(feature = "native-l2")]
+    async fn place_limit_order_bails_on_address_mismatch_even_with_key() {
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("POLYTRADER_ENABLE_REAL_ORDERS", "1");
+        let old_key = std::env::var("POLYMARKET_PRIVATE_KEY").ok();
+        std::env::set_var(
+            "POLYMARKET_PRIVATE_KEY",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+        );
+        {
+            let mut g = crate::server::get_l2_secrets().lock().unwrap();
+            g.clear();
+            // address that won't match the privkey 0x...0001 -> 0x7E5F...
+            g.insert(
+                "test-sess".to_string(),
+                crate::server::L2Secret {
+                    address: "0x0000000000000000000000000000000000000000".to_string(),
+                    api_key: "00000000-0000-0000-0000-000000000000".to_string(),
+                    secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+                    passphrase: "p".to_string(),
+                },
+            );
+        }
+        let client = RealClobClient::from_current_l2_session().expect("injected");
+        let intent = RealOrderIntentDryRun {
+            token_id: "0".repeat(64),
+            side: "buy".to_string(),
+            order_type: "limit".to_string(),
+            size: dec!(1),
+            price: Some(dec!(0.5)),
+            expected_edge_bps: None,
+            market_id: None,
+            outcome: None,
+        };
+        let err = client.place_limit_order(&intent).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match active L2 session address")
+                || err.to_string().contains("signer address does not match")
+        );
+        // restore
+        match old_key {
+            Some(v) => std::env::set_var("POLYMARKET_PRIVATE_KEY", v),
+            None => std::env::remove_var("POLYMARKET_PRIVATE_KEY"),
+        }
+        std::env::remove_var("POLYTRADER_ENABLE_REAL_ORDERS");
+        // do not leave a secret for sibling tests
+        {
+            let mut g = crate::server::get_l2_secrets().lock().unwrap();
+            g.clear();
+        }
     }
 }

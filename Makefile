@@ -81,7 +81,12 @@ check:
 	cargo fmt --all -- --check
 	cargo check
 	cargo clippy --all-targets -- -D warnings
-	cargo test
+	# Mirror pre-deploy: threads=1 for clob env tests + native-l2 for real gated path coverage.
+	# Native targeted lines are now blocking (remove || true) to make real gated coverage (FILE, signing, place bails) fatal for guardrails.
+	cargo test -- --test-threads=1
+	cargo check --features native-l2
+	cargo test --features native-l2 -- clob::authenticated::tests::place_limit -- --test-threads=1
+	cargo test --features native-l2 -- clob::live_sender::tests::gated_real -- --test-threads=1
 
 # Strict guardrails that MUST pass before any deployment.
 # This prevents wasting time on CrashLoopBackOff deploys due to
@@ -91,16 +96,29 @@ pre-deploy-check:
 	@echo "==> Running strict pre-deploy guardrails (these MUST pass before deploy)..."
 	cargo fmt --all -- --check
 	cargo check
-	cargo test
+	# Env-mutating clob tests (place_bails_*, unlock, gated sender, submit facade) are serialized via TEST_ENV_LOCK.
+	# Use --test-threads=1 for the clob filter to prevent races on POLYTRADER_ENABLE_* globals (see authenticated.rs:2248 comment).
+	cargo test -- --test-threads=1
+	# Exercise native-l2 real gated path (FILE key lookup, signing bails, place_limit under feature, from_current for gated dispatch) in guardrails.
+	# This covers the L2 secret volume + signing exercised in the TS pod (see Issue 5 fix round).
+	# NOTE: these native lines are now *blocking* (no || true) so real gated coverage is fatal before TS+set-image.
+	cargo check --features native-l2
+	cargo test --features native-l2 -- clob::authenticated::tests::place_limit -- --test-threads=1
+	cargo test --features native-l2 -- clob::live_sender::tests::gated_real -- --test-threads=1
 	@echo ""
 	@echo "==> Running clippy for visibility (does not block deploy yet)..."
 	cargo clippy --all-targets -- -D warnings || echo "    (Clippy warnings exist — consider cleaning, but not blocking deploy for now)"
 	@echo ""
-	@echo "==> ✅ Guardrails passed. fmt + check + tests are clean. Safe to build/deploy."
+	@echo "==> Running native-l2 coverage for real gated path (FILE, signing bails, place under feature, from_current) — now blocking per review hygiene."
+	cargo check --features native-l2
+	cargo test --features native-l2 -- clob::authenticated::tests::place_limit -- --test-threads=1
+	cargo test --features native-l2 -- clob::live_sender::tests::gated_real -- --test-threads=1
+	@echo ""
+	@echo "==> ✅ Guardrails passed. fmt + check + tests + native-l2 real gated coverage are clean. Safe to build/deploy."
 	@echo "    (Clippy is advisory for now due to pre-existing L2/paper engine noise.)"
 
 test:
-	cargo test
+	cargo test -- --test-threads=1
 
 run:
 	POLYTRADER_MODE=paper cargo run

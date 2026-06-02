@@ -13,6 +13,7 @@
 //! ngrok header trust only from edge, $150 personal data exposure (future per-user), no migs.
 //! Credits: AGENTS.md, prior ngrok deploy (edge SSO context), no UI auth from 5 polymarket repos.
 
+use crate::strategy::{FeeContext, FusionEngine};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -22,10 +23,11 @@ use axum::{
 };
 use dioxus::prelude::*;
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tower_http::trace::TraceLayer;
@@ -42,9 +44,45 @@ struct MarketRow {
     gamma_id: String,
     slug: String,
     question: String,
+    category: Option<String>,
     last_mid_yes: Option<Decimal>,
     last_mid_no: Option<Decimal>,
     active: bool,
+}
+
+#[derive(Serialize)]
+struct MarketResponse {
+    gamma_id: String,
+    slug: String,
+    question: String,
+    category: Option<String>,
+    category_label: Option<String>,
+    last_mid_yes: Option<Decimal>,
+    last_mid_no: Option<Decimal>,
+    clob_mid_ready: bool,
+    market_data_status: &'static str,
+    active: bool,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct MarketCategoryRow {
+    category: Option<String>,
+    active_market_count: i64,
+    data_ready_market_count: i64,
+}
+
+#[derive(Serialize)]
+struct MarketCategoryResponse {
+    category: Option<String>,
+    category_label: String,
+    active_market_count: i64,
+    data_ready_market_count: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct MarketDataReadinessRow {
+    active_market_count: i64,
+    data_ready_market_count: i64,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -54,6 +92,158 @@ struct PortfolioSnapshot {
     total_locked: Decimal,
     unrealized_pnl: Decimal,
     realized_pnl: Decimal,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct PaperOrderRequest {
+    market_id: String,
+    outcome: String,
+    side: String,
+    order_type: String,
+    size: Decimal,
+    limit_price: Option<Decimal>,
+    rationale: Option<String>,
+    confirm_paper_order: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct StrategyPaperOrderRequest {
+    market_id: String,
+    outcome: Option<String>,
+    size: Option<Decimal>,
+    confirm_strategy_paper_order: Option<bool>,
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct StrategyPaperCandidateObservationRequest {
+    size: Option<Decimal>,
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct StrategyPaperOrderReadinessQuery {
+    market_id: Option<String>,
+    outcome: Option<String>,
+    size: Option<Decimal>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct PaperResetRequest {
+    confirm_paper_reset: Option<bool>,
+    reason: Option<String>,
+    operator: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PaperOrderMarketReadinessRow {
+    gamma_id: String,
+    slug: String,
+    question: String,
+    active: bool,
+    last_mid_yes: Option<Decimal>,
+    last_mid_no: Option<Decimal>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PaperOrderHistoryRow {
+    id: uuid::Uuid,
+    market_id: String,
+    slug: Option<String>,
+    question: Option<String>,
+    outcome: String,
+    side: String,
+    order_type: String,
+    limit_price: Option<Decimal>,
+    size: Decimal,
+    status: String,
+    fill_count: i64,
+    filled_size: Decimal,
+    gross_notional: Decimal,
+    total_fee: Decimal,
+    decision_context: Option<serde_json::Value>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PaperFillHistoryRow {
+    id: uuid::Uuid,
+    order_id: uuid::Uuid,
+    market_id: String,
+    slug: Option<String>,
+    outcome: String,
+    side: String,
+    price: Decimal,
+    size: Decimal,
+    fee: Decimal,
+    slippage_bps: i32,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PaperPositionHistoryRow {
+    market_id: String,
+    slug: Option<String>,
+    question: Option<String>,
+    category: Option<String>,
+    outcome: String,
+    shares: Decimal,
+    avg_entry_price: Decimal,
+    collateral_locked: Decimal,
+    last_mid_yes: Option<Decimal>,
+    last_mid_no: Option<Decimal>,
+    last_updated: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PaperPositionLedgerRow {
+    market_id: String,
+    outcome: String,
+    shares: Decimal,
+    collateral_locked: Decimal,
+}
+
+#[derive(sqlx::FromRow)]
+struct ExpectedPaperPositionLedgerRow {
+    market_id: String,
+    outcome: String,
+    expected_shares: Decimal,
+    fill_count: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct LatestPaperPortfolioSnapshotRow {
+    as_of: chrono::DateTime<chrono::Utc>,
+    virtual_usdc: Decimal,
+    total_locked: Decimal,
+    unrealized_pnl: Decimal,
+    realized_pnl: Decimal,
+    snapshot_reason: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct StrategyCandidateMarketRow {
+    gamma_id: String,
+    slug: String,
+    question: String,
+    category: Option<String>,
+    last_mid_yes: Decimal,
+    last_mid_no: Decimal,
+}
+
+#[derive(sqlx::FromRow)]
+struct StrategyOrderbookSnapshotRow {
+    bids: serde_json::Value,
+    asks: serde_json::Value,
+    spread: Option<Decimal>,
+    fetched_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct StrategyTickVelocitySnapshotRow {
+    mid: Decimal,
+    fetched_at: chrono::DateTime<chrono::Utc>,
 }
 
 pub async fn start_server(
@@ -79,7 +269,36 @@ pub async fn start_server(
     let app_routes = Router::new()
         .route("/", get(dashboard_handler))
         .route("/markets", get(markets_handler))
+        .route("/market-categories", get(market_categories_handler))
+        .route(
+            "/strategy/paper-candidates",
+            get(strategy_paper_candidates_handler),
+        )
+        .route(
+            "/strategy/paper-candidate-observations",
+            get(strategy_paper_candidate_observations_handler)
+                .post(strategy_paper_candidate_observation_handler),
+        )
+        .route(
+            "/strategy/paper-order-readiness",
+            get(strategy_paper_order_readiness_handler),
+        )
+        .route(
+            "/strategy/paper-orders",
+            post(strategy_paper_order_submit_handler),
+        )
         .route("/paper/portfolio", get(portfolio_handler))
+        .route("/paper/order-preview", post(paper_order_preview_handler))
+        .route(
+            "/paper/orders",
+            get(paper_orders_handler).post(paper_order_submit_handler),
+        )
+        .route("/paper/fills", get(paper_fills_handler))
+        .route("/paper/positions", get(paper_positions_handler))
+        .route("/paper/risk-summary", get(paper_risk_summary_handler))
+        .route("/paper/rejections", get(paper_rejections_handler))
+        .route("/paper/reset", post(paper_reset_handler))
+        .route("/paper/reconciliation", get(paper_reconciliation_handler))
         // AUTH (Next Phase): login/callback/logout/whoami. Optional for paper (dual edge+app).
         // Relative links in UI + <base> ensure subpath compat. /health untouched (public).
         .route("/auth/login", get(auth_login_handler))
@@ -251,7 +470,7 @@ async fn health_handler() -> impl IntoResponse {
 
 async fn markets_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let rows: Vec<MarketRow> = sqlx::query_as(
-        "SELECT gamma_id, slug, question, last_mid_yes, last_mid_no, active
+        "SELECT gamma_id, slug, question, category, last_mid_yes, last_mid_no, active
          FROM market_data.markets
          WHERE active = true
          ORDER BY updated_at DESC
@@ -261,7 +480,222 @@ async fn markets_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
     .await
     .unwrap_or_default();
 
-    Json(rows)
+    let response = rows
+        .into_iter()
+        .map(|row| MarketResponse {
+            clob_mid_ready: market_has_two_sided_mids(&row.last_mid_yes, &row.last_mid_no),
+            market_data_status: market_data_status(&row.last_mid_yes, &row.last_mid_no),
+            gamma_id: row.gamma_id,
+            slug: row.slug,
+            question: row.question,
+            category_label: row
+                .category
+                .as_deref()
+                .map(category_display_label)
+                .map(str::to_string),
+            category: row.category,
+            last_mid_yes: row.last_mid_yes,
+            last_mid_no: row.last_mid_no,
+            active: row.active,
+        })
+        .collect::<Vec<_>>();
+
+    Json(response)
+}
+
+async fn market_categories_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let rows: Vec<MarketCategoryRow> = sqlx::query_as(
+        "SELECT category,
+                COUNT(*)::BIGINT AS active_market_count,
+                COUNT(*) FILTER (WHERE last_mid_yes IS NOT NULL AND last_mid_no IS NOT NULL)::BIGINT AS data_ready_market_count
+         FROM market_data.markets
+         WHERE active = true
+         GROUP BY category
+         ORDER BY active_market_count DESC, category NULLS LAST
+         LIMIT 50",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    let response = rows
+        .into_iter()
+        .map(|row| MarketCategoryResponse {
+            category_label: row
+                .category
+                .as_deref()
+                .map(category_display_label)
+                .unwrap_or("Uncategorized")
+                .to_string(),
+            category: row.category,
+            active_market_count: row.active_market_count,
+            data_ready_market_count: row.data_ready_market_count,
+        })
+        .collect::<Vec<_>>();
+
+    Json(response)
+}
+
+async fn strategy_paper_candidates_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    //! Read-only strategy candidate view for paper-only operation.
+    //!
+    //! RISK: This route wires strategy scoring to paper-order previews only.
+    //! It never calls `/paper/orders`, never sets `confirm_paper_order:true`,
+    //! never writes paper order/fill/position rows, and never touches CLOB order
+    //! APIs. Its purpose is to make the strategy layer observable before any
+    //! autonomous paper caller is allowed to execute candidates.
+    match build_strategy_paper_candidates(&state.pool).await {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "request_sent": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+                "error": format!("Failed to build strategy paper candidates: {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn strategy_paper_candidate_observation_handler(
+    State(state): State<Arc<AppState>>,
+    request: Option<Json<StrategyPaperCandidateObservationRequest>>,
+) -> impl IntoResponse {
+    //! Journal-only strategy observation.
+    //!
+    //! RISK: This creates append-only Hermes input, not trading authority. It
+    //! builds the same candidate snapshot as the read-only GET route, records
+    //! attribution/no-send flags in `journal.events`, and never calls paper
+    //! execution, signing, approvals, allowance refresh, live senders, or CLOB
+    //! order APIs.
+    let request = request.map(|Json(request)| request).unwrap_or_default();
+    match build_strategy_paper_candidate_observation(&state.pool, request).await {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "journaled": false,
+                "request_sent": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+                "error": format!("Failed to record strategy paper candidate observation: {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn strategy_paper_candidate_observations_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DryRunEventsQuery>,
+) -> impl IntoResponse {
+    //! Read-only strategy candidate observation history.
+    //!
+    //! RISK: These are journaled pre-execution observations only. This route
+    //! cannot record a new observation, submit a paper order, sign, approve,
+    //! refresh allowance, create a live sender, or call CLOB order APIs.
+    let limit = clamp_dry_run_events_limit(query.limit.unwrap_or(10));
+    match load_strategy_paper_candidate_observation_events(&state.pool, limit).await {
+        Ok(events) => Json(serde_json::json!({
+            "paper_only": true,
+            "real_orders_enabled": false,
+            "strategy_candidate_observation_history": true,
+            "request_sent": false,
+            "post_order_called": false,
+            "post_orders_called": false,
+            "count": events.len(),
+            "events": events,
+            "note": "Read-only journal.events history for strategy paper candidate observations; no paper or CLOB order API is called."
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "strategy_candidate_observation_history": true,
+                "request_sent": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+                "error": format!("Failed to load strategy paper candidate observations: {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn strategy_paper_order_readiness_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<StrategyPaperOrderReadinessQuery>,
+) -> impl IntoResponse {
+    //! Read-only strategy paper-order preflight.
+    //!
+    //! RISK: This endpoint mirrors the strategy paper-order gates for operator
+    //! review only. It does not record a rejection, submit a paper order, sign,
+    //! approve, refresh allowance, create a live sender, or call CLOB order APIs.
+    match build_strategy_paper_order_readiness(&state.pool, query).await {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "strategy_paper_order_readiness": true,
+                "ready_for_strategy_paper_order": false,
+                "request_sent": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+                "error": format!("Failed to build strategy paper-order readiness: {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn strategy_paper_order_submit_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<StrategyPaperOrderRequest>,
+) -> impl IntoResponse {
+    //! Strategy-gated paper execution bridge.
+    //!
+    //! RISK: This route is still paper-only. It re-derives the candidate on the
+    //! server, requires the FusionEngine net-edge gate to pass, requires an
+    //! explicit strategy confirmation, and then delegates to the existing paper
+    //! order submit path. It never signs, submits, cancels, funds, approves,
+    //! refreshes allowances, creates a live sender, or calls CLOB order APIs.
+    let (status, body) = build_strategy_paper_order_submission(&state.pool, request).await;
+    (status, Json(body)).into_response()
+}
+
+async fn fetch_market_data_readiness_summary(
+    pool: &PgPool,
+) -> Result<serde_json::Value, sqlx::Error> {
+    let row: MarketDataReadinessRow = sqlx::query_as(
+        "SELECT COUNT(*)::BIGINT AS active_market_count,
+                COUNT(*) FILTER (WHERE last_mid_yes IS NOT NULL AND last_mid_no IS NOT NULL)::BIGINT AS data_ready_market_count
+         FROM market_data.markets
+         WHERE active = true",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let ready = row.active_market_count > 0 && row.data_ready_market_count > 0;
+    Ok(serde_json::json!({
+        "available": true,
+        "status": if ready { "ready" } else { "missing_ready_market" },
+        "active_market_count": row.active_market_count,
+        "data_ready_market_count": row.data_ready_market_count,
+        "paper_only": true,
+        "real_orders_enabled": false,
+    }))
 }
 
 async fn portfolio_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -282,6 +716,599 @@ async fn portfolio_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
         unrealized_pnl: rust_decimal::Decimal::ZERO,
         realized_pnl: rust_decimal::Decimal::ZERO,
     }))
+}
+
+async fn paper_order_preview_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PaperOrderRequest>,
+) -> impl IntoResponse {
+    //! Paper-only execution preview. This endpoint validates the same conservative
+    //! market-data and bankroll gates as the paper submit route, but never writes
+    //! paper orders/fills and never touches authenticated CLOB order APIs.
+    match build_paper_order_plan(&state.pool, &request).await {
+        Ok(plan) => Json(plan).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "accepted_for_paper": false,
+                "executed": false,
+                "request_sent": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+                "error": format!("Paper order preview failed: {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn paper_order_submit_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PaperOrderRequest>,
+) -> impl IntoResponse {
+    //! Guarded paper execution only. This route can mutate `paper_trading.*` via
+    //! `PaperTradingEngine`, but it cannot sign, submit, cancel, approve, fund,
+    //! refresh allowances, or call CLOB `POST /order` / `POST /orders`.
+    let (status, body) = submit_paper_order_from_request(
+        &state.pool,
+        request,
+        "paper_order_submit_route",
+        "paper_order_submit_route_validation",
+        None,
+    )
+    .await;
+    (status, Json(body)).into_response()
+}
+
+async fn submit_paper_order_from_request(
+    pool: &PgPool,
+    request: PaperOrderRequest,
+    decision_context_source: &str,
+    rejection_source: &str,
+    extra_decision_context: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let mut plan = match build_paper_order_plan(pool, &request).await {
+        Ok(plan) => plan,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({
+                    "paper_only": true,
+                    "real_orders_enabled": false,
+                    "accepted_for_paper": false,
+                    "executed": false,
+                    "request_sent": false,
+                    "post_order_called": false,
+                    "post_orders_called": false,
+                    "error": format!("Paper order validation failed: {e}")
+                }),
+            );
+        }
+    };
+
+    let mut blockers = plan
+        .get("blockers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if request.confirm_paper_order != Some(true) {
+        blockers.push(serde_json::json!("confirm_paper_order_required"));
+    }
+    if !blockers.is_empty() {
+        let blocker_labels = blockers
+            .iter()
+            .filter_map(|value| value.as_str())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let rejection_payload = serde_json::json!({
+            "paper_only": true,
+            "real_orders_enabled": false,
+            "accepted_for_paper": false,
+            "executed": false,
+            "source": rejection_source,
+            "market_id": request.market_id.trim(),
+            "outcome": request.outcome,
+            "side": request.side,
+            "order_type": request.order_type,
+            "limit_price": request.limit_price,
+            "size": request.size,
+            "blockers": blocker_labels,
+            "preview": plan.clone(),
+            "request_sent": false,
+            "would_send": false,
+            "would_post": false,
+            "post_order_called": false,
+            "post_orders_called": false,
+            "note": "Confirmed paper submit rejected before PaperTradingEngine writes paper order, fill, position, or portfolio snapshot rows."
+        });
+        let journal_result = record_journal_event(
+            pool,
+            rejection_source,
+            "polytrader_server",
+            "warning",
+            rejection_payload,
+        )
+        .await;
+        if let Some(object) = plan.as_object_mut() {
+            object.insert("accepted_for_paper".to_string(), serde_json::json!(false));
+            object.insert("executed".to_string(), serde_json::json!(false));
+            object.insert("blockers".to_string(), serde_json::json!(blockers));
+            match journal_result {
+                Ok(event_id) => {
+                    object.insert("journaled".to_string(), serde_json::json!(true));
+                    object.insert("journal_event_id".to_string(), serde_json::json!(event_id));
+                }
+                Err(e) => {
+                    object.insert("journaled".to_string(), serde_json::json!(false));
+                    object.insert(
+                        "journal_error".to_string(),
+                        serde_json::json!(e.to_string()),
+                    );
+                }
+            }
+        }
+        return (StatusCode::BAD_REQUEST, plan);
+    }
+
+    let Some(order_side) = parse_paper_order_side(&request.side) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "accepted_for_paper": false,
+                "executed": false,
+                "blockers": ["invalid_side"],
+            }),
+        );
+    };
+    let Some(order_type) = parse_paper_order_type(&request.order_type) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "accepted_for_paper": false,
+                "executed": false,
+                "blockers": ["invalid_order_type"],
+            }),
+        );
+    };
+    let Some(outcome) = normalize_paper_order_outcome(&request.outcome) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "accepted_for_paper": false,
+                "executed": false,
+                "blockers": ["invalid_outcome"],
+            }),
+        );
+    };
+
+    let paper_fee_bps = paper_fee_bps_from_env();
+    let engine = crate::paper::PaperTradingEngine::new(
+        pool.clone(),
+        Arc::new(crate::journal::JournalWriter::new(pool.clone())),
+        paper_fee_bps,
+    );
+    let order = crate::paper::PaperOrder {
+        id: uuid::Uuid::new_v4(),
+        market_id: request.market_id.trim().to_string(),
+        outcome,
+        side: order_side,
+        order_type,
+        limit_price: request.limit_price,
+        size: request.size,
+        status: crate::paper::OrderStatus::Open,
+        created_at: chrono::Utc::now(),
+        decision_context: Some(serde_json::json!({
+            "source": decision_context_source,
+            "paper_only": true,
+            "real_orders_enabled": false,
+            "request_sent": false,
+            "post_order_called": false,
+            "post_orders_called": false,
+            "rationale": request.rationale,
+            "preview": plan,
+            "extra": extra_decision_context,
+        })),
+    };
+    let order_id = order.id;
+
+    match engine.submit_order(order).await {
+        Ok(fills) => {
+            let filled_size: Decimal = fills.iter().map(|fill| fill.size).sum();
+            let gross_notional: Decimal = fills.iter().map(|fill| fill.price * fill.size).sum();
+            let total_fee: Decimal = fills.iter().map(|fill| fill.fee).sum();
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "paper_only": true,
+                    "real_orders_enabled": false,
+                    "accepted_for_paper": true,
+                    "executed": !fills.is_empty(),
+                    "paper_order_id": order_id,
+                    "fill_count": fills.len(),
+                    "filled_size": filled_size,
+                    "gross_notional": gross_notional,
+                    "total_fee": total_fee,
+                    "fills": fills,
+                    "request_sent": false,
+                    "would_send": false,
+                    "would_post": false,
+                    "post_order_called": false,
+                    "post_orders_called": false,
+                    "note": "Paper order executed only in paper_trading tables; no CLOB order API was called."
+                }),
+            )
+        }
+        Err(e) => {
+            let error = e.to_string();
+            // (paper risk fns not present after fidelity revert of paper; treat as non-risk for this path)
+            let engine_risk_rejection = error.to_lowercase().contains("risk");
+            let mut body = serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "accepted_for_paper": false,
+                "executed": false,
+                "paper_order_id": order_id,
+                "request_sent": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+                "error": format!("Paper order execution failed: {error}")
+            });
+            if engine_risk_rejection {
+                if let Some(object) = body.as_object_mut() {
+                    object.insert(
+                        "blockers".to_string(),
+                        serde_json::json!(["paper_engine_risk_rejection"]),
+                    );
+                    object.insert(
+                        "note".to_string(),
+                        serde_json::json!("Paper engine risk guard rejected before fill, position, or portfolio snapshot writes."),
+                    );
+                }
+            }
+            (
+                if engine_risk_rejection {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+                body,
+            )
+        }
+    }
+}
+
+async fn paper_orders_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DryRunEventsQuery>,
+) -> impl IntoResponse {
+    //! Read-only paper order history. This exposes simulated orders/fill rollups
+    //! from `paper_trading.*` so operators and Hermes can inspect paper behavior
+    //! without database access. It never touches authenticated CLOB order APIs.
+    let limit = clamp_dry_run_events_limit(query.limit.unwrap_or(20));
+    match sqlx::query_as::<_, PaperOrderHistoryRow>(
+        r#"SELECT
+                o.id,
+                o.market_id,
+                m.slug,
+                m.question,
+                o.outcome,
+                o.side,
+                o.order_type,
+                o.limit_price,
+                o.size,
+                o.status,
+                COUNT(f.id)::BIGINT AS fill_count,
+                COALESCE(SUM(f.size), 0)::NUMERIC AS filled_size,
+                COALESCE(SUM(f.price * f.size), 0)::NUMERIC AS gross_notional,
+                COALESCE(SUM(f.fee), 0)::NUMERIC AS total_fee,
+                o.decision_context,
+                o.created_at,
+                o.updated_at
+           FROM paper_trading.paper_orders o
+           LEFT JOIN market_data.markets m ON m.gamma_id = o.market_id
+           LEFT JOIN paper_trading.paper_fills f ON f.order_id = o.id
+           GROUP BY o.id, m.slug, m.question
+           ORDER BY o.created_at DESC
+           LIMIT $1"#,
+    )
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(rows) => Json(serde_json::json!({
+            "paper_only": true,
+            "real_orders_enabled": false,
+            "request_sent": false,
+            "post_order_called": false,
+            "post_orders_called": false,
+            "count": rows.len(),
+            "orders": rows.into_iter().map(paper_order_history_json).collect::<Vec<_>>(),
+            "note": "Read-only simulated paper order history; no CLOB order API is called."
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "request_sent": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+                "error": format!("Failed to load paper order history: {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn paper_fills_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DryRunEventsQuery>,
+) -> impl IntoResponse {
+    //! Read-only paper fill history. Fills are simulated executions produced by
+    //! `PaperTradingEngine` and are used by Hermes for fee/P&L attribution.
+    let limit = clamp_dry_run_events_limit(query.limit.unwrap_or(20));
+    match sqlx::query_as::<_, PaperFillHistoryRow>(
+        r#"SELECT
+                f.id,
+                f.order_id,
+                o.market_id,
+                m.slug,
+                o.outcome,
+                o.side,
+                f.price,
+                f.size,
+                f.fee,
+                f.slippage_bps,
+                f.created_at
+           FROM paper_trading.paper_fills f
+           JOIN paper_trading.paper_orders o ON o.id = f.order_id
+           LEFT JOIN market_data.markets m ON m.gamma_id = o.market_id
+           ORDER BY f.created_at DESC
+           LIMIT $1"#,
+    )
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(rows) => Json(serde_json::json!({
+            "paper_only": true,
+            "real_orders_enabled": false,
+            "request_sent": false,
+            "post_order_called": false,
+            "post_orders_called": false,
+            "count": rows.len(),
+            "fills": rows.into_iter().map(paper_fill_history_json).collect::<Vec<_>>(),
+            "note": "Read-only simulated paper fill history; no CLOB order API is called."
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "request_sent": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+                "error": format!("Failed to load paper fill history: {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn paper_positions_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    //! Read-only current paper position exposure. These rows are simulated
+    //! `paper_trading.paper_positions` state only; there is no wallet or CLOB
+    //! position read/write behind this endpoint.
+    match load_paper_position_rows(&state.pool).await {
+        Ok(rows) => Json(serde_json::json!({
+            "paper_only": true,
+            "real_orders_enabled": false,
+            "request_sent": false,
+            "post_order_called": false,
+            "post_orders_called": false,
+            "count": rows.len(),
+            "positions": rows.into_iter().map(paper_position_history_json).collect::<Vec<_>>(),
+            "note": "Read-only simulated paper position exposure; no CLOB order or wallet API is called."
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "request_sent": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+                "error": format!("Failed to load paper positions: {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn paper_rejections_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DryRunEventsQuery>,
+) -> impl IntoResponse {
+    //! Read-only paper rejection audit events. These are append-only journal
+    //! records for refused simulator intents; they are not real orders and they
+    //! never call CLOB order APIs.
+    let limit = clamp_dry_run_events_limit(query.limit.unwrap_or(20));
+    match sqlx::query_as::<
+        _,
+        (
+            uuid::Uuid,
+            String,
+            String,
+            String,
+            serde_json::Value,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
+        r#"SELECT id, event_type, source, severity, payload, created_at
+           FROM journal.events
+           WHERE event_type = 'paper_order_rejection'
+           ORDER BY created_at DESC
+           LIMIT $1"#,
+    )
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(rows) => Json(serde_json::json!({
+            "paper_only": true,
+            "real_orders_enabled": false,
+            "request_sent": false,
+            "post_order_called": false,
+            "post_orders_called": false,
+            "count": rows.len(),
+            "events": rows.into_iter().map(|(id, event_type, source, severity, payload, created_at)| {
+                serde_json::json!({
+                    "id": id,
+                    "event_type": event_type,
+                    "source": source,
+                    "severity": severity,
+                    "payload": payload,
+                    "created_at": created_at,
+                })
+            }).collect::<Vec<_>>(),
+            "note": "Read-only paper rejection audit events from journal.events; no CLOB order API is called."
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "request_sent": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+                "error": format!("Failed to load paper rejection events: {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn paper_reset_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PaperResetRequest>,
+) -> impl IntoResponse {
+    //! Explicit paper-only simulator reset for development recovery.
+    //!
+    //! RISK: This does not delete audit history. It only clears current
+    //! `paper_positions` and writes a fresh virtual portfolio snapshot so a known
+    //! bad simulator state can be rebased without hiding prior paper orders/fills.
+    //! It never touches real wallet state or CLOB order APIs.
+    let reason = request.reason.as_deref().map(str::trim).unwrap_or_default();
+    if request.confirm_paper_reset != Some(true) || reason.len() < 8 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "reset_applied": false,
+                "request_sent": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+                "blockers": ["confirm_paper_reset_required", "reason_min_8_chars_required"],
+                "note": "Paper reset requires confirm_paper_reset:true and a reason. Historical paper orders/fills are preserved."
+            })),
+        )
+            .into_response();
+    }
+
+    match reset_paper_simulator_state(&state.pool, reason, request.operator.as_deref()).await {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "reset_applied": false,
+                "request_sent": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+                "error": format!("Failed to reset paper simulator state: {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn paper_reconciliation_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    //! Read-only consistency check for the current paper simulator state.
+    //!
+    //! RISK: This endpoint never mutates paper tables and never touches CLOB
+    //! order APIs. It compares current cached paper positions and latest
+    //! portfolio snapshot against fills after the latest manual reset boundary,
+    //! so operators can detect stale/corrupt simulator state before strategies
+    //! rely on paper execution.
+    match build_paper_reconciliation_report(&state.pool).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "request_sent": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+                "status": "error",
+                "error": format!("Failed to build paper reconciliation report: {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn paper_risk_summary_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    //! Read-only aggregate over simulated paper risk. This summarizes paper
+    //! positions against conservative small-bankroll limits. It never writes
+    //! `paper_trading.*` rows and never calls authenticated CLOB order APIs.
+    let latest_usdc = match latest_virtual_usdc(&state.pool).await {
+        Ok(value) => value,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "paper_only": true,
+                    "real_orders_enabled": false,
+                    "request_sent": false,
+                    "post_order_called": false,
+                    "post_orders_called": false,
+                    "error": format!("Failed to load latest paper bankroll: {e}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match load_paper_position_rows(&state.pool).await {
+        Ok(rows) => Json(build_paper_risk_summary(latest_usdc, rows)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "request_sent": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+                "error": format!("Failed to load paper risk summary: {e}")
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn dashboard_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -356,6 +1383,14 @@ fn get_sessions() -> &'static Mutex<HashMap<String, Session>> {
 /// Supports common headers the daytrader-oauth policy may add ("add headers" step).
 /// RISK: trust forwarded headers *only* because they come from trusted ngrok edge after SSO;
 /// in standalone/local the cookie path is used. Never trust arbitrary client headers.
+///
+/// RISK NOTE (Fix Round 1): x-forwarded-* (and x-auth-request-*) are trusted here for the POC dual-mode
+/// (ngrok edge SSO + in-cluster sim for verify). In docker-desktop / shared ngrok, in-cluster callers or
+/// spoofed headers *could* forge an operator identity for the 3 privileged paths (human-approval, final-review-decision,
+/// submit-facade). Those paths still require valid non-zero journal event ids + all other gates (collateral, kill, env unlock,
+/// final decision, L2 creds at dispatch time) before any real send; the facade itself is fail-closed. Verify now includes
+/// explicit unauthed 401 negatives. For production, add origin/CIDR/ngrok-auth checks or require mTLS for operator.
+/// See wiki runbooks/l2-private-key-secrets.md and AGENTS safety rules.
 #[derive(Debug, Clone)]
 pub struct AuthUser(pub Option<String>);
 
@@ -696,6 +1731,9 @@ pub(crate) struct L2Secret {
 static L2_SESSIONS: OnceLock<Mutex<HashMap<String, L2Session>>> = OnceLock::new();
 #[allow(clippy::type_complexity)]
 static L2_SECRETS: OnceLock<Mutex<HashMap<String, L2Secret>>> = OnceLock::new();
+// NOTE: .lock().unwrap() used in a few L2 paths (and oauth/sessions). Poison would panic the handler
+// (acceptable for this POC; restart recovers). from_current in clob uses .ok()/? for resilience.
+// See Issue 7 in fix round review. No change to deployed behavior.
 static SERVER_L2_SESSION_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn get_l2_sessions() -> &'static Mutex<HashMap<String, L2Session>> {
@@ -706,7 +1744,7 @@ pub(crate) fn get_l2_secrets() -> &'static Mutex<HashMap<String, L2Secret>> {
     L2_SECRETS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn get_server_l2_session_id() -> &'static Mutex<Option<String>> {
+pub(crate) fn get_server_l2_session_id() -> &'static Mutex<Option<String>> {
     SERVER_L2_SESSION_ID.get_or_init(|| Mutex::new(None))
 }
 
@@ -1021,6 +2059,8 @@ async fn derive_l2_credentials_native(
 pub async fn try_auto_derive_l2_on_startup() -> anyhow::Result<Option<String>> {
     // Support file-based secret (K8s best practice, matches DATABASE_URL_FILE pattern)
     // or direct env var (for local .env.local).
+    // NOTE (dupe with clob::authenticated::get_polymarket_private_key): both resolve the same
+    // privkey for native-l2; kept separate entrypoints for startup vs per-place signing. Minor.
     let private_key = if let Ok(path) = std::env::var("POLYMARKET_PRIVATE_KEY_FILE") {
         if !path.is_empty() {
             match std::fs::read_to_string(&path) {
@@ -1076,9 +2116,22 @@ pub async fn try_auto_derive_l2_on_startup() -> anyhow::Result<Option<String>> {
 // Server-side derivation using POLYMARKET_PRIVATE_KEY (or PRIVATE_KEY) from env.
 async fn l2_derive_from_server_key_handler(
     State(state): State<Arc<AppState>>,
+    auth: AuthUser,
 ) -> impl IntoResponse {
     //! RISK: Only use in paper mode. The private key allows deriving real L2 trading credentials.
     //! Secret material stays in process memory only (L2_SECRETS map).
+    //! SECURITY: operator auth required (401 if unauthenticated); this loads the
+    //! trading creds used by from_current_l2_session for gated real order dispatch.
+    if auth.0.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "operator authentication required to derive server L2 credentials (privileged)"
+            })),
+        )
+            .into_response();
+    }
     // Support file-based secret (K8s recommended) or direct env var.
     let private_key = if let Ok(path) = std::env::var("POLYMARKET_PRIVATE_KEY_FILE") {
         if !path.is_empty() {
@@ -1638,7 +2691,7 @@ async fn clob_operator_status_handler(
     );
 
     let review_status = review_health.get("status").and_then(|v| v.as_str());
-    let live_sender_boundary = crate::clob::live_sender::build_live_sender_boundary_status();
+    let live_sender_boundary = crate::clob::live_sender::build_live_sender_boundary_status().await;
     let operator_status = operator_status_state(
         clob_read_ok,
         &clob_blockers,
@@ -1785,14 +2838,30 @@ async fn clob_order_placement_readiness_handler(
                 Some(format!("Failed to load final review decision audit: {}", e)),
             ),
         };
+    let (market_data_readiness, market_data_error) =
+        match fetch_market_data_readiness_summary(&state.pool).await {
+            Ok(summary) => (summary, None),
+            Err(e) => (
+                serde_json::json!({
+                    "available": false,
+                    "status": "unavailable",
+                    "active_market_count": 0,
+                    "data_ready_market_count": 0,
+                    "paper_only": true,
+                    "real_orders_enabled": false,
+                }),
+                Some(format!("Failed to load market data readiness: {}", e)),
+            ),
+        };
 
     let readiness = build_order_placement_readiness(
         l2_connected,
         clob_read_ok,
         &preflight,
         &review_health,
+        &market_data_readiness,
         &final_review_audit,
-        &crate::clob::live_sender::build_live_sender_boundary_status(),
+        &crate::clob::live_sender::build_live_sender_boundary_status().await,
     );
 
     Json(serde_json::json!({
@@ -1804,10 +2873,12 @@ async fn clob_order_placement_readiness_handler(
         "readiness": readiness,
         "preflight": preflight,
         "review_health": review_health,
+        "market_data_readiness": market_data_readiness,
         "final_review_audit": final_review_audit,
         "errors": {
             "clob": clob_error,
             "review": review_error,
+            "market_data": market_data_error,
             "final_review": final_review_error,
         },
         "note": "Read-only readiness report only; no order placement, signing, submission, cancellation, allowance refresh, balance mutation, approval, kill-switch mutation, live-sender creation, or real trading is implemented."
@@ -2031,7 +3102,7 @@ async fn clob_live_sender_boundary_status_handler(
     //! Read-only status for the fail-closed live-sender boundary. This proves
     //! the trait boundary exists while the only implementation rejects before
     //! any network dispatch.
-    let report = crate::clob::live_sender::build_live_sender_boundary_status();
+    let report = crate::clob::live_sender::build_live_sender_boundary_status().await;
     let event_payload = serde_json::json!({
         "kind": "clob_live_sender_boundary_status",
         "report": report.clone(),
@@ -2094,7 +3165,7 @@ async fn clob_final_review_readiness_handler(
         collateral.as_ref().ok().and_then(|event| event.clone()),
         unlock.as_ref().ok().and_then(|event| event.clone()),
         reconciliation.as_ref().ok().and_then(|event| event.clone()),
-        &crate::clob::live_sender::build_live_sender_boundary_status(),
+        &crate::clob::live_sender::build_live_sender_boundary_status().await,
     );
 
     let mut errors = Vec::new();
@@ -2158,13 +3229,34 @@ async fn clob_final_review_readiness_handler(
 
 async fn clob_final_review_decision_handler(
     State(state): State<Arc<AppState>>,
+    auth: AuthUser,
     Json(request): Json<FinalReviewDecisionRequest>,
 ) -> impl IntoResponse {
     //! Record an operator decision against a final-review readiness packet.
     //! This is audit-only. It deliberately cannot approve real orders, cannot
     //! open the kill switch, and cannot create a live sender.
+    //! SECURITY: operator auth required; auth subject is bound to the journaled
+    //! decision event for audit (final id then usable as gate for submit-facade).
+    if auth.0.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "approved_for_real_orders": false,
+                "final_review_decision_recorded": false,
+                "journaled": false,
+                "error": "operator authentication required for final-review-decision (privileged gate)"
+            })),
+        )
+            .into_response();
+    }
     let decision = normalize_final_review_decision(&request.decision);
-    let operator = request.operator.as_deref().unwrap_or("unspecified").trim();
+    let operator = auth
+        .0
+        .as_deref()
+        .unwrap_or(request.operator.as_deref().unwrap_or("unspecified"))
+        .trim();
     let note = request.note.as_deref().unwrap_or("").trim();
     let final_review_event = load_journal_event_by_id(
         &state.pool,
@@ -2737,12 +3829,39 @@ async fn clob_order_intent_post_request_dry_run_handler(
 
 async fn clob_order_intent_submit_facade_handler(
     State(state): State<Arc<AppState>>,
+    auth: AuthUser,
     Json(mut request): Json<crate::clob::authenticated::OrderSubmitFacadeRequest>,
 ) -> impl IntoResponse {
     //! Evaluate the fail-closed real-order submission facade. This route exists
     //! to prove the shape and auditability of a future submit path while keeping
     //! live order placement blocked by approval, kill-switch, exposure, config,
     //! journaling, and paper-mode gates.
+    //! SECURITY: operator auth required (AuthUser via SSO/cookie); 401 otherwise.
+    //! The authenticated subject is bound to operator for audit.
+    if auth.0.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "l2_connected": false,
+                "accepted": false,
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "request_sent": false,
+                "post_order_called": false,
+                "error": "operator authentication required for submit-facade (privileged real-order path)"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(ref email) = auth.0 {
+        if request
+            .operator
+            .as_deref()
+            .is_none_or(|o| o.trim().is_empty() || o == "unspecified")
+        {
+            request.operator = Some(email.clone());
+        }
+    }
     let Some(client) = crate::clob::RealClobClient::from_current_l2_session() else {
         return Json(serde_json::json!({
             "l2_connected": false,
@@ -2766,6 +3885,8 @@ async fn clob_order_intent_submit_facade_handler(
 
     request.server_human_approval =
         Some(validate_human_approval_event(&state.pool, &request).await);
+    request.server_final_review_decision =
+        Some(validate_final_review_decision_event(&state.pool, &request).await);
     request.server_collateral_readiness =
         Some(validate_collateral_readiness_event(&state.pool, Some(client.address())).await);
 
@@ -2785,34 +3906,242 @@ async fn clob_order_intent_submit_facade_handler(
             .await
             {
                 Ok(event_id) => {
-                    let reconciliation =
-                        report.get("reconciliation").cloned().unwrap_or_else(|| {
-                            serde_json::json!({
-                                "required": true,
-                                "reconciled": true,
-                                "status": "reconciled_no_send",
-                                "submit_decision": "rejected_fail_closed",
-                                "request_sent": false,
-                                "post_order_called": false,
-                                "post_orders_called": false,
-                                "expected_exchange_state": "no_order_created",
-                                "observed_exchange_state": "not_queried_no_send"
-                            })
+                    // Wire the real sender here (smallest path to actual orders).
+                    // If the facade gate_report has no blockers (meaning human approval,
+                    // collateral, risk, explicit unlock, kill, paper conditional etc all
+                    // passed), we journal the LiveOrderSendRequest (full context) *before*
+                    // calling sender.send(), then invoke the gated sender which re-validates
+                    // immediately before any network POST. This integrates human_approval_event_id,
+                    // final-review (via ids), LiveOrderSender boundary, and pre/post journal.
+                    let gate_blockers: Vec<String> = report
+                        .get("gate_report")
+                        .and_then(|g| g.get("blockers"))
+                        .and_then(|b| b.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let effective_real_enabled =
+                        crate::clob::authenticated::env_truthy_for_clob_reports(
+                            "POLYTRADER_ENABLE_REAL_ORDERS",
+                        ) || crate::clob::authenticated::env_truthy_for_clob_reports(
+                            "POLYTRADER_ENABLE_REAL_ORDER_SUBMISSION",
+                        );
+                    let mut live_send_result: Option<serde_json::Value> = None;
+                    if gate_blockers.is_empty() && effective_real_enabled {
+                        let intent = &request
+                            .post_request_dry_run_request
+                            .signed_payload_request
+                            .intent;
+                        let human_id = request
+                            .human_approval_event_id
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|| "00000000-0000-0000-0000-000000000000".to_string());
+                        let final_id = request
+                            .final_review_decision_event_id
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|| "00000000-0000-0000-0000-000000000000".to_string());
+                        let live_req = crate::clob::LiveOrderSendRequest {
+                            local_order_id: format!("facade-{}", uuid::Uuid::new_v4()),
+                            order_intent_event_id: "00000000-0000-0000-0000-000000000000"
+                                .to_string(),
+                            signed_payload_event_id: "00000000-0000-0000-0000-000000000000"
+                                .to_string(),
+                            human_approval_event_id: human_id.clone(),
+                            final_review_decision_event_id: final_id,
+                            market_id: intent.market_id.clone().unwrap_or_default(),
+                            token_id: intent.token_id.clone(),
+                            side: intent.side.clone(),
+                            order_type: intent.order_type.clone(),
+                            size: intent.size,
+                            price: intent.price.unwrap_or(rust_decimal::Decimal::ONE),
+                        };
+
+                        // Log full intent with context *before* execution (AGENTS + safety rule 5).
+                        // Pre journal is now a HARD gate: journal failure -> no send (fail-closed).
+                        let pre_payload = serde_json::json!({
+                            "kind": "clob_live_order_intent_pre_dispatch",
+                            "live_order_send_request": {
+                                "local_order_id": live_req.local_order_id,
+                                "order_intent_event_id": live_req.order_intent_event_id,
+                                "signed_payload_event_id": live_req.signed_payload_event_id,
+                                "human_approval_event_id": live_req.human_approval_event_id,
+                                "final_review_decision_event_id": live_req.final_review_decision_event_id,
+                                "market_id": live_req.market_id,
+                                "token_id": live_req.token_id,
+                                "side": live_req.side,
+                                "order_type": live_req.order_type,
+                                "size": live_req.size.to_string(),
+                                "price": live_req.price.to_string(),
+                            },
+                            "submit_facade_event_id": event_id,
+                            "paper_only": false,
+                            "real_orders_enabled": effective_real_enabled,
+                            "note": "Full order intent + approval ids journaled immediately before GatedRealClobLiveOrderSender::send (revalidates + may dispatch to real CLOB)."
                         });
+                        match record_journal_event(
+                            &state.pool,
+                            "clob_live_order_intent_pre_dispatch",
+                            "polytrader_server",
+                            "warning",
+                            pre_payload,
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                let live_sender = crate::clob::GatedRealClobLiveOrderSender;
+                                // Use UFCS so we do not need `use ... LiveOrderSender` in this file (smallest edit).
+                                let send_res = <crate::clob::GatedRealClobLiveOrderSender as crate::clob::live_sender::LiveOrderSender>::send(&live_sender, &live_req).await;
+                                live_send_result = Some(
+                                    serde_json::to_value(&send_res)
+                                        .unwrap_or(serde_json::json!({})),
+                                );
+
+                                // Journal the send outcome (observability for Hermes/operator).
+                                // (best-effort; send already happened or rejected by gates inside)
+                                let send_kind = if send_res.accepted_for_network_dispatch {
+                                    "clob_live_order_dispatched"
+                                } else {
+                                    "clob_live_order_send_rejected"
+                                };
+                                let send_payload = serde_json::json!({
+                                    "kind": send_kind,
+                                    "live_send_result": send_res,
+                                    "submit_facade_event_id": event_id,
+                                    "paper_only": false,
+                                    "real_orders_enabled": effective_real_enabled,
+                                });
+                                let _ = record_journal_event(
+                                    &state.pool,
+                                    send_kind,
+                                    "polytrader_server",
+                                    if send_res.accepted_for_network_dispatch {
+                                        "info"
+                                    } else {
+                                        "error"
+                                    },
+                                    send_payload,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                // Fail-closed: pre journal required before any dispatch (AGENTS safety).
+                                tracing::error!(error = %e, "clob_live_order pre-dispatch journal failed; not invoking sender (no real order sent)");
+                                live_send_result = Some(serde_json::json!({
+                                    "sender_name": "GatedRealClobLiveOrderSender",
+                                    "accepted_for_network_dispatch": false,
+                                    "submit_decision": "pre_dispatch_journal_failed",
+                                    "rejection_reason": format!("pre_journal_write_failed: {}", e),
+                                    "exchange_order_id": null,
+                                    "request_sent": false,
+                                    "would_send": false,
+                                    "post_order_called": false,
+                                    "post_orders_called": false,
+                                    "real_orders_enabled": effective_real_enabled,
+                                    "ready_for_real_orders": false,
+                                }));
+                            }
+                        }
+                    }
+
+                    // Build base report that may be augmented to reflect actual live dispatch
+                    // (addresses response/recon always lying with pre-send values).
+                    let mut base_report = report.clone();
+                    if let Some(lsr) = &live_send_result {
+                        if let Some(obj) = base_report.as_object_mut() {
+                            if let Some(v) = lsr.get("accepted_for_network_dispatch") {
+                                obj.insert("accepted".to_string(), v.clone());
+                            }
+                            if let Some(v) = lsr.get("submit_decision") {
+                                obj.insert("submit_decision".to_string(), v.clone());
+                            }
+                            if let Some(v) = lsr.get("post_order_called") {
+                                obj.insert("post_order_called".to_string(), v.clone());
+                            }
+                            if let Some(v) = lsr.get("request_sent") {
+                                obj.insert("request_sent".to_string(), v.clone());
+                            }
+                            if let Some(v) = lsr.get("real_orders_enabled") {
+                                obj.insert("real_orders_enabled".to_string(), v.clone());
+                            }
+                            if let Some(v) = lsr.get("ready_for_real_orders") {
+                                obj.insert("ready_for_real_orders".to_string(), v.clone());
+                            }
+                            let roe = lsr
+                                .get("real_orders_enabled")
+                                .and_then(|b| b.as_bool())
+                                .unwrap_or(false);
+                            obj.insert("paper_only".to_string(), serde_json::json!(!roe));
+                            obj.insert(
+                                "submission_facade_only".to_string(),
+                                serde_json::json!(!roe),
+                            );
+                            obj.insert("dry_run_only".to_string(), serde_json::json!(!roe));
+                        }
+                    }
+
+                    let reconciliation =
+                        base_report
+                            .get("reconciliation")
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                serde_json::json!({
+                                    "required": true,
+                                    "reconciled": true,
+                                    "status": "reconciled_no_send",
+                                    "submit_decision": "rejected_fail_closed",
+                                    "request_sent": false,
+                                    "post_order_called": false,
+                                    "post_orders_called": false,
+                                    "expected_exchange_state": "no_order_created",
+                                    "observed_exchange_state": "not_queried_no_send"
+                                })
+                            });
+                    // Recon now reflects live dispatch result when it occurred (post_order etc from sender).
+                    let (
+                        recon_req_sent,
+                        recon_post_called,
+                        recon_paper,
+                        recon_real_en,
+                        recon_ready,
+                        recon_note,
+                    ) = if let Some(lsr) = &live_send_result {
+                        let rs = lsr
+                            .get("request_sent")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let pc = lsr
+                            .get("post_order_called")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let re = lsr
+                            .get("real_orders_enabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let rd = lsr
+                            .get("ready_for_real_orders")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        (rs, pc, !re, re, rd, "Submit facade reconciliation after live dispatch consideration. See live_sender_dispatch for actual post_order_called / accepted values when dispatch was attempted.".to_string())
+                    } else {
+                        (false, false, true, false, false, "Submit facade reconciliation event. The facade rejected before send, so exchange state is reconciled as no order created.".to_string())
+                    };
                     let reconciliation_payload = serde_json::json!({
                         "kind": "clob_order_submit_reconciliation",
                         "submit_facade_event_id": event_id,
-                        "submit_decision": report.get("submit_decision").cloned().unwrap_or(serde_json::json!("rejected_fail_closed")),
-                        "reconciliation_status": report.get("reconciliation_status").cloned().unwrap_or(serde_json::json!("reconciled_no_send")),
+                        "submit_decision": base_report.get("submit_decision").cloned().unwrap_or(serde_json::json!("rejected_fail_closed")),
+                        "reconciliation_status": base_report.get("reconciliation_status").cloned().unwrap_or(serde_json::json!("reconciled_no_send")),
                         "reconciliation": reconciliation,
-                        "request_sent": false,
+                        "request_sent": recon_req_sent,
                         "would_send": false,
-                        "post_order_called": false,
+                        "post_order_called": recon_post_called,
                         "post_orders_called": false,
-                        "paper_only": true,
-                        "real_orders_enabled": false,
-                        "ready_for_real_orders": false,
-                        "note": "Submit facade reconciliation event. The facade rejected before send, so exchange state is reconciled as no order created."
+                        "paper_only": recon_paper,
+                        "real_orders_enabled": recon_real_en,
+                        "ready_for_real_orders": recon_ready,
+                        "note": recon_note
                     });
                     match record_journal_event(
                         &state.pool,
@@ -2824,8 +4153,13 @@ async fn clob_order_intent_submit_facade_handler(
                     .await
                     {
                         Ok(reconciliation_event_id) => {
-                            let response =
-                                merge_journal_fields(report, true, Some(event_id), None);
+                            let mut response =
+                                merge_journal_fields(base_report, true, Some(event_id), None);
+                            if let Some(lsr) = live_send_result {
+                                if let Some(obj) = response.as_object_mut() {
+                                    obj.insert("live_sender_dispatch".to_string(), lsr);
+                                }
+                            }
                             Json(merge_reconciliation_journal_fields(
                                 response,
                                 true,
@@ -2837,7 +4171,7 @@ async fn clob_order_intent_submit_facade_handler(
                         Err(e) => (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(merge_reconciliation_journal_fields(
-                                merge_journal_fields(report, true, Some(event_id), None),
+                                merge_journal_fields(base_report, true, Some(event_id), None),
                                 false,
                                 None,
                                 Some(format!(
@@ -2890,15 +4224,33 @@ async fn clob_order_intent_submit_facade_handler(
 
 async fn clob_order_intent_human_approval_handler(
     State(state): State<Arc<AppState>>,
+    auth: AuthUser,
     Json(request): Json<HumanApprovalRequest>,
 ) -> impl IntoResponse {
     //! Record a human approval decision for a future submit-facade attempt. This
     //! is an audit workflow only: it creates a short-lived journal event keyed
     //! to a deterministic intent subject hash. It does not approve live sending.
+    //! SECURITY: operator auth required; auth subject bound into journaled event.
+    if auth.0.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "approved_for_facade": false,
+                "journaled": false,
+                "error": "operator authentication required for human-approval (privileged gate)"
+            })),
+        )
+            .into_response();
+    }
     let decision = normalize_human_approval_decision(&request.decision);
     let subject_hash =
         crate::clob::authenticated::approval_subject_hash_for_intent(&request.intent);
-    let operator = request.operator.as_deref().unwrap_or("unspecified");
+    let operator = auth
+        .0
+        .as_deref()
+        .unwrap_or(request.operator.as_deref().unwrap_or("unspecified"));
     let note = request.note.as_deref().unwrap_or("").trim();
 
     let mut blockers = Vec::new();
@@ -3979,6 +5331,7 @@ const REVIEW_BACKLOG_STALE_AFTER_SECONDS: i64 = 24 * 60 * 60;
 const REVIEW_LATENCY_SLOW_AFTER_SECONDS: i64 = 12 * 60 * 60;
 const OPERATOR_STATUS_STALE_AFTER_SECONDS: i64 = 60;
 const HERMES_REFLECTION_STALE_AFTER_SECONDS: i64 = 10 * 60;
+const STRATEGY_CANDIDATE_OBSERVATION_MAX_AGE_SECONDS: i64 = 15 * 60;
 
 fn normalize_dry_run_review_decision(decision: &str) -> Option<&'static str> {
     match decision.trim().to_ascii_lowercase().as_str() {
@@ -4126,6 +5479,9 @@ fn build_hermes_safety_loop_response(
             "available": false,
             "status": "no_reflections",
             "clob_safety_loop": serde_json::Value::Null,
+            "paper_rejection_loop": serde_json::Value::Null,
+            "paper_accounting_loop": serde_json::Value::Null,
+            "strategy_candidate_loop": serde_json::Value::Null,
             "note": "No Hermes reflection has been written yet; this endpoint remains read-only and cannot enable trading."
         });
     };
@@ -4136,6 +5492,18 @@ fn build_hermes_safety_loop_response(
         .unwrap_or_else(|| serde_json::json!({}));
     let clob_safety_loop = metrics
         .get("clob_safety_loop")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let paper_accounting_loop = metrics
+        .get("paper_accounting_loop")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let paper_rejection_loop = metrics
+        .get("paper_rejection_loop")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let strategy_candidate_loop = metrics
+        .get("strategy_candidate_loop")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     let boundary_coverage = clob_safety_loop
@@ -4225,6 +5593,9 @@ fn build_hermes_safety_loop_response(
         "final_review_decision_boundary_coverage": boundary_coverage,
         "latest_final_review_decision_boundary_status": latest_boundary_status,
         "clob_safety_loop": clob_safety_loop,
+        "paper_rejection_loop": paper_rejection_loop,
+        "paper_accounting_loop": paper_accounting_loop,
+        "strategy_candidate_loop": strategy_candidate_loop,
         "note": note
     })
 }
@@ -4671,9 +6042,9 @@ fn build_live_sender_design_readiness_report(
         "would_send": false,
         "post_order_called": false,
         "post_orders_called": false,
-        "live_order_sender_implemented": false,
-        "next_safe_step": "Draft and review a live-sender design/ADR while real trading remains locked; do not implement sending until external collateral, allowance, unlock, kill switch, and paper-mode gates are deliberately addressed.",
-        "note": "Live-sender design readiness only. This reports blockers before any live sender implementation and cannot enable or place real orders."
+        "live_order_sender_implemented": live_sender_implemented,
+        "next_safe_step": "Draft and review a live-sender design/ADR while real trading remains locked; do not implement sending until external collateral, allowance, unlock, kill switch, and paper-mode gates are deliberately addressed. (Gated sender is now wired; still requires explicit unlock to dispatch.)",
+        "note": "Live-sender design readiness only. GatedRealClobLiveOrderSender is implemented; this report cannot enable or place real orders."
     })
 }
 
@@ -4848,9 +6219,9 @@ fn build_live_sender_design_review_report(
         "would_send": false,
         "post_order_called": false,
         "post_orders_called": false,
-        "live_order_sender_implemented": false,
-        "next_safe_step": "Review this contract as an ADR/wiki decision. If accepted, the next code step is a fail-closed trait boundary only, still with no network sender and no real-order authority.",
-        "note": "Live-sender design review contract only. It can make the design reviewable, but it cannot permit implementation, enable trading, or place orders."
+        "live_order_sender_implemented": live_sender_implemented,
+        "next_safe_step": "Review this contract as an ADR/wiki decision. Gated sender is wired behind boundary; still requires all unlocks + revalidation before any real authority or place.",
+        "note": "Live-sender design review contract only. GatedRealClobLiveOrderSender exists (dispatches only on env+approval gates); it cannot auto-enable or place without explicit human review."
     })
 }
 
@@ -4989,6 +6360,8 @@ fn latency_summary(latencies_seconds: &[i64]) -> serde_json::Value {
             "min_seconds": serde_json::Value::Null,
             "max_seconds": serde_json::Value::Null,
             "avg_seconds": serde_json::Value::Null,
+            "slow_count": 0,
+            "slow_after_seconds": REVIEW_LATENCY_SLOW_AFTER_SECONDS,
         });
     }
 
@@ -4996,12 +6369,18 @@ fn latency_summary(latencies_seconds: &[i64]) -> serde_json::Value {
     let max_seconds = latencies_seconds.iter().max().copied().unwrap_or(0);
     let total_seconds: i64 = latencies_seconds.iter().sum();
     let avg_seconds = total_seconds / latencies_seconds.len() as i64;
+    let slow_count = latencies_seconds
+        .iter()
+        .filter(|seconds| **seconds >= REVIEW_LATENCY_SLOW_AFTER_SECONDS)
+        .count();
 
     serde_json::json!({
         "reviewed_count": latencies_seconds.len(),
         "min_seconds": min_seconds,
         "max_seconds": max_seconds,
         "avg_seconds": avg_seconds,
+        "slow_count": slow_count,
+        "slow_after_seconds": REVIEW_LATENCY_SLOW_AFTER_SECONDS,
     })
 }
 
@@ -5031,6 +6410,7 @@ fn build_review_health(summary: &serde_json::Value) -> serde_json::Value {
         nested_summary_usize(summary, "guidance_alignment", "differs_from_latest_review");
     let max_latency_seconds =
         nested_summary_i64(summary, "latest_review_latency", "max_seconds").unwrap_or(0);
+    let slow_review_count = nested_summary_usize(summary, "latest_review_latency", "slow_count");
 
     let mut reasons = Vec::new();
     if unreviewed_count > 0 {
@@ -5039,7 +6419,7 @@ fn build_review_health(summary: &serde_json::Value) -> serde_json::Value {
     if guidance_differs > 0 {
         reasons.push("guidance_exceptions");
     }
-    if max_latency_seconds >= REVIEW_LATENCY_SLOW_AFTER_SECONDS {
+    if slow_review_count > 0 {
         reasons.push("slow_latest_review_latency");
     }
 
@@ -5056,6 +6436,7 @@ fn build_review_health(summary: &serde_json::Value) -> serde_json::Value {
         unreviewed_count,
         guidance_differs,
         max_latency_seconds,
+        slow_review_count,
     );
 
     serde_json::json!({
@@ -5065,6 +6446,7 @@ fn build_review_health(summary: &serde_json::Value) -> serde_json::Value {
             "unreviewed_count": unreviewed_count,
             "guidance_exception_count": guidance_differs,
             "max_latency_seconds": max_latency_seconds,
+            "slow_review_count": slow_review_count,
             "slow_latency_after_seconds": REVIEW_LATENCY_SLOW_AFTER_SECONDS,
         },
         "recommended_actions": recommended_actions,
@@ -5072,6 +6454,7 @@ fn build_review_health(summary: &serde_json::Value) -> serde_json::Value {
         "unreviewed_count": unreviewed_count,
         "guidance_exception_count": guidance_differs,
         "max_latency_seconds": max_latency_seconds,
+        "slow_review_count": slow_review_count,
         "slow_latency_after_seconds": REVIEW_LATENCY_SLOW_AFTER_SECONDS,
         "paper_only": true,
         "real_orders_enabled": false,
@@ -5084,6 +6467,7 @@ fn review_health_recommended_actions(
     unreviewed_count: usize,
     guidance_exception_count: usize,
     max_latency_seconds: i64,
+    slow_review_count: usize,
 ) -> Vec<serde_json::Value> {
     if status == "empty" {
         return vec![serde_json::json!({
@@ -5127,6 +6511,7 @@ fn review_health_recommended_actions(
                 "label": "Inspect review latency; latest reviewed dry-run is past the slow-review threshold.",
                 "endpoint": "/clob/order-intent/review-summary?limit=50",
                 "max_latency_seconds": max_latency_seconds,
+                "slow_review_count": slow_review_count,
                 "slow_latency_after_seconds": REVIEW_LATENCY_SLOW_AFTER_SECONDS,
             })),
             _ => None,
@@ -5465,11 +6850,19 @@ fn build_order_placement_readiness(
     clob_read_ok: bool,
     preflight: &serde_json::Value,
     review_health: &serde_json::Value,
+    market_data_readiness: &serde_json::Value,
     final_review_audit: &serde_json::Value,
     live_sender_boundary: &serde_json::Value,
 ) -> serde_json::Value {
     let review_available =
         review_health.get("status").and_then(|v| v.as_str()) != Some("unavailable");
+    let paper_market_data_ready = market_data_readiness.get("status").and_then(|v| v.as_str())
+        == Some("ready")
+        && market_data_readiness
+            .get("data_ready_market_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            > 0;
     let final_review_decision_audited =
         final_review_audit.get("status").and_then(|v| v.as_str()) == Some("audited");
     let collateral_balance_ok =
@@ -5535,6 +6928,11 @@ fn build_order_placement_readiness(
             "paper_review_health",
             review_available,
             "Paper dry-run review-health and audit views are available.",
+        ),
+        readiness_gate(
+            "paper_market_data_ready",
+            paper_market_data_ready,
+            "At least one active market has both Yes/No mids for paper-pricing input.",
         ),
         readiness_gate(
             "market_tick_and_neg_risk_validation",
@@ -5632,6 +7030,8 @@ fn build_order_placement_readiness(
         "blocker_count": blockers.len(),
         "blockers": blockers,
         "gates": gates,
+        "market_data_readiness": market_data_readiness,
+        "paper_market_data_ready": paper_market_data_ready,
         "final_review_audit_status": final_review_audit.get("status").cloned().unwrap_or(serde_json::Value::Null),
         "final_review_decision_count": final_review_audit.get("count").cloned().unwrap_or(serde_json::json!(0)),
         "live_sender_boundary": live_sender_boundary,
@@ -5713,6 +7113,1818 @@ fn preflight_check_ok(preflight: &serde_json::Value, name: &str) -> Option<bool>
         .find(|check| check.get("name").and_then(|v| v.as_str()) == Some(name))
         .and_then(|check| check.get("ok"))
         .and_then(|ok| ok.as_bool())
+}
+
+fn category_display_label(category: &str) -> &str {
+    match category {
+        "motorsports" => "Motorsports",
+        "formula1" | "formula_1" | "formula-1" | "f1" => "Motorsports",
+        "crypto" => "Crypto",
+        _ => category,
+    }
+}
+
+fn market_has_two_sided_mids(
+    last_mid_yes: &Option<Decimal>,
+    last_mid_no: &Option<Decimal>,
+) -> bool {
+    last_mid_yes.is_some() && last_mid_no.is_some()
+}
+
+fn market_data_status(
+    last_mid_yes: &Option<Decimal>,
+    last_mid_no: &Option<Decimal>,
+) -> &'static str {
+    if market_has_two_sided_mids(last_mid_yes, last_mid_no) {
+        "ready"
+    } else {
+        "missing_mid"
+    }
+}
+
+async fn load_strategy_orderbook_metrics(
+    pool: &PgPool,
+    market_id: &str,
+    outcome: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let snapshot = sqlx::query_as::<_, StrategyOrderbookSnapshotRow>(
+        r#"SELECT bids, asks, spread, fetched_at
+           FROM market_data.orderbook_snapshots
+           WHERE market_id = $1 AND outcome = $2
+           ORDER BY fetched_at DESC
+           LIMIT 1"#,
+    )
+    .bind(market_id)
+    .bind(outcome)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(snapshot) = snapshot else {
+        return Ok(serde_json::json!({
+            "available": false,
+            "status": "missing_orderbook_snapshot",
+            "top3_bid_size": "0",
+            "top3_ask_size": "0",
+            "spread": null,
+            "paper_only": true,
+            "real_orders_enabled": false,
+        }));
+    };
+
+    let top3_bid_size = sum_orderbook_level_sizes(&snapshot.bids, 3);
+    let top3_ask_size = sum_orderbook_level_sizes(&snapshot.asks, 3);
+    let best_bid = best_orderbook_price(&snapshot.bids, true);
+    let best_ask = best_orderbook_price(&snapshot.asks, false);
+    let raw_imbalance = if top3_bid_size + top3_ask_size > Decimal::ZERO {
+        (top3_bid_size - top3_ask_size) / (top3_bid_size + top3_ask_size)
+    } else {
+        Decimal::ZERO
+    };
+
+    Ok(serde_json::json!({
+        "available": true,
+        "status": "ready",
+        "fetched_at": snapshot.fetched_at,
+        "top3_bid_size": top3_bid_size,
+        "top3_ask_size": top3_ask_size,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread": snapshot.spread,
+        "raw_imbalance": raw_imbalance,
+        "paper_only": true,
+        "real_orders_enabled": false,
+    }))
+}
+
+async fn load_strategy_tick_velocity_metrics(
+    pool: &PgPool,
+    market_id: &str,
+    outcome: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let snapshots = sqlx::query_as::<_, StrategyTickVelocitySnapshotRow>(
+        r#"SELECT mid, fetched_at
+           FROM market_data.orderbook_snapshots
+           WHERE market_id = $1 AND outcome = $2 AND mid IS NOT NULL
+           ORDER BY fetched_at DESC
+           LIMIT 2"#,
+    )
+    .bind(market_id)
+    .bind(outcome)
+    .fetch_all(pool)
+    .await?;
+
+    if snapshots.len() < 2 {
+        return Ok(serde_json::json!({
+            "available": false,
+            "status": "missing_tick_velocity_window",
+            "latest_mid": snapshots.first().map(|snapshot| snapshot.mid),
+            "previous_mid": null,
+            "mid_delta": null,
+            "seconds_between": null,
+            "paper_only": true,
+            "real_orders_enabled": false,
+        }));
+    }
+
+    let latest = &snapshots[0];
+    let previous = &snapshots[1];
+    let seconds_between = latest
+        .fetched_at
+        .signed_duration_since(previous.fetched_at)
+        .num_seconds()
+        .abs();
+    let mid_delta = latest.mid - previous.mid;
+
+    Ok(serde_json::json!({
+        "available": true,
+        "status": "ready",
+        "latest_mid": latest.mid,
+        "previous_mid": previous.mid,
+        "mid_delta": mid_delta,
+        "seconds_between": seconds_between,
+        "latest_fetched_at": latest.fetched_at,
+        "previous_fetched_at": previous.fetched_at,
+        "paper_only": true,
+        "real_orders_enabled": false,
+    }))
+}
+
+fn sum_orderbook_level_sizes(levels: &serde_json::Value, limit: usize) -> Decimal {
+    levels
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .take(limit)
+                .filter_map(|row| json_decimal_field(row, "size"))
+                .sum()
+        })
+        .unwrap_or(Decimal::ZERO)
+}
+
+fn best_orderbook_price(levels: &serde_json::Value, highest: bool) -> Option<Decimal> {
+    let mut prices = levels
+        .as_array()?
+        .iter()
+        .filter_map(|row| json_decimal_field(row, "price"))
+        .collect::<Vec<_>>();
+    if highest {
+        prices.sort_by(|left, right| right.cmp(left));
+    } else {
+        prices.sort();
+    }
+    prices.into_iter().next()
+}
+
+fn json_decimal_field(row: &serde_json::Value, key: &str) -> Option<Decimal> {
+    let value = row.get(key)?;
+    if let Some(text) = value.as_str() {
+        Decimal::from_str(text).ok()
+    } else if value.is_number() {
+        Decimal::from_str(&value.to_string()).ok()
+    } else {
+        None
+    }
+}
+
+async fn build_strategy_paper_candidates(pool: &PgPool) -> anyhow::Result<serde_json::Value> {
+    let markets = sqlx::query_as::<_, StrategyCandidateMarketRow>(
+        "SELECT gamma_id, slug, question, category, last_mid_yes, last_mid_no
+         FROM market_data.markets
+         WHERE active = true
+           AND last_mid_yes IS NOT NULL
+           AND last_mid_no IS NOT NULL
+         ORDER BY updated_at DESC
+         LIMIT 10",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let engine = FusionEngine::new();
+    let fee_ctx = FeeContext {
+        taker_bps: Decimal::from(paper_fee_bps_from_env()),
+        maker_bps: Decimal::from(20u64),
+        est_gas_usdc: Decimal::new(1, 2),
+        rewards_offset_bps: Decimal::from(10u64),
+    };
+    let min_net_edge_for_trade = Decimal::new(4, 2);
+    let mut candidates = Vec::new();
+
+    for market in markets {
+        let (target_outcome, target_mid) = if market.last_mid_yes <= market.last_mid_no {
+            ("Yes", market.last_mid_yes)
+        } else {
+            ("No", market.last_mid_no)
+        };
+        let orderbook = load_strategy_orderbook_metrics(pool, &market.gamma_id, target_outcome)
+            .await
+            .unwrap_or_else(|e| {
+                serde_json::json!({
+                    "available": false,
+                    "status": "orderbook_metrics_error",
+                    "error": e.to_string(),
+                    "top3_bid_size": "0",
+                    "top3_ask_size": "0",
+                    "spread": null,
+                    "paper_only": true,
+                    "real_orders_enabled": false,
+                })
+            });
+        let tick_velocity =
+            load_strategy_tick_velocity_metrics(pool, &market.gamma_id, target_outcome)
+                .await
+                .unwrap_or_else(|e| {
+                    serde_json::json!({
+                        "available": false,
+                        "status": "tick_velocity_metrics_error",
+                        "error": e.to_string(),
+                        "latest_mid": null,
+                        "previous_mid": null,
+                        "mid_delta": null,
+                        "seconds_between": null,
+                        "paper_only": true,
+                        "real_orders_enabled": false,
+                    })
+                });
+        let snapshot = serde_json::json!({
+            "gamma_id": market.gamma_id,
+            "slug": market.slug,
+            "question": market.question,
+            "category": market.category,
+            "category_label": market.category.as_deref().map(category_display_label),
+            "last_mid_yes": market.last_mid_yes,
+            "last_mid_no": market.last_mid_no,
+            "target_outcome": target_outcome,
+            "target_mid": target_mid,
+            "market_data_status": "ready",
+            "orderbook": orderbook.clone(),
+            "tick_velocity": tick_velocity.clone(),
+        });
+        let context = serde_json::json!({
+            "paper_only": true,
+            "candidate_source": "strategy_paper_candidates",
+            "min_net_edge_for_trade": min_net_edge_for_trade.to_string(),
+        });
+        let preview_request = PaperOrderRequest {
+            market_id: market.gamma_id.clone(),
+            outcome: target_outcome.to_string(),
+            side: "Buy".to_string(),
+            order_type: "Market".to_string(),
+            size: Decimal::ONE,
+            limit_price: None,
+            rationale: Some("read-only strategy paper candidate preview".to_string()),
+            confirm_paper_order: Some(false),
+        };
+        let paper_order_preview = match build_paper_order_plan(pool, &preview_request).await {
+            Ok(plan) => plan,
+            Err(e) => serde_json::json!({
+                "accepted_for_paper": false,
+                "executed": false,
+                "blockers": ["paper_order_preview_failed"],
+                "error": e.to_string(),
+                "request_sent": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+            }),
+        };
+        let (_gross_edge, net_edge_after_fees, attribution) =
+            engine.fuse_net(&snapshot, &context, Some(&fee_ctx), target_mid)?;
+        let decision = strategy_candidate_decision(net_edge_after_fees, min_net_edge_for_trade);
+
+        candidates.push(serde_json::json!({
+            "market_id": market.gamma_id,
+            "slug": market.slug,
+            "question": market.question,
+            "category": market.category,
+            "category_label": market.category.as_deref().map(category_display_label),
+            "target_outcome": target_outcome,
+            "side": "Buy",
+            "order_type": "Market",
+            "size": "1",
+            "target_mid": target_mid,
+            "orderbook": orderbook,
+            "tick_velocity": tick_velocity,
+            "decision": decision,
+            "min_net_edge_for_trade": min_net_edge_for_trade.to_string(),
+            "net_edge_after_fees": net_edge_after_fees.to_string(),
+            "paper_order_preview": paper_order_preview,
+            "attribution": attribution,
+            "paper_only": true,
+            "real_orders_enabled": false,
+            "request_sent": false,
+            "post_order_called": false,
+            "post_orders_called": false,
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "request_sent": false,
+        "post_order_called": false,
+        "post_orders_called": false,
+        "strategy_engine": "FusionEngine",
+        "status": if candidates.is_empty() { "no_ready_markets" } else { "ready" },
+        "min_net_edge_for_trade": min_net_edge_for_trade.to_string(),
+        "candidate_count": candidates.len(),
+        "candidates": candidates,
+        "note": "Read-only strategy paper candidates with embedded paper-order previews. No paper orders are submitted and no CLOB order API is called."
+    }))
+}
+
+async fn build_strategy_paper_candidate_observation(
+    pool: &PgPool,
+    request: StrategyPaperCandidateObservationRequest,
+) -> anyhow::Result<serde_json::Value> {
+    let candidates_body = build_strategy_paper_candidates(pool).await?;
+    let observation_size = request.size.unwrap_or(Decimal::ONE);
+    let candidate_count = candidates_body
+        .get("candidate_count")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let mut observed_candidates = Vec::new();
+    if let Some(rows) = candidates_body
+        .get("candidates")
+        .and_then(|value| value.as_array())
+    {
+        for candidate in rows.iter().cloned() {
+            let candidate =
+                attach_strategy_requested_size_paper_preview(pool, candidate, observation_size)
+                    .await;
+            observed_candidates.push(strategy_candidate_observation_summary(&candidate));
+        }
+    }
+    let payload = serde_json::json!({
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "strategy_candidate_observation": true,
+        "strategy_observation_size": observation_size,
+        "candidate_count": candidate_count,
+        "status": candidates_body.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "strategy_engine": candidates_body
+            .get("strategy_engine")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "min_net_edge_for_trade": candidates_body
+            .get("min_net_edge_for_trade")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "candidates": observed_candidates,
+        "request_sent": false,
+        "would_send": false,
+        "would_post": false,
+        "post_order_called": false,
+        "post_orders_called": false,
+        "operator_note": request.note,
+        "note": "Journal-only strategy paper candidate observation for Hermes. No paper order, fill, position, signature, approval, allowance refresh, or CLOB order request is created."
+    });
+    let event_id = record_journal_event(
+        pool,
+        "strategy_paper_candidate_observation",
+        "strategy_paper_candidate_observation_route",
+        "info",
+        payload.clone(),
+    )
+    .await?;
+
+    Ok(serde_json::json!({
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "strategy_candidate_observation": true,
+        "journaled": true,
+        "journal_event_id": event_id,
+        "strategy_observation_size": observation_size,
+        "candidate_count": candidate_count,
+        "status": candidates_body.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "strategy_engine": candidates_body
+            .get("strategy_engine")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "min_net_edge_for_trade": candidates_body
+            .get("min_net_edge_for_trade")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "observed_candidates": payload.get("candidates").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "request_sent": false,
+        "would_send": false,
+        "would_post": false,
+        "post_order_called": false,
+        "post_orders_called": false,
+        "note": "Recorded current strategy paper candidates to journal.events for Hermes; no order path was invoked."
+    }))
+}
+
+async fn load_strategy_paper_candidate_observation_events(
+    pool: &PgPool,
+    limit: i64,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            uuid::Uuid,
+            String,
+            String,
+            String,
+            serde_json::Value,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
+        r#"SELECT id, event_type, source, severity, payload, created_at
+           FROM journal.events
+           WHERE event_type = 'strategy_paper_candidate_observation'
+           ORDER BY created_at DESC
+           LIMIT $1"#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, event_type, source, severity, payload, created_at)| {
+                let first_candidate = payload
+                    .get("candidates")
+                    .and_then(|value| value.as_array())
+                    .and_then(|rows| rows.first())
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                serde_json::json!({
+                    "id": id,
+                    "event_type": event_type,
+                    "source": source,
+                    "severity": severity,
+                    "created_at": created_at,
+                    "strategy_observation_size": payload.get("strategy_observation_size").cloned().unwrap_or(serde_json::Value::Null),
+                    "candidate_count": payload.get("candidate_count").cloned().unwrap_or(serde_json::Value::Null),
+                    "status": payload.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                    "strategy_engine": payload.get("strategy_engine").cloned().unwrap_or(serde_json::Value::Null),
+                    "min_net_edge_for_trade": payload.get("min_net_edge_for_trade").cloned().unwrap_or(serde_json::Value::Null),
+                    "first_candidate": {
+                        "market_id": first_candidate.get("market_id").cloned().unwrap_or(serde_json::Value::Null),
+                        "slug": first_candidate.get("slug").cloned().unwrap_or(serde_json::Value::Null),
+                        "target_outcome": first_candidate.get("target_outcome").cloned().unwrap_or(serde_json::Value::Null),
+                        "size": first_candidate.get("size").cloned().unwrap_or(serde_json::Value::Null),
+                        "strategy_requested_size": first_candidate.get("strategy_requested_size").cloned().unwrap_or(serde_json::Value::Null),
+                        "decision": first_candidate.get("decision").cloned().unwrap_or(serde_json::Value::Null),
+                        "net_edge_after_fees": first_candidate.get("net_edge_after_fees").cloned().unwrap_or(serde_json::Value::Null),
+                        "orderbook_status": first_candidate
+                            .get("orderbook")
+                            .and_then(|value| value.get("status"))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "tick_velocity_status": first_candidate
+                            .get("tick_velocity")
+                            .and_then(|value| value.get("status"))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    },
+                    "request_sent": payload.get("request_sent").cloned().unwrap_or(serde_json::Value::Null),
+                    "post_order_called": payload.get("post_order_called").cloned().unwrap_or(serde_json::Value::Null),
+                    "post_orders_called": payload.get("post_orders_called").cloned().unwrap_or(serde_json::Value::Null),
+                    "paper_only": true,
+                    "real_orders_enabled": false,
+                })
+            },
+        )
+        .collect())
+}
+
+async fn load_strategy_paper_candidate_observation_evidence(
+    pool: &PgPool,
+    market_id: &str,
+    outcome: &str,
+    requested_size: Decimal,
+) -> anyhow::Result<serde_json::Value> {
+    let requested_size_text = requested_size.to_string();
+    let latest: Option<(uuid::Uuid, serde_json::Value, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as(
+            r#"SELECT id, payload, created_at
+               FROM journal.events
+               WHERE event_type = 'strategy_paper_candidate_observation'
+                 AND EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements(payload->'candidates') candidate
+                    WHERE candidate->>'market_id' = $1
+                      AND candidate->>'target_outcome' = $2
+                      AND candidate->>'strategy_requested_size' = $3
+                 )
+               ORDER BY created_at DESC
+               LIMIT 1"#,
+        )
+        .bind(market_id)
+        .bind(outcome)
+        .bind(&requested_size_text)
+        .fetch_optional(pool)
+        .await?;
+
+    let Some((event_id, payload, created_at)) = latest else {
+        return Ok(serde_json::json!({
+            "available": false,
+            "status": "missing_strategy_candidate_observation",
+            "market_id": market_id,
+            "target_outcome": outcome,
+            "strategy_requested_size": requested_size,
+            "max_age_seconds": STRATEGY_CANDIDATE_OBSERVATION_MAX_AGE_SECONDS,
+            "paper_only": true,
+            "real_orders_enabled": false,
+            "request_sent": false,
+            "post_order_called": false,
+            "post_orders_called": false,
+        }));
+    };
+
+    let observed_candidate = payload
+        .get("candidates")
+        .and_then(|value| value.as_array())
+        .and_then(|rows| {
+            rows.iter().find(|candidate| {
+                candidate.get("market_id").and_then(|value| value.as_str()) == Some(market_id)
+                    && candidate
+                        .get("target_outcome")
+                        .and_then(|value| value.as_str())
+                        == Some(outcome)
+                    && candidate
+                        .get("strategy_requested_size")
+                        .and_then(|value| value.as_str())
+                        == Some(requested_size_text.as_str())
+            })
+        })
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let now = chrono::Utc::now();
+    let age_seconds = (now - created_at).num_seconds().max(0);
+    let is_recent = age_seconds <= STRATEGY_CANDIDATE_OBSERVATION_MAX_AGE_SECONDS;
+    let observed_decision = observed_candidate
+        .get("decision")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let observation_ready = observed_decision == "paper_candidate_ready_for_manual_review";
+    let status = if !is_recent {
+        "stale_strategy_candidate_observation"
+    } else if observation_ready {
+        "ready"
+    } else {
+        "strategy_candidate_observation_not_ready"
+    };
+
+    Ok(serde_json::json!({
+        "available": true,
+        "status": status,
+        "event_id": event_id,
+        "created_at": created_at,
+        "age_seconds": age_seconds,
+        "max_age_seconds": STRATEGY_CANDIDATE_OBSERVATION_MAX_AGE_SECONDS,
+        "is_recent": is_recent,
+        "observation_ready_for_manual_review": observation_ready,
+        "market_id": market_id,
+        "target_outcome": outcome,
+        "strategy_requested_size": requested_size,
+        "observed_strategy_requested_size": observed_candidate
+            .get("strategy_requested_size")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "observed_decision": observed_decision,
+        "observed_net_edge_after_fees": observed_candidate
+            .get("net_edge_after_fees")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "observed_candidate": observed_candidate,
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "request_sent": false,
+        "post_order_called": false,
+        "post_orders_called": false,
+    }))
+}
+
+fn strategy_candidate_observation_summary(candidate: &serde_json::Value) -> serde_json::Value {
+    let attribution = candidate
+        .get("attribution")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    serde_json::json!({
+        "market_id": candidate.get("market_id").cloned().unwrap_or(serde_json::Value::Null),
+        "slug": candidate.get("slug").cloned().unwrap_or(serde_json::Value::Null),
+        "question": candidate.get("question").cloned().unwrap_or(serde_json::Value::Null),
+        "category": candidate.get("category").cloned().unwrap_or(serde_json::Value::Null),
+        "category_label": candidate.get("category_label").cloned().unwrap_or(serde_json::Value::Null),
+        "target_outcome": candidate.get("target_outcome").cloned().unwrap_or(serde_json::Value::Null),
+        "side": candidate.get("side").cloned().unwrap_or(serde_json::Value::Null),
+        "order_type": candidate.get("order_type").cloned().unwrap_or(serde_json::Value::Null),
+        "size": candidate.get("size").cloned().unwrap_or(serde_json::Value::Null),
+        "strategy_requested_size": candidate
+            .get("strategy_requested_size")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "target_mid": candidate.get("target_mid").cloned().unwrap_or(serde_json::Value::Null),
+        "decision": candidate.get("decision").cloned().unwrap_or(serde_json::Value::Null),
+        "min_net_edge_for_trade": candidate
+            .get("min_net_edge_for_trade")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "net_edge_after_fees": candidate
+            .get("net_edge_after_fees")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "orderbook": candidate.get("orderbook").cloned().unwrap_or(serde_json::Value::Null),
+        "tick_velocity": candidate
+            .get("tick_velocity")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "attribution": attribution,
+        "paper_order_preview": {
+            "accepted_for_paper": candidate
+                .get("paper_order_preview")
+                .and_then(|preview| preview.get("accepted_for_paper"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "blockers": candidate
+                .get("paper_order_preview")
+                .and_then(|preview| preview.get("blockers"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+            "executed": false,
+            "request_sent": false,
+            "post_order_called": false,
+            "post_orders_called": false,
+        },
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "request_sent": false,
+        "post_order_called": false,
+        "post_orders_called": false,
+    })
+}
+
+async fn build_strategy_paper_order_submission(
+    pool: &PgPool,
+    request: StrategyPaperOrderRequest,
+) -> (StatusCode, serde_json::Value) {
+    let market_id = request.market_id.trim();
+    if market_id.is_empty() {
+        return strategy_paper_order_rejection(
+            pool,
+            request,
+            None,
+            None,
+            vec!["market_id_required".to_string()],
+        )
+        .await;
+    }
+
+    let candidates_body = match build_strategy_paper_candidates(pool).await {
+        Ok(body) => body,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({
+                    "paper_only": true,
+                    "real_orders_enabled": false,
+                    "accepted_for_paper": false,
+                    "executed": false,
+                    "request_sent": false,
+                    "post_order_called": false,
+                    "post_orders_called": false,
+                    "error": format!("Failed to re-derive strategy candidates: {e}")
+                }),
+            );
+        }
+    };
+
+    let normalized_outcome = request
+        .outcome
+        .as_deref()
+        .and_then(normalize_paper_order_outcome);
+    let candidate = candidates_body
+        .get("candidates")
+        .and_then(|value| value.as_array())
+        .and_then(|rows| {
+            rows.iter().find(|candidate| {
+                let id_matches = candidate.get("market_id").and_then(|v| v.as_str())
+                    == Some(market_id)
+                    || candidate.get("slug").and_then(|v| v.as_str()) == Some(market_id);
+                let outcome_matches = normalized_outcome.as_deref().is_none_or(|outcome| {
+                    candidate.get("target_outcome").and_then(|v| v.as_str()) == Some(outcome)
+                });
+                id_matches && outcome_matches
+            })
+        })
+        .cloned();
+
+    let Some(candidate) = candidate else {
+        return strategy_paper_order_rejection(
+            pool,
+            request,
+            None,
+            None,
+            vec!["strategy_candidate_not_found".to_string()],
+        )
+        .await;
+    };
+
+    let requested_size = request.size.unwrap_or(Decimal::ONE);
+    let candidate =
+        attach_strategy_requested_size_paper_preview(pool, candidate, requested_size).await;
+    let candidate_market_id = candidate
+        .get("market_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or(market_id)
+        .to_string();
+    let candidate_outcome = candidate
+        .get("target_outcome")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Yes")
+        .to_string();
+    let observation_evidence = match load_strategy_paper_candidate_observation_evidence(
+        pool,
+        &candidate_market_id,
+        &candidate_outcome,
+        requested_size,
+    )
+    .await
+    {
+        Ok(evidence) => evidence,
+        Err(e) => serde_json::json!({
+            "available": false,
+            "status": "strategy_candidate_observation_lookup_failed",
+            "error": e.to_string(),
+            "market_id": candidate_market_id,
+            "target_outcome": candidate_outcome,
+            "strategy_requested_size": requested_size,
+            "max_age_seconds": STRATEGY_CANDIDATE_OBSERVATION_MAX_AGE_SECONDS,
+            "paper_only": true,
+            "real_orders_enabled": false,
+            "request_sent": false,
+            "post_order_called": false,
+            "post_orders_called": false,
+        }),
+    };
+
+    let blockers = strategy_paper_order_gate_blockers(&candidate, &request, &observation_evidence);
+    if !blockers.is_empty() {
+        return strategy_paper_order_rejection(
+            pool,
+            request,
+            Some(candidate),
+            Some(observation_evidence),
+            blockers,
+        )
+        .await;
+    }
+
+    let market_id = candidate
+        .get("market_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or(market_id)
+        .to_string();
+    let outcome = candidate
+        .get("target_outcome")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Yes")
+        .to_string();
+    let rationale = format!(
+        "strategy paper candidate manual submit: {}",
+        request
+            .note
+            .as_deref()
+            .unwrap_or("operator confirmed strategy paper candidate")
+    );
+    let paper_request = PaperOrderRequest {
+        market_id,
+        outcome,
+        side: "Buy".to_string(),
+        order_type: "Market".to_string(),
+        size: requested_size,
+        limit_price: None,
+        rationale: Some(rationale),
+        confirm_paper_order: Some(true),
+    };
+    let (status, mut body) = submit_paper_order_from_request(
+        pool,
+        paper_request,
+        "strategy_paper_order_submit_route",
+        "strategy_paper_order_submit_route_validation",
+        Some(serde_json::json!({
+            "strategy_candidate": candidate,
+            "strategy_candidate_observation_evidence": observation_evidence,
+            "confirm_strategy_paper_order": true,
+            "operator_note": request.note,
+        })),
+    )
+    .await;
+    if let Some(object) = body.as_object_mut() {
+        object.insert("strategy_paper_order".to_string(), serde_json::json!(true));
+        object.insert("strategy_candidate".to_string(), candidate);
+        object.insert(
+            "strategy_candidate_observation_evidence".to_string(),
+            observation_evidence,
+        );
+        object.insert(
+            "confirm_strategy_paper_order".to_string(),
+            serde_json::json!(true),
+        );
+    }
+    (status, body)
+}
+
+async fn build_strategy_paper_order_readiness(
+    pool: &PgPool,
+    query: StrategyPaperOrderReadinessQuery,
+) -> anyhow::Result<serde_json::Value> {
+    let candidates_body = build_strategy_paper_candidates(pool).await?;
+    let market_id = query.market_id.as_deref().map(str::trim).unwrap_or("");
+    let requested_size = query.size.unwrap_or(Decimal::ONE);
+    let normalized_outcome = query
+        .outcome
+        .as_deref()
+        .and_then(normalize_paper_order_outcome);
+
+    let candidate = candidates_body
+        .get("candidates")
+        .and_then(|value| value.as_array())
+        .and_then(|rows| {
+            if market_id.is_empty() {
+                rows.first()
+            } else {
+                rows.iter().find(|candidate| {
+                    let id_matches = candidate.get("market_id").and_then(|v| v.as_str())
+                        == Some(market_id)
+                        || candidate.get("slug").and_then(|v| v.as_str()) == Some(market_id);
+                    let outcome_matches = normalized_outcome.as_deref().is_none_or(|outcome| {
+                        candidate.get("target_outcome").and_then(|v| v.as_str()) == Some(outcome)
+                    });
+                    id_matches && outcome_matches
+                })
+            }
+        })
+        .cloned();
+
+    let Some(candidate) = candidate else {
+        return Ok(serde_json::json!({
+            "paper_only": true,
+            "real_orders_enabled": false,
+            "strategy_paper_order_readiness": true,
+            "ready_for_strategy_paper_order": false,
+            "blockers": ["strategy_candidate_not_found"],
+            "strategy_requested_size": requested_size,
+            "candidate": null,
+            "strategy_candidate_observation_evidence": null,
+            "submit_requires_confirm_strategy_paper_order": true,
+            "request_sent": false,
+            "post_order_called": false,
+            "post_orders_called": false,
+            "note": "Read-only strategy paper-order preflight; no paper order, rejection event, or CLOB order API is called."
+        }));
+    };
+
+    let candidate =
+        attach_strategy_requested_size_paper_preview(pool, candidate, requested_size).await;
+    let candidate_market_id = candidate
+        .get("market_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or(market_id)
+        .to_string();
+    let candidate_outcome = candidate
+        .get("target_outcome")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Yes")
+        .to_string();
+    let observation_evidence = match load_strategy_paper_candidate_observation_evidence(
+        pool,
+        &candidate_market_id,
+        &candidate_outcome,
+        requested_size,
+    )
+    .await
+    {
+        Ok(evidence) => evidence,
+        Err(e) => serde_json::json!({
+            "available": false,
+            "status": "strategy_candidate_observation_lookup_failed",
+            "error": e.to_string(),
+            "market_id": candidate_market_id,
+            "target_outcome": candidate_outcome,
+            "strategy_requested_size": requested_size,
+            "max_age_seconds": STRATEGY_CANDIDATE_OBSERVATION_MAX_AGE_SECONDS,
+            "paper_only": true,
+            "real_orders_enabled": false,
+            "request_sent": false,
+            "post_order_called": false,
+            "post_orders_called": false,
+        }),
+    };
+    let gate_request = StrategyPaperOrderRequest {
+        market_id: candidate_market_id,
+        outcome: Some(candidate_outcome),
+        size: Some(requested_size),
+        confirm_strategy_paper_order: Some(true),
+        note: Some("read-only strategy paper-order readiness preflight".to_string()),
+    };
+    let blockers =
+        strategy_paper_order_gate_blockers(&candidate, &gate_request, &observation_evidence);
+    let ready_for_strategy_paper_order = blockers.is_empty();
+
+    Ok(serde_json::json!({
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "strategy_paper_order_readiness": true,
+        "ready_for_strategy_paper_order": ready_for_strategy_paper_order,
+        "blockers": blockers,
+        "strategy_requested_size": requested_size,
+        "candidate": candidate,
+        "strategy_candidate_observation_evidence": observation_evidence,
+        "submit_requires_confirm_strategy_paper_order": true,
+        "request_sent": false,
+        "would_send": false,
+        "would_post": false,
+        "post_order_called": false,
+        "post_orders_called": false,
+        "note": "Read-only strategy paper-order preflight. It mirrors current gates without journaling a rejection or invoking paper/CLOB order paths."
+    }))
+}
+
+async fn attach_strategy_requested_size_paper_preview(
+    pool: &PgPool,
+    mut candidate: serde_json::Value,
+    requested_size: Decimal,
+) -> serde_json::Value {
+    //! Rebuild the candidate's embedded paper preview for the operator's
+    //! requested paper size.
+    //!
+    //! RISK: The strategy candidate list is a read-only ranking surface and uses
+    //! a one-share preview. The execution bridge must evaluate the exact size
+    //! requested by the operator before it can delegate to PaperTradingEngine;
+    //! otherwise a large paper order could pass strategy gates using stale
+    //! one-share risk data and only fail later in the lower-level engine.
+    let market_id = candidate
+        .get("market_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let target_outcome = candidate
+        .get("target_outcome")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Yes")
+        .to_string();
+    let preview_request = PaperOrderRequest {
+        market_id,
+        outcome: target_outcome,
+        side: "Buy".to_string(),
+        order_type: "Market".to_string(),
+        size: requested_size,
+        limit_price: None,
+        rationale: Some("requested-size strategy paper preview".to_string()),
+        confirm_paper_order: Some(false),
+    };
+    let paper_order_preview = build_paper_order_plan(pool, &preview_request)
+        .await
+        .unwrap_or_else(|e| {
+            serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "accepted_for_paper": false,
+                "executed": false,
+                "dry_run_only": true,
+                "blockers": ["paper_order_preview_failed"],
+                "error": e.to_string(),
+                "request_sent": false,
+                "would_send": false,
+                "would_post": false,
+                "post_order_called": false,
+                "post_orders_called": false,
+            })
+        });
+
+    if let Some(object) = candidate.as_object_mut() {
+        object.insert("size".to_string(), serde_json::json!(requested_size));
+        object.insert(
+            "strategy_requested_size".to_string(),
+            serde_json::json!(requested_size),
+        );
+        object.insert("paper_order_preview".to_string(), paper_order_preview);
+    }
+    candidate
+}
+
+fn strategy_paper_order_gate_blockers(
+    candidate: &serde_json::Value,
+    request: &StrategyPaperOrderRequest,
+    observation_evidence: &serde_json::Value,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if request.confirm_strategy_paper_order != Some(true) {
+        blockers.push("confirm_strategy_paper_order_required".to_string());
+    }
+    if candidate.get("decision").and_then(|v| v.as_str())
+        != Some("paper_candidate_ready_for_manual_review")
+    {
+        blockers.push("strategy_net_edge_below_minimum".to_string());
+    }
+    if observation_evidence
+        .get("available")
+        .and_then(|value| value.as_bool())
+        != Some(true)
+    {
+        blockers.push("strategy_candidate_observation_required".to_string());
+    } else {
+        if observation_evidence
+            .get("is_recent")
+            .and_then(|value| value.as_bool())
+            != Some(true)
+        {
+            blockers.push("strategy_candidate_observation_stale".to_string());
+        }
+        if observation_evidence
+            .get("observation_ready_for_manual_review")
+            .and_then(|value| value.as_bool())
+            != Some(true)
+        {
+            blockers.push("strategy_candidate_observation_not_ready".to_string());
+        }
+    }
+    if candidate
+        .get("paper_order_preview")
+        .and_then(|preview| preview.get("accepted_for_paper"))
+        .and_then(|value| value.as_bool())
+        != Some(true)
+    {
+        blockers.push("strategy_paper_preview_blocked".to_string());
+    }
+    blockers
+}
+
+async fn strategy_paper_order_rejection(
+    pool: &PgPool,
+    request: StrategyPaperOrderRequest,
+    candidate: Option<serde_json::Value>,
+    observation_evidence: Option<serde_json::Value>,
+    blockers: Vec<String>,
+) -> (StatusCode, serde_json::Value) {
+    let payload = serde_json::json!({
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "accepted_for_paper": false,
+        "executed": false,
+        "strategy_paper_order": true,
+        "source": "strategy_paper_order_submit_route_validation",
+        "market_id": request.market_id.trim(),
+        "requested_outcome": request.outcome,
+        "requested_size": request.size,
+        "confirm_strategy_paper_order": request.confirm_strategy_paper_order == Some(true),
+        "candidate": candidate,
+        "strategy_candidate_observation_evidence": observation_evidence,
+        "blockers": blockers,
+        "request_sent": false,
+        "would_send": false,
+        "would_post": false,
+        "post_order_called": false,
+        "post_orders_called": false,
+        "note": "Strategy-gated paper submit rejected before PaperTradingEngine writes paper order, fill, position, or portfolio snapshot rows."
+    });
+    let journal_result = record_journal_event(
+        pool,
+        "strategy_paper_order_submit_route_validation",
+        "polytrader_server",
+        "warning",
+        payload,
+    )
+    .await;
+    let mut body = serde_json::json!({
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "accepted_for_paper": false,
+        "executed": false,
+        "strategy_paper_order": true,
+        "blockers": blockers,
+        "candidate": candidate,
+        "strategy_candidate_observation_evidence": observation_evidence,
+        "request_sent": false,
+        "post_order_called": false,
+        "post_orders_called": false,
+        "note": "Strategy-gated paper submit rejected before paper execution."
+    });
+    if let Some(object) = body.as_object_mut() {
+        match journal_result {
+            Ok(event_id) => {
+                object.insert("journaled".to_string(), serde_json::json!(true));
+                object.insert("journal_event_id".to_string(), serde_json::json!(event_id));
+            }
+            Err(e) => {
+                object.insert("journaled".to_string(), serde_json::json!(false));
+                object.insert(
+                    "journal_error".to_string(),
+                    serde_json::json!(e.to_string()),
+                );
+            }
+        }
+    }
+    (StatusCode::BAD_REQUEST, body)
+}
+
+fn strategy_candidate_decision(
+    net_edge_after_fees: Decimal,
+    min_net_edge_for_trade: Decimal,
+) -> &'static str {
+    if net_edge_after_fees >= min_net_edge_for_trade {
+        "paper_candidate_ready_for_manual_review"
+    } else {
+        "observe"
+    }
+}
+
+async fn build_paper_order_plan(
+    pool: &PgPool,
+    request: &PaperOrderRequest,
+) -> anyhow::Result<serde_json::Value> {
+    let mut blockers: Vec<&'static str> = Vec::new();
+    let market_id = request.market_id.trim();
+    if market_id.is_empty() {
+        blockers.push("market_id_required");
+    }
+
+    let outcome = normalize_paper_order_outcome(&request.outcome);
+    if outcome.is_none() {
+        blockers.push("invalid_outcome");
+    }
+    let side = parse_paper_order_side(&request.side);
+    if side.is_none() {
+        blockers.push("invalid_side");
+    }
+    let order_type = parse_paper_order_type(&request.order_type);
+    if order_type.is_none() {
+        blockers.push("invalid_order_type");
+    }
+    if request.size <= Decimal::ZERO {
+        blockers.push("size_must_be_positive");
+    }
+
+    let market = if market_id.is_empty() {
+        None
+    } else {
+        sqlx::query_as::<_, PaperOrderMarketReadinessRow>(
+            "SELECT gamma_id, slug, question, active, last_mid_yes, last_mid_no
+             FROM market_data.markets
+             WHERE gamma_id = $1 OR slug = $1
+             LIMIT 1",
+        )
+        .bind(market_id)
+        .fetch_optional(pool)
+        .await?
+    };
+    let Some(market) = market else {
+        blockers.push("market_not_found");
+        return Ok(paper_order_plan_json(
+            request,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            blockers,
+        ));
+    };
+
+    if !market.active {
+        blockers.push("market_not_active");
+    }
+    if !market_has_two_sided_mids(&market.last_mid_yes, &market.last_mid_no) {
+        blockers.push("market_data_missing_two_sided_mids");
+    }
+
+    let mid = match outcome.as_deref() {
+        Some("Yes") => market.last_mid_yes,
+        Some("No") => market.last_mid_no,
+        _ => None,
+    };
+    let limit_price = request.limit_price;
+    if matches!(order_type, Some(crate::paper::OrderType::Limit)) {
+        match limit_price {
+            Some(price) if price > Decimal::ZERO && price < Decimal::ONE => {}
+            _ => blockers.push("valid_limit_price_required"),
+        }
+    }
+
+    let reference_price = limit_price.or(mid);
+    let estimated_notional = reference_price
+        .map(|price| request.size * price)
+        .unwrap_or(Decimal::ZERO);
+
+    let latest_usdc = latest_virtual_usdc(pool).await?;
+    let max_order_notional = paper_max_order_notional(latest_usdc);
+    let max_total_exposure = paper_max_total_exposure(latest_usdc);
+    let current_total_collateral_locked = current_paper_collateral_locked(pool).await?;
+    let projected_total_collateral_locked = paper_projected_total_collateral_locked(
+        side.as_ref(),
+        current_total_collateral_locked,
+        estimated_notional,
+    );
+    if estimated_notional > max_order_notional {
+        blockers.push("max_order_notional_exceeded");
+    }
+    if projected_total_collateral_locked > max_total_exposure {
+        blockers.push("max_total_exposure_exceeded");
+    }
+
+    let current_position = if let Some(outcome) = outcome.as_deref() {
+        sqlx::query_scalar::<_, Decimal>(
+            "SELECT shares FROM paper_trading.paper_positions WHERE market_id = $1 AND outcome = $2",
+        )
+        .bind(&market.gamma_id)
+        .bind(outcome)
+        .fetch_optional(pool)
+        .await?
+        .unwrap_or(Decimal::ZERO)
+    } else {
+        Decimal::ZERO
+    };
+    if matches!(side, Some(crate::paper::OrderSide::Sell)) && current_position < request.size {
+        blockers.push("insufficient_paper_position");
+    }
+
+    Ok(paper_order_plan_json(
+        request,
+        Some(&market),
+        outcome.as_deref(),
+        side.map(|value| value.to_string()),
+        order_type.map(|value| value.to_string()),
+        reference_price,
+        latest_usdc,
+        max_order_notional,
+        max_total_exposure,
+        current_total_collateral_locked,
+        projected_total_collateral_locked,
+        blockers,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paper_order_plan_json(
+    request: &PaperOrderRequest,
+    market: Option<&PaperOrderMarketReadinessRow>,
+    outcome: Option<&str>,
+    side: Option<String>,
+    order_type: Option<String>,
+    reference_price: Option<Decimal>,
+    latest_usdc: Decimal,
+    max_order_notional: Decimal,
+    max_total_exposure: Decimal,
+    current_total_collateral_locked: Decimal,
+    projected_total_collateral_locked: Decimal,
+    blockers: Vec<&'static str>,
+) -> serde_json::Value {
+    let estimated_notional = reference_price
+        .map(|price| request.size * price)
+        .unwrap_or(Decimal::ZERO);
+    serde_json::json!({
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "accepted_for_paper": blockers.is_empty(),
+        "executed": false,
+        "dry_run_only": true,
+        "request_sent": false,
+        "would_send": false,
+        "would_post": false,
+        "post_order_called": false,
+        "post_orders_called": false,
+        "blockers": blockers,
+        "market": market.map(|market| serde_json::json!({
+            "gamma_id": market.gamma_id,
+            "slug": market.slug,
+            "question": market.question,
+            "active": market.active,
+            "last_mid_yes": market.last_mid_yes,
+            "last_mid_no": market.last_mid_no,
+            "market_data_status": market_data_status(&market.last_mid_yes, &market.last_mid_no),
+        })),
+        "normalized_intent": {
+            "market_id": market.map(|market| market.gamma_id.as_str()).unwrap_or(request.market_id.trim()),
+            "outcome": outcome,
+            "side": side,
+            "order_type": order_type,
+            "size": request.size,
+            "limit_price": request.limit_price,
+            "reference_price": reference_price,
+            "estimated_notional": estimated_notional,
+        },
+        "risk": {
+            "latest_virtual_usdc": latest_usdc,
+            "max_order_notional": max_order_notional,
+            "max_order_notional_pct": "1",
+            "max_total_exposure": max_total_exposure,
+            "max_total_exposure_pct": "15",
+            "current_total_collateral_locked": current_total_collateral_locked,
+            "projected_total_collateral_locked": projected_total_collateral_locked,
+            "projected_total_exposure_within_limit": projected_total_collateral_locked <= max_total_exposure,
+            "short_selling_allowed": false,
+        },
+        "note": "Paper order preview only unless /paper/orders is called with confirm_paper_order:true. No CLOB order API is called."
+    })
+}
+
+async fn latest_virtual_usdc(pool: &PgPool) -> anyhow::Result<Decimal> {
+    Ok(sqlx::query_scalar::<_, Decimal>(
+        "SELECT virtual_usdc FROM paper_trading.virtual_portfolio_snapshots ORDER BY as_of DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(Decimal::from(10000u64)))
+}
+
+async fn reset_paper_simulator_state(
+    pool: &PgPool,
+    reason: &str,
+    operator: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(780112301)")
+        .execute(&mut *tx)
+        .await?;
+
+    let (position_count_before, total_collateral_before): (i64, Decimal) = sqlx::query_as(
+        "SELECT COUNT(*)::BIGINT, COALESCE(SUM(collateral_locked), 0)::NUMERIC
+         FROM paper_trading.paper_positions",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let order_count_preserved: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM paper_trading.paper_orders")
+            .fetch_one(&mut *tx)
+            .await?;
+    let fill_count_preserved: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM paper_trading.paper_fills")
+            .fetch_one(&mut *tx)
+            .await?;
+
+    let deleted_positions = sqlx::query("DELETE FROM paper_trading.paper_positions")
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+    let reset_usdc = Decimal::from(10000u64);
+    sqlx::query(
+        r#"INSERT INTO paper_trading.virtual_portfolio_snapshots
+           (virtual_usdc, total_locked, unrealized_pnl, realized_pnl, snapshot_reason, positions)
+           VALUES ($1, 0, 0, 0, 'manual_paper_reset', '[]'::jsonb)"#,
+    )
+    .bind(reset_usdc)
+    .execute(&mut *tx)
+    .await?;
+
+    let event_id = uuid::Uuid::new_v4();
+    let payload = serde_json::json!({
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "reset_applied": true,
+        "reason": reason,
+        "operator": operator.unwrap_or("unspecified"),
+        "position_count_before": position_count_before,
+        "deleted_positions": deleted_positions,
+        "total_collateral_before": total_collateral_before,
+        "reset_virtual_usdc": reset_usdc,
+        "order_count_preserved": order_count_preserved,
+        "fill_count_preserved": fill_count_preserved,
+        "orders_and_fills_deleted": false,
+        "request_sent": false,
+        "would_send": false,
+        "would_post": false,
+        "post_order_called": false,
+        "post_orders_called": false,
+        "note": "Paper simulator current state reset only; historical paper orders and fills are preserved for audit."
+    });
+    sqlx::query(
+        r#"INSERT INTO journal.events (id, event_type, source, severity, payload)
+           VALUES ($1, 'paper_simulator_reset', 'paper_reset_route', 'warning', $2)"#,
+    )
+    .bind(event_id)
+    .bind(&payload)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(serde_json::json!({
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "reset_applied": true,
+        "journaled": true,
+        "journal_event_id": event_id,
+        "position_count_before": position_count_before,
+        "deleted_positions": deleted_positions,
+        "total_collateral_before": total_collateral_before,
+        "reset_virtual_usdc": reset_usdc,
+        "order_count_preserved": order_count_preserved,
+        "fill_count_preserved": fill_count_preserved,
+        "orders_and_fills_deleted": false,
+        "request_sent": false,
+        "would_send": false,
+        "would_post": false,
+        "post_order_called": false,
+        "post_orders_called": false,
+        "note": "Paper simulator current state reset only; historical paper orders and fills are preserved for audit."
+    }))
+}
+
+async fn build_paper_reconciliation_report(pool: &PgPool) -> anyhow::Result<serde_json::Value> {
+    let latest_reset_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT as_of
+         FROM paper_trading.virtual_portfolio_snapshots
+         WHERE snapshot_reason = 'manual_paper_reset'
+         ORDER BY as_of DESC
+         LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let latest_snapshot = sqlx::query_as::<_, LatestPaperPortfolioSnapshotRow>(
+        "SELECT as_of, virtual_usdc, total_locked, unrealized_pnl, realized_pnl, snapshot_reason
+         FROM paper_trading.virtual_portfolio_snapshots
+         ORDER BY as_of DESC
+         LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let current_positions = sqlx::query_as::<_, PaperPositionLedgerRow>(
+        "SELECT market_id, outcome, shares, collateral_locked
+         FROM paper_trading.paper_positions
+         ORDER BY market_id, outcome",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let expected_positions = sqlx::query_as::<_, ExpectedPaperPositionLedgerRow>(
+        r#"WITH latest_reset AS (
+               SELECT as_of
+               FROM paper_trading.virtual_portfolio_snapshots
+               WHERE snapshot_reason = 'manual_paper_reset'
+               ORDER BY as_of DESC
+               LIMIT 1
+           )
+           SELECT
+               o.market_id,
+               o.outcome,
+               COALESCE(SUM(CASE WHEN o.side = 'Buy' THEN f.size ELSE -f.size END), 0)::NUMERIC AS expected_shares,
+               COUNT(f.id)::BIGINT AS fill_count
+           FROM paper_trading.paper_fills f
+           JOIN paper_trading.paper_orders o ON o.id = f.order_id
+           WHERE f.created_at > COALESCE((SELECT as_of FROM latest_reset), 'epoch'::timestamptz)
+           GROUP BY o.market_id, o.outcome
+           HAVING COALESCE(SUM(CASE WHEN o.side = 'Buy' THEN f.size ELSE -f.size END), 0) <> 0
+           ORDER BY o.market_id, o.outcome"#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let fills_since_reset_count: i64 = sqlx::query_scalar(
+        "WITH latest_reset AS (
+             SELECT as_of
+             FROM paper_trading.virtual_portfolio_snapshots
+             WHERE snapshot_reason = 'manual_paper_reset'
+             ORDER BY as_of DESC
+             LIMIT 1
+         )
+         SELECT COUNT(*)
+         FROM paper_trading.paper_fills
+         WHERE created_at > COALESCE((SELECT as_of FROM latest_reset), 'epoch'::timestamptz)",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let orders_since_reset_count: i64 = sqlx::query_scalar(
+        "WITH latest_reset AS (
+             SELECT as_of
+             FROM paper_trading.virtual_portfolio_snapshots
+             WHERE snapshot_reason = 'manual_paper_reset'
+             ORDER BY as_of DESC
+             LIMIT 1
+         )
+         SELECT COUNT(*)
+         FROM paper_trading.paper_orders
+         WHERE created_at > COALESCE((SELECT as_of FROM latest_reset), 'epoch'::timestamptz)",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let current_total_collateral_locked: Decimal = current_positions
+        .iter()
+        .map(|row| row.collateral_locked)
+        .sum();
+    let mut current_by_key = HashMap::new();
+    for row in &current_positions {
+        current_by_key.insert((row.market_id.clone(), row.outcome.clone()), row.shares);
+    }
+
+    let mut mismatches = Vec::new();
+    for expected in &expected_positions {
+        let key = (expected.market_id.clone(), expected.outcome.clone());
+        let actual_shares = current_by_key.remove(&key).unwrap_or(Decimal::ZERO);
+        if actual_shares != expected.expected_shares {
+            mismatches.push(serde_json::json!({
+                "type": "position_share_mismatch",
+                "market_id": expected.market_id,
+                "outcome": expected.outcome,
+                "expected_shares": expected.expected_shares,
+                "actual_shares": actual_shares,
+                "fill_count_since_reset": expected.fill_count,
+            }));
+        }
+    }
+    for ((market_id, outcome), actual_shares) in current_by_key {
+        if actual_shares != Decimal::ZERO {
+            mismatches.push(serde_json::json!({
+                "type": "unexpected_current_position_without_post_reset_fills",
+                "market_id": market_id,
+                "outcome": outcome,
+                "actual_shares": actual_shares,
+                "expected_shares": "0",
+            }));
+        }
+    }
+
+    if let Some(snapshot) = &latest_snapshot {
+        if snapshot.total_locked != current_total_collateral_locked {
+            mismatches.push(serde_json::json!({
+                "type": "snapshot_total_locked_mismatch",
+                "snapshot_total_locked": snapshot.total_locked,
+                "current_total_collateral_locked": current_total_collateral_locked,
+                "snapshot_reason": snapshot.snapshot_reason,
+                "snapshot_as_of": snapshot.as_of,
+            }));
+        }
+    } else {
+        mismatches.push(serde_json::json!({
+            "type": "missing_portfolio_snapshot",
+        }));
+    }
+
+    let status = if mismatches.is_empty() {
+        "reconciled"
+    } else {
+        "mismatch"
+    };
+
+    Ok(serde_json::json!({
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "request_sent": false,
+        "post_order_called": false,
+        "post_orders_called": false,
+        "status": status,
+        "latest_reset_at": latest_reset_at,
+        "orders_since_reset_count": orders_since_reset_count,
+        "fills_since_reset_count": fills_since_reset_count,
+        "current_position_count": current_positions.len(),
+        "expected_position_count": expected_positions.len(),
+        "current_total_collateral_locked": current_total_collateral_locked,
+        "latest_snapshot": latest_snapshot.map(|snapshot| serde_json::json!({
+            "as_of": snapshot.as_of,
+            "virtual_usdc": snapshot.virtual_usdc,
+            "total_locked": snapshot.total_locked,
+            "unrealized_pnl": snapshot.unrealized_pnl,
+            "realized_pnl": snapshot.realized_pnl,
+            "snapshot_reason": snapshot.snapshot_reason,
+        })),
+        "expected_positions": expected_positions.into_iter().map(|row| serde_json::json!({
+            "market_id": row.market_id,
+            "outcome": row.outcome,
+            "expected_shares": row.expected_shares,
+            "fill_count_since_reset": row.fill_count,
+        })).collect::<Vec<_>>(),
+        "mismatch_count": mismatches.len(),
+        "mismatches": mismatches,
+        "note": "Read-only paper reconciliation from current positions, latest portfolio snapshot, and fills after the latest manual reset; no CLOB order API is called."
+    }))
+}
+
+fn paper_max_order_notional(latest_virtual_usdc: Decimal) -> Decimal {
+    latest_virtual_usdc * Decimal::new(1, 2)
+}
+
+fn paper_max_total_exposure(latest_virtual_usdc: Decimal) -> Decimal {
+    latest_virtual_usdc * Decimal::new(15, 2)
+}
+
+async fn current_paper_collateral_locked(pool: &PgPool) -> anyhow::Result<Decimal> {
+    Ok(sqlx::query_scalar::<_, Decimal>(
+        "SELECT COALESCE(SUM(collateral_locked), 0)::NUMERIC FROM paper_trading.paper_positions",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+fn paper_projected_total_collateral_locked(
+    side: Option<&crate::paper::OrderSide>,
+    current_total_collateral_locked: Decimal,
+    estimated_notional: Decimal,
+) -> Decimal {
+    if matches!(side, Some(crate::paper::OrderSide::Buy)) {
+        current_total_collateral_locked + estimated_notional
+    } else {
+        current_total_collateral_locked
+    }
+}
+
+async fn load_paper_position_rows(pool: &PgPool) -> anyhow::Result<Vec<PaperPositionHistoryRow>> {
+    Ok(sqlx::query_as::<_, PaperPositionHistoryRow>(
+        r#"SELECT
+                p.market_id,
+                m.slug,
+                m.question,
+                m.category,
+                p.outcome,
+                p.shares,
+                p.avg_entry_price,
+                p.collateral_locked,
+                m.last_mid_yes,
+                m.last_mid_no,
+                p.last_updated
+           FROM paper_trading.paper_positions p
+           LEFT JOIN market_data.markets m ON m.gamma_id = p.market_id
+           ORDER BY p.last_updated DESC, p.market_id, p.outcome"#,
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+fn build_paper_risk_summary(
+    latest_virtual_usdc: Decimal,
+    rows: Vec<PaperPositionHistoryRow>,
+) -> serde_json::Value {
+    let open_position_count = rows.len();
+    let total_collateral_locked: Decimal = rows.iter().map(|row| row.collateral_locked).sum();
+    let total_mark_value: Decimal = rows
+        .iter()
+        .map(|row| {
+            let mark_price = if row.outcome.eq_ignore_ascii_case("yes") {
+                row.last_mid_yes
+            } else {
+                row.last_mid_no
+            };
+            mark_price
+                .map(|price| row.shares * price)
+                .unwrap_or(row.collateral_locked)
+        })
+        .sum();
+    let unrealized_pnl = total_mark_value - total_collateral_locked;
+    let max_order_notional = paper_max_order_notional(latest_virtual_usdc);
+    let max_total_exposure = paper_max_total_exposure(latest_virtual_usdc);
+    let percent = Decimal::from(100u64);
+    let total_exposure_pct_of_bankroll = if latest_virtual_usdc > Decimal::ZERO {
+        total_collateral_locked / latest_virtual_usdc * percent
+    } else {
+        Decimal::ZERO
+    };
+    let total_exposure_limit_used_pct = if max_total_exposure > Decimal::ZERO {
+        total_collateral_locked / max_total_exposure * percent
+    } else {
+        Decimal::ZERO
+    };
+    let within_total_exposure_limit = total_collateral_locked <= max_total_exposure;
+    let status = if within_total_exposure_limit {
+        "within_limits"
+    } else {
+        "total_exposure_limit_exceeded"
+    };
+
+    serde_json::json!({
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "request_sent": false,
+        "post_order_called": false,
+        "post_orders_called": false,
+        "latest_virtual_usdc": latest_virtual_usdc,
+        "open_position_count": open_position_count,
+        "total_collateral_locked": total_collateral_locked,
+        "total_mark_value": total_mark_value,
+        "unrealized_pnl": unrealized_pnl,
+        "max_order_notional": max_order_notional,
+        "max_order_notional_pct": "1",
+        "max_total_exposure": max_total_exposure,
+        "max_total_exposure_pct": "15",
+        "total_exposure_pct_of_bankroll": total_exposure_pct_of_bankroll,
+        "total_exposure_limit_used_pct": total_exposure_limit_used_pct,
+        "within_total_exposure_limit": within_total_exposure_limit,
+        "status": status,
+        "positions": rows.into_iter().map(paper_position_history_json).collect::<Vec<_>>(),
+        "note": "Read-only aggregate paper risk summary; no CLOB order, wallet, or allowance API is called."
+    })
+}
+
+fn paper_order_history_json(row: PaperOrderHistoryRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.id,
+        "market_id": row.market_id,
+        "slug": row.slug,
+        "question": row.question,
+        "outcome": row.outcome,
+        "side": row.side,
+        "order_type": row.order_type,
+        "limit_price": row.limit_price,
+        "size": row.size,
+        "status": row.status,
+        "fill_count": row.fill_count,
+        "filled_size": row.filled_size,
+        "gross_notional": row.gross_notional,
+        "total_fee": row.total_fee,
+        "decision_context": row.decision_context.unwrap_or_else(|| serde_json::json!({})),
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+        "paper_only": true,
+        "real_orders_enabled": false,
+    })
+}
+
+fn paper_fill_history_json(row: PaperFillHistoryRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.id,
+        "order_id": row.order_id,
+        "market_id": row.market_id,
+        "slug": row.slug,
+        "outcome": row.outcome,
+        "side": row.side,
+        "price": row.price,
+        "size": row.size,
+        "fee": row.fee,
+        "slippage_bps": row.slippage_bps,
+        "created_at": row.created_at,
+        "paper_only": true,
+        "real_orders_enabled": false,
+    })
+}
+
+fn paper_position_history_json(row: PaperPositionHistoryRow) -> serde_json::Value {
+    let mark_price = if row.outcome.eq_ignore_ascii_case("yes") {
+        row.last_mid_yes
+    } else {
+        row.last_mid_no
+    };
+    let mark_value = mark_price.map(|price| row.shares * price);
+    let unrealized_pnl = mark_value.map(|value| value - row.collateral_locked);
+    let category_label = row
+        .category
+        .as_deref()
+        .map(category_display_label)
+        .map(str::to_string);
+
+    serde_json::json!({
+        "market_id": row.market_id,
+        "slug": row.slug,
+        "question": row.question,
+        "category": row.category,
+        "category_label": category_label,
+        "outcome": row.outcome,
+        "shares": row.shares,
+        "avg_entry_price": row.avg_entry_price,
+        "collateral_locked": row.collateral_locked,
+        "mark_price": mark_price,
+        "mark_value": mark_value,
+        "unrealized_pnl": unrealized_pnl,
+        "last_updated": row.last_updated,
+        "paper_only": true,
+        "real_orders_enabled": false,
+    })
+}
+
+fn paper_fee_bps_from_env() -> u16 {
+    std::env::var("POLYTRADER_PAPER_FEE_BPS")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(50)
+}
+
+fn normalize_paper_order_outcome(value: &str) -> Option<String> {
+    if value.eq_ignore_ascii_case("yes") {
+        Some("Yes".to_string())
+    } else if value.eq_ignore_ascii_case("no") {
+        Some("No".to_string())
+    } else {
+        None
+    }
+}
+
+fn parse_paper_order_side(value: &str) -> Option<crate::paper::OrderSide> {
+    if value.eq_ignore_ascii_case("buy") {
+        Some(crate::paper::OrderSide::Buy)
+    } else if value.eq_ignore_ascii_case("sell") {
+        Some(crate::paper::OrderSide::Sell)
+    } else {
+        None
+    }
+}
+
+fn parse_paper_order_type(value: &str) -> Option<crate::paper::OrderType> {
+    if value.eq_ignore_ascii_case("market") {
+        Some(crate::paper::OrderType::Market)
+    } else if value.eq_ignore_ascii_case("limit") {
+        Some(crate::paper::OrderType::Limit)
+    } else {
+        None
+    }
 }
 
 fn build_review_queue_item(
@@ -5959,6 +9171,79 @@ async fn validate_human_approval_event(
         event_id: Some(event_id),
         decision,
         subject_hash: Some(actual_subject_hash),
+        blockers,
+    }
+}
+
+async fn validate_final_review_decision_event(
+    pool: &PgPool,
+    request: &crate::clob::authenticated::OrderSubmitFacadeRequest,
+) -> crate::clob::authenticated::FinalReviewDecisionValidation {
+    let Some(event_id) = request.final_review_decision_event_id else {
+        return crate::clob::authenticated::FinalReviewDecisionValidation {
+            valid: false,
+            event_id: None,
+            decision: None,
+            operator: None,
+            blockers: vec!["final_review_decision_event_missing".to_string()],
+        };
+    };
+
+    let row = sqlx::query_as::<_, (serde_json::Value, chrono::DateTime<chrono::Utc>)>(
+        r#"SELECT payload, created_at
+           FROM journal.events
+           WHERE id = $1 AND event_type = 'clob_final_review_decision'"#,
+    )
+    .bind(event_id)
+    .fetch_optional(pool)
+    .await;
+
+    let Some((payload, _created_at)) = (match row {
+        Ok(row) => row,
+        Err(_) => {
+            return crate::clob::authenticated::FinalReviewDecisionValidation {
+                valid: false,
+                event_id: Some(event_id),
+                decision: None,
+                operator: None,
+                blockers: vec!["final_review_decision_event_lookup_failed".to_string()],
+            };
+        }
+    }) else {
+        return crate::clob::authenticated::FinalReviewDecisionValidation {
+            valid: false,
+            event_id: Some(event_id),
+            decision: None,
+            operator: None,
+            blockers: vec!["final_review_decision_event_not_found".to_string()],
+        };
+    };
+
+    let decision = payload
+        .get("decision")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let operator = payload
+        .get("operator")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let mut blockers = Vec::new();
+
+    if decision.is_none() {
+        blockers.push("final_review_decision_event_has_no_decision".to_string());
+    }
+    // Note: all normalized decisions (acknowledge/reject/rework) are accepted as
+    // "final decision recorded"; the operator is responsible for only passing an
+    // appropriate (non-reject) decision id to the submit facade.
+
+    blockers.sort();
+    blockers.dedup();
+
+    crate::clob::authenticated::FinalReviewDecisionValidation {
+        valid: blockers.is_empty(),
+        event_id: Some(event_id),
+        decision,
+        operator,
         blockers,
     }
 }
@@ -6416,6 +9701,79 @@ mod tests {
     }
 
     #[test]
+    fn category_display_label_humanizes_motorsports() {
+        assert_eq!(category_display_label("motorsports"), "Motorsports");
+        assert_eq!(category_display_label("formula1"), "Motorsports");
+        assert_eq!(category_display_label("f1"), "Motorsports");
+        assert_eq!(category_display_label("crypto"), "Crypto");
+    }
+
+    #[test]
+    fn market_data_status_requires_two_sided_mids() {
+        let yes = Some(Decimal::new(650000, 8));
+        let no = Some(Decimal::new(99350000, 8));
+        assert!(market_has_two_sided_mids(&yes, &no));
+        assert_eq!(market_data_status(&yes, &no), "ready");
+        assert!(!market_has_two_sided_mids(&yes, &None));
+        assert_eq!(market_data_status(&yes, &None), "missing_mid");
+    }
+
+    #[test]
+    fn paper_order_helpers_normalize_and_cap_risk() {
+        assert_eq!(normalize_paper_order_outcome("yes").as_deref(), Some("Yes"));
+        assert_eq!(normalize_paper_order_outcome("NO").as_deref(), Some("No"));
+        assert!(normalize_paper_order_outcome("draw").is_none());
+        assert!(matches!(
+            parse_paper_order_side("buy"),
+            Some(crate::paper::OrderSide::Buy)
+        ));
+        assert!(matches!(
+            parse_paper_order_type("LIMIT"),
+            Some(crate::paper::OrderType::Limit)
+        ));
+        assert_eq!(
+            paper_max_order_notional(Decimal::from(150u64)),
+            Decimal::new(150, 2)
+        );
+        assert_eq!(
+            paper_max_total_exposure(Decimal::from(150u64)),
+            Decimal::new(2250, 2)
+        );
+        assert_eq!(
+            paper_projected_total_collateral_locked(
+                Some(&crate::paper::OrderSide::Buy),
+                Decimal::from(20u64),
+                Decimal::new(150, 2),
+            ),
+            Decimal::new(2150, 2)
+        );
+        assert_eq!(
+            paper_projected_total_collateral_locked(
+                Some(&crate::paper::OrderSide::Sell),
+                Decimal::from(20u64),
+                Decimal::new(150, 2),
+            ),
+            Decimal::from(20u64)
+        );
+        let summary = build_paper_risk_summary(Decimal::from(150u64), Vec::new());
+        assert_eq!(summary["within_total_exposure_limit"], true);
+        assert_eq!(summary["status"], "within_limits");
+        assert_eq!(summary["open_position_count"], 0);
+    }
+
+    #[test]
+    fn strategy_candidate_decision_requires_min_net_edge() {
+        assert_eq!(
+            strategy_candidate_decision(Decimal::new(399, 4), Decimal::new(4, 2)),
+            "observe"
+        );
+        assert_eq!(
+            strategy_candidate_decision(Decimal::new(4, 2), Decimal::new(4, 2)),
+            "paper_candidate_ready_for_manual_review"
+        );
+    }
+
+    #[test]
     fn dry_run_review_decision_is_normalized() {
         assert_eq!(
             normalize_dry_run_review_decision(" approve "),
@@ -6861,6 +10219,41 @@ mod tests {
                         "network_sender_present": false,
                         "accepted_for_network_dispatch": false
                     }
+                },
+                "paper_accounting_loop": {
+                    "status": "reconciled",
+                    "mismatch_count": 0,
+                    "fills_since_reset_count": 0,
+                    "hermes_checks_paper_accounting": true,
+                    "request_sent": false,
+                    "post_order_called": false,
+                    "post_orders_called": false
+                },
+                "paper_rejection_loop": {
+                    "paper_order_rejection_events_24h": 4,
+                    "strategy_paper_order_rejections_24h": 1,
+                    "strategy_gate_status": "blocked",
+                    "top_blockers": {
+                        "strategy_net_edge_below_minimum": 1
+                    },
+                    "hermes_consumes_strategy_paper_gate": true,
+                    "paper_only": true,
+                    "real_orders_enabled": false
+                },
+                "strategy_candidate_loop": {
+                    "strategy_candidate_observation_events_24h": 2,
+                    "observed_candidates_24h": 2,
+                    "strategy_candidate_observation_status": "observing_candidates",
+                    "latest_summary": {
+                        "first_candidate_decision": "observe",
+                        "first_candidate_net_edge_after_fees": "-0.014"
+                    },
+                    "hermes_consumes_strategy_candidate_observations": true,
+                    "paper_only": true,
+                    "real_orders_enabled": false,
+                    "request_sent": false,
+                    "post_order_called": false,
+                    "post_orders_called": false
                 }
             })),
             recommendations: Some(serde_json::json!(["inspect final-review decisions"])),
@@ -6902,6 +10295,40 @@ mod tests {
         assert_eq!(response["reflection"]["stale_after_seconds"], 600);
         assert_eq!(response["reflection"]["is_stale"], false);
         assert_eq!(response["reflection"]["freshness_status"], "fresh");
+        assert_eq!(response["paper_accounting_loop"]["status"], "reconciled");
+        assert_eq!(response["paper_accounting_loop"]["mismatch_count"], 0);
+        assert_eq!(
+            response["paper_rejection_loop"]["strategy_paper_order_rejections_24h"],
+            1
+        );
+        assert_eq!(
+            response["paper_rejection_loop"]["strategy_gate_status"],
+            "blocked"
+        );
+        assert_eq!(
+            response["paper_rejection_loop"]["top_blockers"]["strategy_net_edge_below_minimum"],
+            1
+        );
+        assert_eq!(
+            response["paper_rejection_loop"]["hermes_consumes_strategy_paper_gate"],
+            true
+        );
+        assert_eq!(
+            response["strategy_candidate_loop"]["strategy_candidate_observation_events_24h"],
+            2
+        );
+        assert_eq!(
+            response["strategy_candidate_loop"]["observed_candidates_24h"],
+            2
+        );
+        assert_eq!(
+            response["strategy_candidate_loop"]["latest_summary"]["first_candidate_decision"],
+            "observe"
+        );
+        assert_eq!(
+            response["strategy_candidate_loop"]["hermes_consumes_strategy_candidate_observations"],
+            true
+        );
     }
 
     #[test]
@@ -6916,6 +10343,7 @@ mod tests {
         assert_eq!(response["request_sent"], false);
         assert_eq!(response["post_order_called"], false);
         assert_eq!(response["post_orders_called"], false);
+        assert!(response["strategy_candidate_loop"].is_null());
     }
 
     #[test]
@@ -7079,6 +10507,11 @@ mod tests {
         assert_eq!(summary["latest_review_latency"]["min_seconds"], 300);
         assert_eq!(summary["latest_review_latency"]["max_seconds"], 300);
         assert_eq!(summary["latest_review_latency"]["avg_seconds"], 300);
+        assert_eq!(summary["latest_review_latency"]["slow_count"], 0);
+        assert_eq!(
+            summary["latest_review_latency"]["slow_after_seconds"],
+            REVIEW_LATENCY_SLOW_AFTER_SECONDS
+        );
         assert_eq!(
             summary["top_blockers"][0]["name"],
             "real_order_route_absent"
@@ -7105,6 +10538,18 @@ mod tests {
         assert_eq!(summary["min_seconds"], 60);
         assert_eq!(summary["max_seconds"], 180);
         assert_eq!(summary["avg_seconds"], 120);
+        assert_eq!(summary["slow_count"], 0);
+        assert_eq!(
+            summary["slow_after_seconds"],
+            REVIEW_LATENCY_SLOW_AFTER_SECONDS
+        );
+
+        let slow_summary = latency_summary(&[
+            REVIEW_LATENCY_SLOW_AFTER_SECONDS - 1,
+            REVIEW_LATENCY_SLOW_AFTER_SECONDS,
+            REVIEW_LATENCY_SLOW_AFTER_SECONDS + 60,
+        ]);
+        assert_eq!(slow_summary["slow_count"], 2);
     }
 
     #[test]
@@ -7116,7 +10561,8 @@ mod tests {
                 "differs_from_latest_review": 1
             },
             "latest_review_latency": {
-                "max_seconds": REVIEW_LATENCY_SLOW_AFTER_SECONDS
+                "max_seconds": REVIEW_LATENCY_SLOW_AFTER_SECONDS,
+                "slow_count": 2
             }
         });
 
@@ -7136,6 +10582,8 @@ mod tests {
             health["reason_details"]["max_latency_seconds"],
             REVIEW_LATENCY_SLOW_AFTER_SECONDS
         );
+        assert_eq!(health["reason_details"]["slow_review_count"], 2);
+        assert_eq!(health["slow_review_count"], 2);
         assert_eq!(
             health["reason_details"]["slow_latency_after_seconds"],
             REVIEW_LATENCY_SLOW_AFTER_SECONDS
@@ -7163,6 +10611,7 @@ mod tests {
             actions[2]["max_latency_seconds"],
             REVIEW_LATENCY_SLOW_AFTER_SECONDS
         );
+        assert_eq!(actions[2]["slow_review_count"], 2);
         assert_eq!(
             actions[2]["slow_latency_after_seconds"],
             REVIEW_LATENCY_SLOW_AFTER_SECONDS
@@ -7300,13 +10749,14 @@ mod tests {
         assert_eq!(ids, vec!["inspect_final_review_decisions"]);
     }
 
-    #[test]
-    fn operator_status_actions_include_fail_closed_live_sender_boundary() {
+    #[tokio::test]
+    async fn operator_status_actions_include_fail_closed_live_sender_boundary() {
         let review_health = serde_json::json!({
             "recommended_actions": [{"id": "none", "severity": "info"}]
         });
         let final_review_audit = serde_json::json!({"status": "audited"});
-        let live_sender_boundary = crate::clob::live_sender::build_live_sender_boundary_status();
+        let live_sender_boundary =
+            crate::clob::live_sender::build_live_sender_boundary_status().await;
         let hermes_safety_loop = serde_json::json!({"status": "boundary_coverage_complete"});
         let hermes_gap_alignment = serde_json::json!({"available": false});
 
@@ -7510,8 +10960,8 @@ mod tests {
             .contains("Hermes reflection is stale"));
     }
 
-    #[test]
-    fn order_placement_readiness_reports_real_order_gap() {
+    #[tokio::test]
+    async fn order_placement_readiness_reports_real_order_gap() {
         let preflight = serde_json::json!({
             "checks": [
                 {"name": "collateral_balance_positive", "ok": false},
@@ -7520,6 +10970,11 @@ mod tests {
         });
         let review_health = serde_json::json!({
             "status": "needs_attention"
+        });
+        let market_data_readiness = serde_json::json!({
+            "status": "ready",
+            "active_market_count": 1,
+            "data_ready_market_count": 1
         });
         let final_review_audit = serde_json::json!({
             "status": "audited",
@@ -7531,33 +10986,39 @@ mod tests {
             true,
             &preflight,
             &review_health,
+            &market_data_readiness,
             &final_review_audit,
-            &crate::clob::live_sender::build_live_sender_boundary_status(),
+            &crate::clob::live_sender::build_live_sender_boundary_status().await,
         );
         let blockers = readiness["blockers"].as_array().expect("blockers");
         let expected_completed_count =
             if real_order_reconciliation_available() && market_metadata_validation_available() {
-                14
+                15
             } else if real_order_reconciliation_available() {
-                13
+                14
             } else if kill_switch_and_exposure_limits_available() {
-                12
+                13
             } else if human_approval_workflow_available() {
-                11
+                12
             } else if order_submit_facade_available() {
-                10
+                11
             } else if order_post_request_dry_run_available() {
-                8
+                9
             } else if signed_order_payload_dry_run_available() {
-                7
+                8
             } else {
-                6
+                7
             };
 
         assert_eq!(readiness["ready"], false);
         assert_eq!(readiness["stage"], "authenticated_read_and_paper_dry_run");
         assert_eq!(readiness["completed_count"], expected_completed_count);
-        assert_eq!(readiness["required_count"], 17);
+        assert_eq!(readiness["required_count"], 18);
+        assert_eq!(readiness["paper_market_data_ready"], true);
+        assert_eq!(
+            readiness["market_data_readiness"]["data_ready_market_count"],
+            1
+        );
         assert_eq!(readiness["final_review_audit_status"], "audited");
         assert_eq!(readiness["final_review_decision_count"], 1);
         assert_eq!(
@@ -7647,10 +11108,13 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker == "market_tick_and_neg_risk_validation"));
         }
+        assert!(!blockers
+            .iter()
+            .any(|blocker| blocker == "paper_market_data_ready"));
     }
 
-    #[test]
-    fn order_placement_readiness_blocks_missing_final_review_audit() {
+    #[tokio::test]
+    async fn order_placement_readiness_blocks_missing_final_review_audit() {
         let preflight = serde_json::json!({
             "checks": [
                 {"name": "collateral_balance_positive", "ok": false},
@@ -7658,6 +11122,11 @@ mod tests {
             ]
         });
         let review_health = serde_json::json!({"status": "ok"});
+        let market_data_readiness = serde_json::json!({
+            "status": "ready",
+            "active_market_count": 1,
+            "data_ready_market_count": 1
+        });
         let final_review_audit = serde_json::json!({
             "status": "missing_audit",
             "count": 0
@@ -7668,20 +11137,21 @@ mod tests {
             true,
             &preflight,
             &review_health,
+            &market_data_readiness,
             &final_review_audit,
-            &crate::clob::live_sender::build_live_sender_boundary_status(),
+            &crate::clob::live_sender::build_live_sender_boundary_status().await,
         );
         let blockers = readiness["blockers"].as_array().expect("blockers");
 
-        assert_eq!(readiness["required_count"], 17);
+        assert_eq!(readiness["required_count"], 18);
         assert_eq!(readiness["final_review_audit_status"], "missing_audit");
         assert!(blockers
             .iter()
             .any(|blocker| blocker == "final_review_decision_audit"));
     }
 
-    #[test]
-    fn final_review_readiness_aggregates_latest_gate_evidence() {
+    #[tokio::test]
+    async fn final_review_readiness_aggregates_latest_gate_evidence() {
         let collateral_event = serde_json::json!({
             "id": uuid::Uuid::nil(),
             "payload": {
@@ -7727,7 +11197,7 @@ mod tests {
             Some(collateral_event),
             Some(unlock_event),
             Some(reconciliation_event),
-            &crate::clob::live_sender::build_live_sender_boundary_status(),
+            &crate::clob::live_sender::build_live_sender_boundary_status().await,
         );
         let blockers = report["blockers"].as_array().expect("blockers");
 

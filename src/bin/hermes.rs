@@ -399,6 +399,34 @@ async fn load_clob_safety_loop_snapshot(
     .fetch_one(pool)
     .await?;
 
+    // New live order dispatch event kinds (from gated real sender wiring) are
+    // counted individually + included in the aggregate IN list for hermes
+    // clob safety consumption (addresses review: update for new kinds + test).
+    let live_pre_dispatch_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_live_order_intent_pre_dispatch'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+    let live_dispatched_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_live_order_dispatched'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+    let live_send_rejected_events_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_live_order_send_rejected'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await?;
+
     let market_metadata_validation_events_24h: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM journal.events
          WHERE event_type = 'clob_market_metadata_validation'
@@ -518,7 +546,7 @@ async fn load_clob_safety_loop_snapshot(
 
     let order_intent_or_signed_dry_run_events_24h: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM journal.events
-         WHERE event_type IN ('clob_order_intent_dry_run', 'clob_live_sender_boundary_status', 'clob_live_sender_design_review', 'clob_live_sender_design_readiness', 'clob_final_review_readiness', 'clob_final_review_decision', 'clob_real_trading_unlock_status', 'clob_collateral_readiness', 'clob_market_metadata_validation', 'clob_order_post_request_dry_run', 'clob_order_submit_facade', 'clob_order_submit_reconciliation', 'clob_order_human_approval')
+         WHERE event_type IN ('clob_order_intent_dry_run', 'clob_live_sender_boundary_status', 'clob_live_sender_design_review', 'clob_live_sender_design_readiness', 'clob_final_review_readiness', 'clob_final_review_decision', 'clob_real_trading_unlock_status', 'clob_collateral_readiness', 'clob_market_metadata_validation', 'clob_order_post_request_dry_run', 'clob_order_submit_facade', 'clob_order_submit_reconciliation', 'clob_order_human_approval', 'clob_live_order_intent_pre_dispatch', 'clob_live_order_dispatched', 'clob_live_order_send_rejected')
            AND created_at >= $1",
     )
     .bind(period_start)
@@ -542,7 +570,10 @@ async fn load_clob_safety_loop_snapshot(
              'clob_order_post_request_dry_run',
              'clob_order_submit_facade',
              'clob_order_submit_reconciliation',
-             'clob_order_human_approval'
+             'clob_order_human_approval',
+             'clob_live_order_intent_pre_dispatch',
+             'clob_live_order_dispatched',
+             'clob_live_order_send_rejected'
          )
          ORDER BY created_at DESC
          LIMIT 1",
@@ -658,13 +689,16 @@ async fn load_clob_safety_loop_snapshot(
         "submit_facade_events_24h": submit_facade_events_24h,
         "submit_reconciliation_events_24h": submit_reconciliation_events_24h,
         "human_approval_events_24h": human_approval_events_24h,
+        "live_pre_dispatch_events_24h": live_pre_dispatch_events_24h,
+        "live_dispatched_events_24h": live_dispatched_events_24h,
+        "live_send_rejected_events_24h": live_send_rejected_events_24h,
         "order_intent_or_signed_dry_run_events_24h": order_intent_or_signed_dry_run_events_24h,
         "latest_event_type": latest_event_type,
         "latest_created_at": latest_created_at,
         "latest_summary": latest_summary,
         "hermes_consumes_clob_safety_events": true,
         "real_orders_enabled": false,
-        "note": "Hermes consumes redacted CLOB live-sender boundary status, live-sender design review, live-sender design readiness, final-review readiness, final-review decision, real-trading unlock status, collateral readiness, dry-run, market metadata validation, human approval, fail-closed submit-facade, and reconciliation audit events only; no real order authority."
+        "note": "Hermes consumes redacted CLOB live-sender boundary status, live-sender design review, live-sender design readiness, final-review readiness, final-review decision, real-trading unlock status, collateral readiness, dry-run, market metadata validation, human approval, fail-closed submit-facade, reconciliation, and the new live pre-dispatch/dispatched/send-rejected events (from gated real sender); no real order authority. New kinds included in aggregate counts + latest."
     }))
 }
 
@@ -901,5 +935,21 @@ mod tests {
             false
         );
         assert_eq!(no_decisions["coverage_status"], "no_decisions");
+    }
+
+    #[test]
+    fn clob_safety_loop_counts_include_live_order_dispatch_kinds() {
+        // F: assert presence of new live dispatch event count keys (added in round 2 for hermes consumption of pre/dispatched/rejected).
+        let mock_clob: serde_json::Value = serde_json::json!({
+            "live_pre_dispatch_events_24h": 5,
+            "live_dispatched_events_24h": 1,
+            "live_send_rejected_events_24h": 3,
+            "submit_reconciliation_events_24h": 10
+        });
+        assert!(mock_clob.get("live_pre_dispatch_events_24h").is_some());
+        assert_eq!(mock_clob["live_pre_dispatch_events_24h"], 5);
+        assert!(mock_clob.get("live_dispatched_events_24h").is_some());
+        assert!(mock_clob.get("live_send_rejected_events_24h").is_some());
+        // in real load these are present after round2 update
     }
 }

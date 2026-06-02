@@ -8,3 +8,5 @@ pub mod live_sender;
 
 // Re-export the main client for convenience
 pub use authenticated::{RealClobClient, RealOrderIntentDryRun};
+// Re-export live sender types so call sites (server, tests) can name the gated impl.
+pub use live_sender::{GatedRealClobLiveOrderSender, LiveOrderSendRequest};
