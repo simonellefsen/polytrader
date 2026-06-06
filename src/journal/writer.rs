@@ -114,4 +114,41 @@ impl JournalWriter {
         tracing::info!(usdc = %snap.virtual_usdc, reason, "portfolio snapshot recorded");
         Ok(())
     }
+
+    /// Record a generic append-only journal event (reuse for decision reports, future kinds).
+    ///
+    /// RISK (AGENTS.md + schema + trading safety): append-only to journal.events (jsonb payload);
+    /// never contains secrets, private keys, L2 HMACs, or anything that would authorize real orders.
+    /// Follows *exact* server record_journal_event pattern (id=uuid v4, no created_at bind since DB default).
+    /// Used by 5-min DR generator (DecisionReport net_edge jsonb) + will be used for other observable
+    /// events. Hermes consumes via COUNT on event_type. Paper-only. No mig. Decimal/observability preserved.
+    /// Duplication with server private (~9791) is acceptable per plan ("exact reuse" + "acceptable for this additive-only tranche (per smallest scope)"); TODO: future consolidate (server delegate to JournalWriter).
+    /// See wiki/schema.md (jsonb for decision reports), goals-and-operational-cadence.md (5-min DR logged),
+    /// decisions/real-order-approval-flow.md (DR generator wiring).
+    pub async fn record_journal_event(
+        &self,
+        event_type: &str,
+        source: &str,
+        severity: &str,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<uuid::Uuid> {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO journal.events (id, event_type, source, severity, payload)
+               VALUES ($1, $2, $3, $4, $5)"#,
+        )
+        .bind(id)
+        .bind(event_type)
+        .bind(source)
+        .bind(severity)
+        .bind(&payload)
+        .execute(&self.pool)
+        .await?;
+        // Changed to debug! (from info!) to address log volume nit at 5min cadence + LIMIT 3 (DR generator calls
+        // this on success; server private remains info! for its higher-severity clob_/strategy_ paths).
+        // Duplication of INSERT with server private record_journal_event is acceptable for this additive-only
+        // tranche (per smallest scope); future: server can delegate to JournalWriter when extending.
+        tracing::debug!(id = %id, event_type, "journal event recorded");
+        Ok(id)
+    }
 }
