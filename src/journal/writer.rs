@@ -123,8 +123,10 @@ impl JournalWriter {
     /// Used by 5-min DR generator (DecisionReport net_edge jsonb) + will be used for other observable
     /// events. Hermes consumes via COUNT on event_type. Paper-only. No mig. Decimal/observability preserved.
     /// Duplication with server private (~9791) is acceptable per plan ("exact reuse" + "acceptable for this additive-only tranche (per smallest scope)"); TODO: future consolidate (server delegate to JournalWriter).
-    /// See wiki/schema.md (jsonb for decision reports), goals-and-operational-cadence.md (5-min DR logged),
-    /// decisions/real-order-approval-flow.md (DR generator wiring).
+    /// + now reused for tax_snapshot skeleton per fees-tax (see record_tax_snapshot).
+    ///
+    ///   See wiki/schema.md (jsonb for decision reports), goals-and-operational-cadence.md (5-min DR logged),
+    ///   decisions/real-order-approval-flow.md (DR generator wiring).
     pub async fn record_journal_event(
         &self,
         event_type: &str,
@@ -150,5 +152,70 @@ impl JournalWriter {
         // tranche (per smallest scope); future: server can delegate to JournalWriter when extending.
         tracing::debug!(id = %id, event_type, "journal event recorded");
         Ok(id)
+    }
+
+    /// Minimal defense-in-depth sanitizer for journal payloads at new write boundaries (e.g. tax).
+    /// Strips known sensitive keys recursively (defense for copy-paste errors by future producers);
+    /// follows "never contains secrets" contract in schema + all RISK comments (machine-enforceable here for tax path).
+    /// Current skeleton: no-op on most but removes e.g. l2_*, private*, secret*, key*, signature* (case-insens prefix).
+    /// Callers (esp. record_tax_snapshot) must still honor documented contract; this is additive guard.
+    /// (Per Issue 5 review nit; keeps as pattern for reuse in generic later if needed.)
+    fn sanitize_journal_payload(v: serde_json::Value) -> serde_json::Value {
+        use serde_json::Value;
+        fn strip(val: Value) -> Value {
+            match val {
+                Value::Object(mut map) => {
+                    let bad_prefixes = [
+                        "l2_",
+                        "private",
+                        "secret",
+                        "key",
+                        "signature",
+                        "hmac",
+                        "auth",
+                    ];
+                    map.retain(|k, _| {
+                        let kl = k.to_ascii_lowercase();
+                        !bad_prefixes.iter().any(|p| kl.starts_with(p))
+                    });
+                    let new_map: serde_json::Map<_, _> =
+                        map.into_iter().map(|(k, vv)| (k, strip(vv))).collect();
+                    Value::Object(new_map)
+                }
+                Value::Array(arr) => Value::Array(arr.into_iter().map(strip).collect()),
+                other => other,
+            }
+        }
+        strip(v)
+    }
+
+    /// Record a tax snapshot / position record (for future cost basis, realized P&L, fees paid reconstruction per fees-tax wiki).
+    ///
+    /// RISK (AGENTS.md + fees-tax-latency-and-execution-tiers.md + goals-and-operational-cadence.md 'Journal extensions (comments first)' non-negotiable):
+    /// - append-only to journal.events (jsonb payload via reuse of record_journal_event);
+    /// - paper proxy only (treat every paper trade as if it will one day be real for record-keeping/audit-grade per fees wiki "Tax & Record-Keeping Strategy");
+    /// - never contains secrets, private keys, L2 HMACs, or anything authorizing real orders;
+    /// - evidence-only for Hermes future attribution of net P&L after modeled 'tax' drag / cost basis (virtual tax reserve is later Phase 3+);
+    /// - Decimal strings in payload; follows exact prior DR generator reuse pattern (no new tables/kinds beyond event_type string "tax_snapshot"; no mig);
+    /// - called from future code (or manual/ops) for tax snapshots; Hermes will lightly consume counts/samples (skeleton).
+    /// - source is normalized (trim + <=128 chars); payload sanitized at boundary (Issue 5/6).
+    ///
+    ///   See wiki/strategies/fees-tax-latency-and-execution-tiers.md +
+    ///   goals-and-operational-cadence.md +
+    ///   decisions/real-order-approval-flow.md (tax skeleton section) +
+    ///   log.md (this tranche).
+    ///
+    /// TODO(future): wire calls to record_tax_snapshot from paper fill paths or produce_5min (after DRs) per fees-tax 'treat every paper trade as if it will one day be real' + goals 'Journal extensions' + backtest tie-in; see wiki/log Current State.
+    pub async fn record_tax_snapshot(
+        &self,
+        source: &str,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<uuid::Uuid> {
+        // Issue 6: source normalizer (trim + cap length; allow-list deferred to first real producer wiring; internal callers only).
+        let norm_source: String = source.trim().chars().take(128).collect();
+        // Issue 5: sanitize at dedicated tax boundary (reuse helper; strips dangerous keys before INSERT; full sample kept for backtest but LLM redacts per hermes).
+        let safe_payload = Self::sanitize_journal_payload(payload);
+        self.record_journal_event("tax_snapshot", &norm_source, "info", safe_payload)
+            .await
     }
 }
