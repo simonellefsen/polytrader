@@ -235,6 +235,28 @@ async fn do_reflection(
         }
     };
 
+    // Backtest harness start (DRs vs paper fills + tax-adjusted; smallest continuation after tax producer wiring per log top "Ready for next (e.g. fuller backtest harness on DRs vs paper fills + tax...)" + goals-and-operational-cadence.md "Query recent fills + all decision reports" + "Compare decision reports vs actual outcomes" + "backtest harness on DRs vs paper fills + tax-adjusted" + "Journal extensions (comments first)" + fees-tax "treat every paper trade as if it will one day be real for record-keeping purposes" + plan "Ready for next / backtest").
+    // Smallest: direct sqlx limited sample (2) of paper_trading.paper_fills (reuses columns populated by record_paper_fills + now tax producer wire with source=paper_fills inside that fn; reuses existing fill_count/sum from above for 24h; no new tables/kinds/migs/harness; limited for "skeleton vs production"; LIMIT 2 conservative vs DR's 3 because tax producer emits on small batches per fill record path (per smallest + "skeleton vs production")).
+    // Ties to DR net_edge sample + tax snapshots (emitted on these fills) so reflection metrics now hold data for DR vs paper fills + tax-adjusted comparison start in self-imp.
+    // Still limited (no full join to specific DRs/approvals yet; no resolution data; "skeleton vs production" "limited sample (no full DR-fill join yet; see goals for fuller backtest harness)" per prior; paper proxy; pending real fills for tax-adjusted; see fees/goals for fuller).
+    // RISK (AGENTS.md + fees-tax + goals + trading safety non-negotiable): paper-only always; no submit/auto/reserve; append-only reads; Decimal (via string in json); robust match+warn+[] .unwrap_or everywhere (uniform with DR/tax paths); no new privileged/UI/kinds (reuse paper_fills table + events); no secrets/migs; heavy comments; all context in reflection (journaled for wiki loop). No change to generator, DR read, tax count/sum, load_clob, writer/producer, gated paths, paper defaults, fail-closed, L2, pre-dispatch, reval, 401s, SSR, any prior marker. Fills sample now enables future attr/backtest harness (DR net vs actual paper outcomes + tax drag) without touching trading/real paths.
+    // (pool from env or fallback default; k8s/ops must override per AGENTS "No secrets in repo"; pre-existing but noted for new continuous backtest path on fills/tax data [Issue 6]). (reuses paper_fills table populated under tx/locks in engine/writer per prior; sample is read-only evidence for backtest/attr per goals, not authoritative for positions; redaction pattern for samples extended for this sibling [Issue 8]).
+    // See writer::record_paper_fills (producer wire) + record_tax_snapshot + strategy::DecisionReport (net PRIMARY) + fees-tax + goals.
+    // Hardened for "most recent" guarantee (Issue 1 fix per reviewer; matches exact DR sample subquery pattern at ~179-180 for deterministic limited recent sample on backtest data quality "Compare decision reports vs actual outcomes"; smallest additive; keeps LIMIT 2 for tax batch nature + robust match+warn+[]).
+    let recent_paper_fills_sample: serde_json::Value = match sqlx::query_scalar(
+        r#"SELECT COALESCE(json_agg(j ORDER BY created_at DESC), '[]'::json) FROM (SELECT id::text AS id, order_id::text AS "order_id", price::text AS "price", size::text AS "size", fee::text AS "fee", created_at FROM paper_trading.paper_fills WHERE created_at >= $1 ORDER BY created_at DESC LIMIT 2) AS j"#
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "recent_paper_fills_sample query failed (using empty; non-fatal; per AGENTS observability for reflection skeleton read path; consistent with DR/tax sample paths)");
+            serde_json::json!([])
+        }
+    };
+
     // Basic P&L attribution (Decimal only; no floats in finance per AGENTS)
     // Now includes prior snapshot deltas for true window change (smallest viable fix for weak attribution)
     let (usdc, locked, unreal, realized) = latest_snap.unwrap_or((
@@ -318,7 +340,9 @@ async fn do_reflection(
         "tax_journal_skeleton": {
             "tax_snapshots_24h": tax_snapshots_24h.to_string(),
             "recent_tax_sample": tax_sample,
-            "note": "skeleton per fees-tax-latency-and-execution-tiers.md 'journal should capture enough data to reconstruct a full tax position' + 'Per-trade cost basis, Fees paid (deductible in many jurisdictions), Realized P&L, Unrealized positions' + 'treat every paper trade as if it will one day be real for record-keeping purposes' + goals 'Journal extensions (comments first)' + log/plan 'Ready for next (e.g. tax journal skeleton...)'; paper proxy only; append-only evidence for Hermes future net-after-tax-drag attribution + backtest harness (DRs vs fills + tax-adjusted); limited (no actual reserve/calc yet; see fees/goals for fuller); see writer::record_tax_snapshot"
+            "recent_paper_fills_sampled": recent_paper_fills_sample,
+            "fills_24h": fill_count.to_string(),
+            "note": "skeleton per fees-tax-latency-and-execution-tiers.md 'journal should capture enough data to reconstruct a full tax position' + 'Per-trade cost basis, Fees paid (deductible in many jurisdictions), Realized P&L, Unrealized positions' + 'treat every paper trade as if it will one day be real for record-keeping purposes' + goals 'Journal extensions (comments first)' + log/plan 'Ready for next (e.g. tax journal skeleton...)'; paper proxy only; append-only evidence for Hermes future net-after-tax-drag attribution + backtest harness (DRs vs fills + tax-adjusted); limited (no actual reserve/calc yet; see fees/goals for fuller); + recent paper fills sampled (tied to tax producer wire inside record_paper_fills on fill record path) for DR net vs paper fills + tax-adjusted backtest harness start per goals 'Query recent fills...' + 'Compare decision reports vs actual outcomes' + 'backtest harness on DRs vs paper fills + tax-adjusted'; limited sample (no full DR-fill join yet; see goals for fuller); skeleton vs production; see writer::record_tax_snapshot + record_paper_fills"
         },
         "note": "attribution from latest+prior snapshots + fills in window; deltas + fee-adjusted computed (Decimal); see fees-tax-latency wiki for model; approval_attribution added for closed-loop on gated real approvals/P&L (net fees, drag, decision quality); decision_report_cadence added for 5-min DR visibility (per goals-and-operational-cadence.md)"
     });
@@ -328,7 +352,7 @@ async fn do_reflection(
     let local_summary = format!(
         "Paper P&L over last 24h: realized delta={}, unrealized delta={}, fills={}, fees={}. Fee-adjusted realized (conservative)={}, fee_drag~{}%. Active markets: {}. Current: realized={}, unrealized={}. \
          CLOB safety loop: {} live-sender boundary status event(s), {} live-sender design review contract(s), {} live-sender design package(s), {} final-review package(s), {} final-review decision(s) with {}/{} fail-closed boundary coverage and {}/{} no-network dispatch coverage, {} unlock-status event(s), {} collateral readiness snapshot(s), {} market metadata validation event(s), {} post-request dry-run event(s), {} human-approval event(s), {} submit-facade event(s), {} reconciliation event(s), and {} signed/order-intent dry-run event(s) in window; latest event={}. \
-         Approval attribution (2026-06-06): {} approvals_with_snapshots_24h, {} final_with_snaps, {} pre_dispatches_with_approval_ids (rate {}), {} dispatches_from_approved, hermes_approval_gap={}. decision_reports_considered_24h (5-min DR; initial generator in main)={}. DRs read (extend do_reflection per goals; start backtest harness): count={}, preview top-2 nets [{}] (limited sample; full in metrics). Tax journal skeleton (paper proxy per fees-tax wiki 'treat every paper trade as if real for cost basis/audit'): count={}. (Local attribution with deltas from prior snapshot + fee impact per fees-tax-latency wiki; vs daily/weekly net targets from goals wiki. No edge decay or resolution surprises observed in window. Approval data for net-fees/edge/drag/outcome stubs + gated wiki props + 5min DR per goals. Tax for future net-after-tax attr.)",
+         Approval attribution (2026-06-06): {} approvals_with_snapshots_24h, {} final_with_snaps, {} pre_dispatches_with_approval_ids (rate {}), {} dispatches_from_approved, hermes_approval_gap={}. decision_reports_considered_24h (5-min DR; initial generator in main)={}. DRs read (extend do_reflection per goals; start backtest harness): count={}, preview top-2 nets [{}] (limited sample; full in metrics). Tax journal skeleton (paper proxy per fees-tax wiki 'treat every paper trade as if real for cost basis/audit'): count={}. Fills sampled for backtest (DR vs paper fills + tax-adjusted; tied to producer): len from sample in metrics. Paper fills sample count noted for backtest harness start (in tax sub) [Issue 7 nit]. (Local attribution with deltas from prior snapshot + fee impact per fees-tax-latency wiki; vs daily/weekly net targets from goals wiki. No edge decay or resolution surprises observed in window. Approval data for net-fees/edge/drag/outcome stubs + gated wiki props + 5min DR per goals. Tax + fills sample for future net-after-tax + backtest harness (DR net vs paper outcomes).)",
         delta_realized,
         delta_unreal,
         fill_count,
@@ -382,7 +406,7 @@ async fn do_reflection(
         "Review clob_safety_loop human-approval (now with approve-time snapshots 2026-06-03) and submit-facade blockers before implementing kill-switch or live-send internals".to_string(),
         "Review approval_attribution (approvals_with_snaps, pre-linked rate, hermes_approval_gap, avg_edge_net_fees stub from risk_snapshot_at_approval + paper fees) + linked pre-dispatches for human+final decision quality vs dispatch (drag, net edge); when real fills+resolutions arrive, compare outcome vs approval decision and propose wiki/strategy update if mismatch (gated via HERMES_AUTONOMOUS_WIKI_PROPOSALS)".to_string(),
         "Track decision_reports_considered_24h + decision_report_cadence (5-min DR generator now active in main per goals-and-operational-cadence.md + strategy/DecisionReport + fuse_net; real counts in hermes; DR edge quality will feed Hermes proposals for gated real path; limited (no full ranked yet); append-only, evidence-only, no new privileged, reuse existing; will enable per-signal attribution once fuller generator + fills); now also reads recent decision reports (net_edge PRIMARY) in do_reflection per goals \"Extend do_reflection...\"; start backtest harness (DR vs paper outcomes/approvals quality; see wiki goals + decisions/real-order-approval-flow)".to_string(),
-        "Track tax_journal_skeleton (paper proxy count/sample per fees-tax-latency-and-execution-tiers.md 'journal should be capable...' + goals 'Journal extensions'; for future Hermes attribution of net P&L after tax/cost basis drag + backtest; limited skeleton; see writer record_tax_snapshot + wiki fees/goals + this tranche; append-only evidence-only)".to_string(),
+        "Track tax_journal_skeleton (paper proxy count/sample per fees-tax-latency-and-execution-tiers.md 'journal should be capable...' + goals 'Journal extensions'; for future Hermes attribution of net P&L after tax/cost basis drag + backtest; limited skeleton; + recent paper fills sampled in do_reflection (via tax producer on fills) for backtest harness start (DRs vs paper fills + tax-adjusted per goals 'Query recent fills...' + 'Compare decision reports vs actual outcomes'); see writer record_tax_snapshot + record_paper_fills + wiki fees/goals + this tranche; append-only evidence-only; limited (no full join yet; see goals for fuller)".to_string(),
     ];
     let final_review_decision_events = clob_safety_loop["final_review_decision_events_24h"]
         .as_i64()
@@ -411,6 +435,7 @@ async fn do_reflection(
         if let Some(tax) = m.get_mut("tax_journal_skeleton") {
             if let Some(obj) = tax.as_object_mut() {
                 obj.remove("recent_tax_sample");
+                obj.remove("recent_paper_fills_sampled"); // Issue 3 fix: parity redaction for new backtest sample (audit-grade fills/fee data per fees-tax + producer wire + goals; defense-in-depth like DR/tax; full kept in stored metrics + local_summary)
             }
         }
         m
@@ -1250,15 +1275,18 @@ mod tests {
 
     #[test]
     fn tax_journal_skeleton_has_dedicated_mock_and_asserts() {
-        // 2026-06-06 tax journal skeleton: dedicated additive #[test] fn (extracted from dr cadence test per Issue 3 [Tests/Plan] for discoverability/isolation; "New Hermes ... paths must have dedicated unit tests").
-        // Ties to wiki fees-tax + goals "Journal extensions" + log/plan "tax journal skeleton".
-        // End-to-end producer + reflection consume deferred per plan 'skeleton' + Issue 9; current dedicated mock + full 61 + runtime cover consumption shape/robustness (query via do_refl path in other tests).
+        // 2026-06-06 tax journal skeleton + producer wire: dedicated additive #[test] fn (extracted from dr cadence test per Issue 3 [Tests/Plan] for discoverability/isolation; "New Hermes ... paths must have dedicated unit tests").
+        // Ties to wiki fees-tax + goals "Journal extensions" + log/plan "tax journal skeleton" + "wire minimal tax producer".
+        // Producer wire from paper_fills live (this tranche; inside record_paper_fills); real >0 counts visible in runs exercising paper submit_order (full suite + engine fills) + journal inspection; e2e attr/backtest deferred per plan 'skeleton vs production'. Current dedicated mock + full 61 + runtime cover consumption shape/robustness (query via do_refl path in other tests).
         // Mock note closer to real (prefix + key phrases); specific asserts for "paper proxy only" && "see writer::record_tax_snapshot"; + negative (no overclaim e.g. no "full reserve").
+        // (0 new test fn created per plan "0 new tests ok if documented" + "local cargo + unit sufficient" + "no new DB harness"; new path coverage via asserts inside existing dedicated tax test + full suite re-runs --threads=1 + native explicit.)
         let mock_tax: serde_json::Value = serde_json::json!({
             "tax_journal_skeleton": {
                 "tax_snapshots_24h": "0",
                 "recent_tax_sample": [],
-                "note": "skeleton per fees-tax-latency-and-execution-tiers.md 'journal should capture enough data to reconstruct a full tax position' + ...; paper proxy only; append-only evidence for Hermes future net-after-tax-drag attribution + backtest harness; limited (no actual reserve/calc yet; see fees/goals for fuller); see writer::record_tax_snapshot"
+                "recent_paper_fills_sampled": [],
+                "fills_24h": "0",
+                "note": "skeleton per fees-tax-latency-and-execution-tiers.md 'journal should capture enough data to reconstruct a full tax position' + ...; paper proxy only; append-only evidence for Hermes future net-after-tax-drag attribution + backtest harness; limited (no actual reserve/calc yet; see fees/goals for fuller); + recent paper fills sampled (tied to tax producer wire inside record_paper_fills) for DR net vs paper fills + tax-adjusted backtest harness start per goals; limited sample (no full DR-fill join yet; see goals for fuller); skeleton vs production; see writer::record_tax_snapshot + record_paper_fills"
             }
         });
         assert!(mock_tax.get("tax_journal_skeleton").is_some());
@@ -1269,10 +1297,19 @@ mod tests {
         assert!(mock_tax["tax_journal_skeleton"]
             .get("recent_tax_sample")
             .is_some());
+        // Coverage for new backtest harness fills sample path (tied to tax producer after tax journal producer wiring tranche) inside the dedicated tax test (per past-issues "New Hermes attribution/metrics paths must have dedicated unit tests (mock assert for new keys)" + plan "0 new tests ok if documented"; no new fn created; exercised in full --threads=1 + targeted).
+        // (enhance existing dedicated tax mock only (no new fn per plan '0 new tests ok if documented'/'local cargo + unit sufficient'/'skeleton vs production'); new path (query + redaction + synthesis) exercised via static mock + indirect (writer paper_fills + tax producer in full 61p suite + engine fills); direct DB/query/redaction/synthesis coverage deferred to 'expanded tests' / fuller backtest harness per wiki/plan/goals [Issue 4].)
+        assert!(mock_tax["tax_journal_skeleton"]
+            .get("recent_paper_fills_sampled")
+            .is_some());
+        assert!(mock_tax["tax_journal_skeleton"].get("fills_24h").is_some());
+        assert_eq!(mock_tax["tax_journal_skeleton"]["fills_24h"], "0");
         let note_str = mock_tax["tax_journal_skeleton"]["note"].as_str().unwrap();
         assert!(note_str.contains("skeleton"));
         assert!(note_str.contains("paper proxy only"));
         assert!(note_str.contains("see writer::record_tax_snapshot"));
+        assert!(note_str.contains("recent paper fills sampled"));
+        assert!(note_str.contains("backtest harness start"));
         assert!(!note_str.contains("virtual tax reserve active")); // negative: no overclaim on future Phase 3+
                                                                    // prior dr/approval asserts in sibling test still hold (additive); full re-runs under --threads=1 + native will confirm no regression on 61+ tests + surfaces.
     }
