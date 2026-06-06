@@ -167,6 +167,22 @@ async fn do_reflection(
             .await?;
     let clob_safety_loop = load_clob_safety_loop_snapshot(pool, period_start).await?;
 
+    // Extend `do_reflection` per wiki/strategies/goals-and-operational-cadence.md ("Extend `do_reflection` to also read recent decision reports" + "Query recent fills, portfolio snapshots, and all decision reports logged in the last hour" + "Compare decision reports (what the system \"wanted\" to do 5–60 min ago) vs. actual outcomes") + log top "Ready for next (e.g. start tax journal or backtest harness per wiki-tracked list in goals-and-operational-cadence.md + decisions/real-order-approval-flow + project-plan 'Ready for next / backtest')" + decisions/real-order-approval-flow + project-plan post-DR "Ready for next / backtest".
+    // Smallest start of backtest harness / actionable self-imp (Hermes + wiki first-class): direct sqlx read of recent 'decision_report' events (reuse existing journal.events jsonb, net_edge_after_fees PRIMARY per strategy/DecisionReport + goals 4-6% min net); limited sample (3) for attribution (ids + net + generated_by); include in metrics under decision_report_cadence + local_summary + lightly extend the track rec.
+    // Makes DR cadence data (now produced by main generator) consumable for P&L/edge quality vs paper fills/approvals in future reflections (backtest proxy: DR net vs realized outcome; per-signal later when fuller); still limited (no full ranked, no resolution data yet; "skeleton vs production" per prior; see goals for fuller).
+    // RISK (AGENTS.md + goals + fees-tax + strategy + trading safety non-negotiable): paper-only always; no submit/auto; append-only reads; Decimal (via string in json); robust .unwrap_or everywhere; no new privileged/UI/kinds (reuse events); no secrets/migs; heavy comments; all context in reflection (journaled for wiki loop). No change to generator, load_clob (count remains), gated paths, paper defaults, fail-closed, L2, pre-dispatch, reval, 401s, SSR, any prior marker.
+    // See strategy::DecisionReport + fuse_net ("PRIMARY signal..."); server for on-demand fuse; main produce for generator; writer record.
+    let recent_dr_count: i64 = clob_safety_loop["decision_reports_considered_24h"]
+        .as_i64()
+        .unwrap_or(0);
+    let recent_dr_sample: serde_json::Value = sqlx::query_scalar(
+        r#"SELECT COALESCE(json_agg(json_build_object('id', id::text, 'net_edge_after_fees', (payload #>> '{report,net_edge_after_fees}'), 'generated_by', payload->>'generated_by', 'created_at', created_at) ORDER BY created_at DESC), '[]'::json) FROM journal.events WHERE event_type = 'decision_report' AND created_at >= $1 LIMIT 3"#
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(serde_json::json!([]));
+
     // Basic P&L attribution (Decimal only; no floats in finance per AGENTS)
     // Now includes prior snapshot deltas for true window change (smallest viable fix for weak attribution)
     let (usdc, locked, unreal, realized) = latest_snap.unwrap_or((
@@ -243,7 +259,9 @@ async fn do_reflection(
         },
         "decision_report_cadence": {
             "decision_reports_considered_24h": clob_safety_loop["decision_reports_considered_24h"].as_i64().unwrap_or(0).to_string(),
-            "note": "5-min DR cadence (fused net edge primary per goals-and-operational-cadence.md + fuse_net in strategy/DecisionReport; initial generator active in main journals 'decision_report'; still limited (no full ranked/risk filters; see goals + server strategy candidates); orthogonal to approval queue per goals but DR edge quality will feed Hermes proposals for gated real path; append-only, evidence-only, no new privileged, reuse existing"
+            "recent_decision_reports_sampled": recent_dr_sample,
+            "recent_dr_count": recent_dr_count.to_string(),
+            "note": "5-min DR cadence (fused net edge primary per goals-and-operational-cadence.md + fuse_net in strategy/DecisionReport; initial generator active in main journals 'decision_report'; still limited (no full ranked/risk filters; see goals + server strategy candidates); orthogonal to approval queue per goals but DR edge quality will feed Hermes proposals for gated real path; append-only, evidence-only, no new privileged, reuse existing; now reads recent decision reports (extend do_reflection per goals) for attribution/backtest start (DR net vs paper outcomes/approvals)"
         },
         "note": "attribution from latest+prior snapshots + fills in window; deltas + fee-adjusted computed (Decimal); see fees-tax-latency wiki for model; approval_attribution added for closed-loop on gated real approvals/P&L (net fees, drag, decision quality); decision_report_cadence added for 5-min DR visibility (per goals-and-operational-cadence.md)"
     });
@@ -253,7 +271,7 @@ async fn do_reflection(
     let local_summary = format!(
         "Paper P&L over last 24h: realized delta={}, unrealized delta={}, fills={}, fees={}. Fee-adjusted realized (conservative)={}, fee_drag~{}%. Active markets: {}. Current: realized={}, unrealized={}. \
          CLOB safety loop: {} live-sender boundary status event(s), {} live-sender design review contract(s), {} live-sender design package(s), {} final-review package(s), {} final-review decision(s) with {}/{} fail-closed boundary coverage and {}/{} no-network dispatch coverage, {} unlock-status event(s), {} collateral readiness snapshot(s), {} market metadata validation event(s), {} post-request dry-run event(s), {} human-approval event(s), {} submit-facade event(s), {} reconciliation event(s), and {} signed/order-intent dry-run event(s) in window; latest event={}. \
-         Approval attribution (2026-06-06): {} approvals_with_snapshots_24h, {} final_with_snaps, {} pre_dispatches_with_approval_ids (rate {}), {} dispatches_from_approved, hermes_approval_gap={}. decision_reports_considered_24h (5-min DR; initial generator in main)={}. (Local attribution with deltas from prior snapshot + fee impact per fees-tax-latency wiki; vs daily/weekly net targets from goals wiki. No edge decay or resolution surprises observed in window. Approval data for net-fees/edge/drag/outcome stubs + gated wiki props + 5min DR per goals.)",
+         Approval attribution (2026-06-06): {} approvals_with_snapshots_24h, {} final_with_snaps, {} pre_dispatches_with_approval_ids (rate {}), {} dispatches_from_approved, hermes_approval_gap={}. decision_reports_considered_24h (5-min DR; initial generator in main)={}. DRs read (extend do_reflection per goals; start backtest harness): count={}, sampled net edges for quality vs paper fills/approvals. (Local attribution with deltas from prior snapshot + fee impact per fees-tax-latency wiki; vs daily/weekly net targets from goals wiki. No edge decay or resolution surprises observed in window. Approval data for net-fees/edge/drag/outcome stubs + gated wiki props + 5min DR per goals.)",
         delta_realized,
         delta_unreal,
         fill_count,
@@ -287,7 +305,8 @@ async fn do_reflection(
         clob_safety_loop["approval_to_pre_dispatch_rate"].as_str().unwrap_or("0.00"),
         clob_safety_loop["dispatches_from_approved_24h"].as_i64().unwrap_or(0),
         clob_safety_loop["hermes_approval_gap"].as_i64().unwrap_or(0),
-        clob_safety_loop["decision_reports_considered_24h"].as_i64().unwrap_or(0)
+        clob_safety_loop["decision_reports_considered_24h"].as_i64().unwrap_or(0),
+        recent_dr_count
     );
     let mut local_recs = vec![
         "Continue paper-only until explicit human gate (per AGENTS.md)".to_string(),
@@ -303,7 +322,7 @@ async fn do_reflection(
         "Track clob_live_sender_boundary_status to ensure the only live-sender implementation remains fail-closed before network dispatch".to_string(),
         "Review clob_safety_loop human-approval (now with approve-time snapshots 2026-06-03) and submit-facade blockers before implementing kill-switch or live-send internals".to_string(),
         "Review approval_attribution (approvals_with_snaps, pre-linked rate, hermes_approval_gap, avg_edge_net_fees stub from risk_snapshot_at_approval + paper fees) + linked pre-dispatches for human+final decision quality vs dispatch (drag, net edge); when real fills+resolutions arrive, compare outcome vs approval decision and propose wiki/strategy update if mismatch (gated via HERMES_AUTONOMOUS_WIKI_PROPOSALS)".to_string(),
-        "Track decision_reports_considered_24h + decision_report_cadence (5-min DR generator now active in main per goals-and-operational-cadence.md + strategy/DecisionReport + fuse_net; real counts in hermes; DR edge quality will feed Hermes proposals for gated real path; limited (no full ranked yet); append-only, evidence-only, no new privileged, reuse existing; will enable per-signal attribution once fuller generator + fills)".to_string(),
+        "Track decision_reports_considered_24h + decision_report_cadence (5-min DR generator now active in main per goals-and-operational-cadence.md + strategy/DecisionReport + fuse_net; real counts in hermes; DR edge quality will feed Hermes proposals for gated real path; limited (no full ranked yet); append-only, evidence-only, no new privileged, reuse existing; will enable per-signal attribution once fuller generator + fills); now also reads recent decision reports (net_edge PRIMARY) in do_reflection per goals \"Extend do_reflection...\"; start backtest harness (DR vs paper outcomes/approvals quality; see wiki goals + decisions/real-order-approval-flow)".to_string(),
     ];
     let final_review_decision_events = clob_safety_loop["final_review_decision_events_24h"]
         .as_i64()
@@ -1116,5 +1135,20 @@ mod tests {
         assert_eq!(mock_clob["decision_reports_considered_24h"], 0);
         assert!(mock_clob.get("note").is_some());
         // mock for key presence only (mirrors approval attr test); real load_clob_safety_loop_snapshot uses DB COUNT (robust .unwrap_or(0) uniform) post-generator at hermes runtime; dedicated test + re-runs green; full cargo exercises hermes unit paths + server/ui (no new DB harness per plan "smallest hermes-only" + "local cargo + unit sufficient"); generator/journal real paths via manual + runtime + journal inspection. See Issue 4/12 review fixes + plan.
+        // 2026-06-06 continuation (new DR read path in do_reflection): dedicated mock assert for new Hermes attribution/metrics path (recent decision reports read per "Extend do_reflection" + backtest start); per past-issues briefing requirement for new paths.
+        let mock_dr_read: serde_json::Value = serde_json::json!({
+            "decision_report_cadence": {
+                "recent_decision_reports_sampled": [{"id":"11111111-1111-1111-1111-111111111111","net_edge_after_fees":"0.0123","generated_by":"5min_dr_cadence_in_main"}],
+                "recent_dr_count": "1",
+                "note": "now reads recent decision reports (extend do_reflection per goals) for attribution/backtest start"
+            }
+        });
+        assert!(mock_dr_read.get("decision_report_cadence").is_some());
+        assert!(mock_dr_read["decision_report_cadence"]
+            .get("recent_decision_reports_sampled")
+            .is_some());
+        assert!(mock_dr_read["decision_report_cadence"]
+            .get("recent_dr_count")
+            .is_some());
     }
 }
