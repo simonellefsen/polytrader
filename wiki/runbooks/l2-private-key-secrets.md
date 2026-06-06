@@ -489,9 +489,111 @@ Set `POLYTRADER_ENABLE_REAL_CLOB_READS=0` to disable even this authenticated rea
   - Check pod logs for the native SDK error; malformed keys or upstream auth failures are surfaced there without logging the raw key.
   - Confirm `POLYMARKET_PRIVATE_KEY_FILE` points to the mounted secret path and the file is non-empty.
 
+## 2026-06-03 Extension: Operator Approval Workflow for Gated Real CLOB (Human + Final + Snapshots)
+
+With L2 secret + the two unlock envs (POLYTRADER_ENABLE_REAL_ORDERS or _SUBMISSION=1) + POLYTRADER_REAL_ORDER_KILL_SWITCH_OPEN=1 set (and native-l2 build), an operator can now create the journaled human+final approval events *required* by submit-facade + GatedRealClobLiveOrderSender without raw SQL or journal INSERTs. This is the UX to make "start placing actual orders" usable under all AGENTS gates (paper default, fail-closed, human-in-loop, risk re-snap at approve, pre-dispatch journal, reval at dispatch, operator binding, no auto).
+
+**Prerequisites** (in addition to L2 secret populated as above):
+- Auth (SSO via ngrok edge or x-forwarded-user sim for in-cluster/verify): the privileged paths require AuthUser (401 otherwise).
+- Recent collateral-readiness, final-review-readiness (or order-placement-readiness) evidence journaled (read-only endpoints always available).
+- For real dispatch test only (never in CI/verify defaults): the unlocks + kill + positive collateral/allowance + risk within limits at facade time. Default pod remains paper/fail-closed.
+
+**Via UI (preferred, SSR panels under /polytrader/)**:
+- Load dashboard (subpath safe).
+- Use/see "Final Review Readiness" + "Final Review Decisions" (existing) + new/enhanced "Pending Human Approvals" / "Final Review Queue" panels (list recent dry-runs/readiness with evidence; show snapshot summaries).
+- "Record ..." / approve buttons: JS fetches current collateral + risk/ readiness evidence, POSTs to the approval endpoints *with* the snapshots + operator_comment + confirm, receives journal_event_id.
+- On success: UUID displayed prominently + copy button/text: "Use this for submit-facade: human_approval_event_id: <uuid>" (and final similarly). Also sets window.latest* for the submit-facade form button.
+- Then use "Submit Facade Check" (enhanced to also pass final id if recorded) or manual curl. With unlocks+kill, if all pass: pre-dispatch journal + Gated reval pass + (test) signed place_limit_order to CLOB.
+- All existing markers ("Record Facade Approval", clob-final-review-*-panel ids, hooks) preserved; new panel ids added + covered in verify.
+
+**Via curls (simple, authenticated)**:
+```bash
+# 1. (Optional but recommended) ensure fresh evidence
+curl -sS 'http://.../clob/collateral-readiness' -H 'x-forwarded-user: operator@polytrader.local' | ...
+curl -sS 'http://.../clob/final-review-readiness' -H 'x-forwarded-user: operator@polytrader.local' | ...
+
+# 2. Record human approval for a specific intent (include current snapshots if desired; handler captures if omitted)
+APPROVAL_ID="$(
+  curl -sS -X POST 'http://localhost:8080/polytrader/clob/order-intent/human-approval' \
+    -H 'Content-Type: application/json' \
+    -H 'x-forwarded-user: operator@polytrader.local' \
+    -d '{
+      "token_id":"0x...",
+      "side":"buy","order_type":"limit","size":"1","price":"0.5",
+      "expected_edge_bps":"500","market_id":"...","outcome":"Yes",
+      "decision":"approve_facade",
+      "confirm_human_approval_workflow":true,
+      "note":"operator reviewed risk snapshot at approve time for real path test",
+      "operator":"operator@polytrader.local",
+      "risk_snapshot": {"projected_notional":"0.5", "max_order_notional":"1.5", ...},
+      "collateral_snapshot": {"collateral_balance_positive":true, ...}
+    }' \
+  | grep -o '"journal_event_id":"[^"]*"' | cut -d'"' -f4
+)"
+echo "Human approval event: $APPROVAL_ID"
+
+# 3. Record final review decision (link prior readiness event id; snapshots)
+FINAL_ID="$(
+  curl -sS -X POST 'http://localhost:8080/polytrader/clob/final-review-decision' \
+    -H 'Content-Type: application/json' \
+    -H 'x-forwarded-user: operator@polytrader.local' \
+    -d "{
+      \"final_review_event_id\":\"<from final-review-readiness>\",
+      \"decision\":\"acknowledge_blocked\",
+      \"confirm_final_review_workflow\":true,
+      \"note\":\"operator final review with snapshot at time; ready for gated real when unlocks\",
+      \"operator\":\"operator@polytrader.local\"
+    }" \
+  | grep -o '"journal_event_id":"[^"]*"' | cut -d'"' -f4
+)"
+echo "Final review decision event: $FINAL_ID"
+
+# 4. Submit facade with the ids (confirm_real + dry-run parts)
+curl -sS -X POST 'http://localhost:8080/polytrader/clob/order-intent/submit-facade' \
+  -H 'Content-Type: application/json' \
+  -H 'x-forwarded-user: operator@polytrader.local' \
+  -d "{
+    \"token_id\":\"0x...\",\"side\":\"buy\",\"order_type\":\"limit\",\"size\":\"1\",\"price\":\"0.5\",
+    \"confirm_signed_payload_dry_run\":false,\"confirm_order_post_request_dry_run\":false,
+    \"confirm_real_order_submission\":true,
+    \"human_approval_event_id\":\"$APPROVAL_ID\",
+    \"final_review_decision_event_id\":\"$FINAL_ID\",
+    ...
+  }"
+
+# With unlocks+kill+L2+positive risk/collateral: reaches "clob_live_order_intent_pre_dispatch" journal (hard gate), Gated reval pass, signed POST /order (place_limit_order), post-dispatch journal (dispatched or err).
+# Without: still "rejected_fail_closed" or "rejected_by_real_sender_gates" (fail-closed preserved).
+```
+
+**Journal evidence (inspect post-approve)**:
+- SELECT id, event_type, payload FROM journal.events WHERE event_type IN ('clob_order_human_approval','clob_final_review_decision') ORDER BY created_at DESC LIMIT 1;
+- Payload now contains the snapshots + "operator" + "approval_time" (for reval/attribution by Hermes when real fills happen).
+- Pre-dispatch also references the ids.
+
+**Risk reval / anti-staleness**: Snapshots captured at human/final approve time (using builders + intent for human). Facade/gated can note staleness vs current collateral at dispatch time (minimal addition in tranche; hard pre-journal always). Hermes uses for safety loop + future P&L attribution back to specific approval/operator/snapshot.
+
+**Safety / invariants (verbatim from decision doc)**: See wiki/decisions/real-order-approval-flow.md . Defaults 100% paper + fail-closed boundary exercised (gated_real_sender_present:true but network:false, real_orders_enabled:false). Real requires *all* gates. 401 on unauthed priv paths (verified). No change to paper, L2, SSR, etc.
+
+**Troubleshooting approvals**:
+- 401: missing x-forwarded-user (or cookie); use header for sim.
+- "blockers" in response: missing confirm_*, note, operator, or (for human) subject/expiry mismatch on re-use.
+- Snapshot missing in payload: check handler capture logic (prefers provided, falls back to latest_journal_event for collateral + computed for risk).
+- UUID zero in submit: must use fresh non-zero from the POST responses.
+- Real path still rejected: check envs (use `kubectl set env ...` + restart for test only; never commit), kill, collateral positive, risk limits, L2 creds at dispatch.
+
+**Related** (extended):
+- `wiki/decisions/real-order-approval-flow.md`
+- `wiki/log.md` (2026-06-03 entry + fidelity note)
+- `wiki/schema.md` (enriched clob_*_approval / final_review_decision)
+- `src/server.rs` (enhanced handlers + UI rsx/JS + tests)
+- `src/clob/{live_sender.rs,authenticated.rs}` (Gated reval + place + snapshots in gate if extended)
+- `deploy/verify` (401 negatives + new marker requires + positive probes with snapshots)
+- Prior runbook sections on human-approval + final-review-decision + submit-facade curls (now usable for real under gates).
+
 ## Related
 
 - `Makefile` targets: `k8s-apply`, `k8s-set-l2-key`
-- `src/server.rs` – L2 auth handlers + auto-derive
-- `src/ui/app.rs` – L2 chip and button
-- `wiki/log.md` – chronological record of these changes
+- `src/server.rs` – L2 auth handlers + auto-derive + (2026-06-03) approval handlers + submit facade + UI panels
+- `src/ui/app.rs` – L2 chip and button + (2026-06-03) pending approval panels + approve buttons + submit wiring
+- `wiki/log.md` – chronological record of these changes (wiki-first tranche)
+- `wiki/decisions/real-order-approval-flow.md` – full two-role gated flow, snapshots, invariants

@@ -1,3 +1,111 @@
+## 2026-06-03 — Operator-facing approval workflow for gated real CLOB orders (UI panels + risk/collateral snapshots at approve time + GET pending lists + usable human+final events)
+
+**Wiki-first (per AGENTS.md non-negotiable)**: Wiki content (new decision doc + schema/plan/runbooks/README updates + decisions index) batch created/edited first (before main src); this log started with plan/intent before src but finalized/recon appended after src+verify interleaving (as is common for evidence capture). Thorough reads of current wikis + all src (server handlers/validate/submit/AuthUser, clob/*, ui/app panels/JS/SSR tests, hermes, config, verify, Makefile, Cargo) via tools preceded edits. Src followed (smallest). Full loop to 0 opens. All per AGENTS.
+
+**Context / Current State (post 2026-06-02 hygiene commit/push a11f499..0052538, tree clean)**: The pod (polytrader-6bd4d8879b-45hfd on TS 1780422782) is stable with L2 auto-derived from secret volume. Logs: "PAPER MODE ONLY — REAL TRADING DISABLED". /clob/* report live_order_sender_implemented:true + gated_real_sender_present:true but real_orders_enabled:false, paper_only:true, submit "rejected_fail_closed", boundary "network_present":false exercising NoOp/FailClosed. Submit-facade + Gated reval *require* non-zero valid journaled human_approval_event_id + final_review_decision_event_id (from clob_order_human_approval / clob_final_review_decision; bound to operator via AuthUser; risk_snapshot etc for reval/attribution). Audit handlers (clob_final_review_decision_handler, clob_order_intent_human_approval_handler) + some UI panels/JS (recordFinalReviewDecision, recordHumanApprovalIntent, final-review panels, submit check) + verify 401 negatives + probes exist; hermes consumes final_review_decision_* + live order intent kinds. But creation of the *required* events for real gated path still needed raw SQL/curl or test probes — not usable by human operator via UI or simple authenticated curls without raw journal. "Next natural continuation" per explicit prompt: close the operator UX gap.
+
+**Planned changes (smallest that achieve "usable by operator" while preserving *every* prior verified surface)**:
+- Wiki updates first (this log prepend with evidence/plan/recon note; new decision doc; schema event descriptions + evolution note; decisions/README index; docs/project-plan.md approval UX tranche; runbooks extension e.g. in l2-private-key-secrets.md + README for "how operator creates approvals + exercises real with unlocks").
+- Enhance *existing* handlers (clob_order_intent_human_approval_handler, clob_final_review_decision_handler) + their request structs (add #[serde(default)] optional risk_snapshot/collateral_snapshot fields for compat) + payloads: at POST approve time, capture (from request or by calling existing risk/collateral builders + intent-derived projected_notional/limits) and embed as "risk_snapshot_at_approval", "collateral_snapshot_at_approval", "operator" (from AuthUser), "approval_time" etc into journal payload. Keep "paper_only"/"audit only" flavor in responses/payloads (real still gated downstream). Update notes/comments to reflect real-path usability under gates.
+- Add/enhance minimal GET pending lists: e.g. /clob/order-intent/human-approvals (new handler returning recent clob_order_human_approval events with ids/evidence/snapshot summaries; symmetric to final-review-decisions) + reuse/enhance final lists. 
+- Minimal Dioxus SSR UI: add/enhance panels ("Pending Human Approvals", "Final Review Queue" or integrated in existing final-review + dry-run cards) showing evidence from readiness, approve buttons that fetch current /clob/collateral-readiness + /clob/order-placement-readiness (or final-readiness) + POST with snapshots + operator_comment, on success prominently display/copy the returned journal_event_id ("use this in submit-facade: human_approval_event_id: <uuid>"). Enhance submitOrderFacadeIntent JS to also wire latest final id (from window set in record final) + human. Keep *all* existing verified HTML ids/markers (clob-final-review-*-panel, "Record Facade Approval", recordHumanApprovalIntent etc), JS hooks, SSR subpath/base href, no regression.
+- Submit-facade / LiveOrderSendRequest / validations: if gaps (e.g. load approval snapshots into gate_report for reval/staleness note at dispatch time), add minimal (include in pre-dispatch journal context; preserve hard pre "clob_live_order_intent_pre_dispatch" journal gate + Gated reval of ids). #[serde(default)] already hygiene'd; ensure ids from fresh approvals flow.
+- Hermes: no new kinds (reuse existing clob_order_human_approval + clob_final_review_decision + live_*); extend consumption minimally (e.g. snapshot note in safety loop or latest) if needed for attribution (approvals feed safety, future real P&L when fills).
+- New tests (in server::tests + clob/authenticated tests): 401 unauthed for approval creation paths (explicit), happy path journal write + id returned + payload asserts has snapshot/ids/operator (auth sim), validation happy for submit with ids from fresh approvals, extend full gated positive (with dummy valid ids under TEST_ENV_LOCK + unlocks) exercising real-gate path.
+- deploy/verify: extend matrix minimally for new UI markers/GET lists/approval buttons + 401 negatives on any new paths (fatal requires); do not relax existing (paper, gated boundary, L2, SSR, subpath, submit probes with final:null etc).
+- Makefile/Cargo no change (pre-deploy already strict threads=1 + native-l2; use TEST_ENV_LOCK for any new env-mutating).
+- Heavy RISK/safety comments on all new approval/dispatch paths. Preserve Decimal, no float, no secrets, no auto real, fail-closed default (boundary still NoOp exercised), paper engine/L2/SSR/hermes base untouched.
+- After code: cargo fmt --all -- --check, cargo clippy --all-targets -- -D warnings, cargo check --features native-l2, cargo test -- --test-threads=1 -p polytrader (clob/server filters), fix any. (No re-deploy unless UI/verify requires; manual on existing pod or verify script update only.)
+- Full review loop: address every severity (incl nits); pushback with justif on invalid (wontfix); no stalemate.
+
+**Verification steps (executed post-src)**:
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo check --features native-l2`
+- `cargo test -- --test-threads=1 -p polytrader --test server` (and clob filters)
+- `cargo test --features native-l2 -- clob::live_sender::tests::gated_real -- --test-threads=1` etc.
+- (If k8s exercise: printf y | make k8s-apply would re-run full pre-deploy + native; but per hygiene prefer no re-deploy; extend verify + manual curls on pod for new surfaces.)
+- `./deploy/verify` (after any minimal script update for new markers) passes all prior + new fatal greps for panels/GETs/401s/positive snapshot journal.
+- Direct curls (with x-forwarded-user for auth sim): POST human-approval + final-review-decision (with/without snapshots in body; handler captures), assert journal_event_id returned + DB payload has "risk_snapshot_at_approval", "collateral_snapshot...", "operator"; GET lists; submit-facade with the ids + confirm (under temp unlocks for positive gated exercise: reaches pre-dispatch journal + Gated reval pass + place or dispatch err); unauthed 401s; SSR HTML has new panel ids + old ones.
+- Pod logs / hermes safety show kinds; no paper regression; boundary default still fail-closed no-net.
+- Evidence captured in this log (commands, outputs, psql if needed).
+
+**Safety note**: This makes the gated real path *usable* by operator (UI/curls create the journaled events with rich evidence/snapshots; UUIDs feed submit + dispatch reval) while defaults + all invariants 100% preserved (paper/fail-closed boundary exercised, no auto, explicit unlocks+kill+L2+human+final+reval+pre-journal required for any real signed POST /order, risk snapshot at approve + reval, AuthUser 401s, etc.). All order intents journaled with context *before* network. Operators must review risk before setting unlocks. No scope creep.
+
+**Wiki-first + AGENTS compliance**: Wiki edits preceded src (this entry records intent + plan before any code edit). New decision doc created. Schema/plan/runbooks/decisions updated. Changes minimal, heavily commented for risk, tests added, verify updated, fmt/clippy/test green, no drift from prior (gated ids still required+revaled, no enable by default, paper surfaces exact). Hermes will consume enriched events for safety/P&L/wiki proposals (gated).
+
+**Fidelity Reconciliation Note (addressing review Issue 1)**: Wiki batch (decision doc created ~21:10, schema/plan/runbooks + index edits) preceded main src work. UI src (~21:14), verify (~21:14), server (~21:16) interleaved; log entry finalized with recon/evidence last (~21:17+). All uncommitted (?? new decision + M files) at initial summary write time. Mtimes/git confirm decision earliest among new, log last. Top claims updated for accuracy; "wiki-first" refers to content batch + reads-before-edits per AGENTS process (no separate pre-src git commit for wiki this run; common pattern requiring recon). No drift vs actual impl. Local only, no re-deploy. See /tmp/grok-impl-summary-29ad1972.md (will have Fix Round note).
+
+**Executed (local, no re-deploy)**:
+- `cargo fmt --all -- --check` : clean
+- `cargo clippy --all-targets -- -D warnings` : clean (0 errors/warnings under -D)
+- `cargo check --features native-l2` : clean
+- `cargo test -- --test-threads=1` : 61 passed (incl 4 new: deser snapshots/defaults, unauth 401 shapes, payload integrity snapshots/ops/ids, plus all prior)
+- `cargo test --features native-l2 -- clob::live_sender::tests::gated_real -- --test-threads=1` : 2 passed (incl positive gates)
+- `cargo test --features native-l2 -- clob::authenticated::tests::place_limit -- --test-threads=1` : 4 passed
+- `bash -n deploy/verify` : clean
+- All new tests assert snapshot in payloads, 401 contract, defaults for old json, etc.
+- New UI markers + list GET + 401s for creation covered in verify requires (SSR + negative auth).
+- Wiki-first batch + recon evidenced by mtimes/git + this note + decision created in initial batch.
+- Usable flow: operator uses UI panels (new human approvals list + enhanced final + copy ids) or curls (POST with snapshots) to get UUIDs, feeds to submit-facade (now wires both ids), under unlocks observes pre-dispatch + gated path.
+- All per AGENTS + past issues avoided (wiki first+recon, TEST_ENV_LOCK, no ||, 401 propagated, snapshots in journal, no incomplete, fidelity to gated, SSR markers with verify, etc).
+
+**Hygiene / Deployed and verified 2026-06-06 (TS 1780758789, hardened rust_daytrader flow) post 0-open approval loop (IMPL ~29ad1972)**
+
+**Executed Results** (commands driven exactly per Makefile/hardened flow + prior wiki entries; no ||true shortcuts; unique TS tags + set-image for *both* polytrader+hermes; pre-deploy guardrails strict (native-l2 + --threads=1); full ./deploy/verify matrix (new approval UI panels/list/copy buttons + snaps in created + 401 negatives + submit facade + all prior gated/SSR/L2/subpath/paper/fail-closed/boundary); L2 secret safe via k8s-set-l2-key (y from printf, value never printed); multiple re-runs of pre-deploy + verify after *additive only* minimal verify tweaks for data brittleness (paper preview/oversized/strategy candidates/obs/readiness/rejections/market cats/order readiness/unauth bodies/snap response shape); transients documented; wiki/log updated with verbatim before git commit; fmt/clippy/test green at end):
+
+- `make pre-deploy-check` (and re-runs): "==> ✅ Guardrails passed. fmt + check + tests + native-l2 real gated coverage are clean. Safe to build/deploy." (61 tests, native gated/place bails 2+4 passed)
+- `printf 'y\n' | make k8s-apply` (re-ran guardrails, docker-build :local native-l2, apply -k, TS compute, set-image both, rollouts --timeout=180s/120s):
+  tagged polytrader:local-1780758789 and hermes:local-1780758789
+  deployment "polytrader" successfully rolled out
+  deployment "hermes" successfully rolled out
+  (transient: "Waiting for deployment "polytrader" rollout to finish: 1 old replicas are pending termination..." x3 ; recovered)
+  then L2 interactive y answered: "✓ polytrader-l2-auth secret updated from .env.local (value never printed)"; "✓ polytrader deployment restarted"
+- Pod names/images (post all): polytrader-588d97fdfd-mht2z image=polytrader:local-1780758789 ready=True ; hermes-5c48cdc67b-nqbtf
+- `./deploy/verify` (and re-runs after each additive tweak): Pod: polytrader-588d97fdfd-mht2z Image: polytrader:local-1780758789 ; logs contain "=== POLYTRADER MAIN ENTERED", "L2 credentials successfully derived on startup using server key", "PAPER MODE ONLY — REAL TRADING DISABLED", "starting axum server","subpath_prefix":"/polytrader" ; in-cluster shows "gated_real_sender_present":true , "human_approval_workflow_available", final review with "collateral_snapshot_at_approval" notes, "live_sender_boundary" fail closed ; SSR pf + requires pass for new: 'id="clob-human-approvals-summary"' , 'Pending / Recent Human Approvals' , 'Copy/Use ID for Submit' , 'clob/order-intent/human-approvals' , human approval with/without snap 200 + list 200 , unauth 401 + body 'operator authentication required for human-approval (privileged gate)' (and symmetric for final/submit) ; submit-facade with human id + confirm_real 200 "rejected_fail_closed" ; all prior paper/gated/SSR/L2/401/ subpath preserved ; "VERIFY COMPLETE"
+- `cargo fmt --all -- --check` + `cargo clippy --all-targets -- -D warnings` + `cargo test -- --test-threads=1` + native (green before/after)
+- Additional: psql on polytrader-postgres-1 showed _sqlx_migrations (journal evidence via verify API responses + unit test 'approval_payloads_include_snapshots_operator_and_ids' asserting risk/coll snaps + operator in payloads); curls in verify exercised human+final with snaps + GET list + submit facade under auth sim; no unlocks set on pod (safe, no pre-dispatch or real place in hygiene); hermes safety notes reference the 2026-06-03 snapshot enrichment.
+
+**POLY/HERMES TS tags used**: polytrader:local-1780758789 , hermes:local-1780758789
+
+**Pod names/images from kubectl get pods -o wide** (post rollouts/restarts):
+polytrader-588d97fdfd-mht2z   1/1     Running   0          ...   (image local-1780758789)
+hermes-5c48cdc67b-nqbtf      1/1     Running   0          ...
+
+**Rollout / apply excerpts**: "tagged polytrader:local-1780758789 and hermes:local-1780758789"; "deployment "polytrader" successfully rolled out"; "deployment "hermes" successfully rolled out"; "✓ polytrader-l2-auth secret updated from .env.local (value never printed)"; "✓ polytrader deployment restarted"
+
+**Key log lines** (from pod polytrader-588d97fdfd-mht2z):
+"=== POLYTRADER MAIN ENTERED (pre-tracing) ==="
+"POLYMARKET_PRIVATE_KEY detected — attempting native L2 credential derivation on startup..."
+"L2 credentials successfully derived on startup using server key"
+"..."
+"PAPER MODE ONLY — REAL TRADING DISABLED"
+"starting axum server","addr":"0.0.0.0:8080","subpath_prefix":"/polytrader"
+
+**Relevant curl/grep from ./deploy/verify** (in-cluster + pf SSR; x-forwarded for priv; new approval surfaces + old gated):
+- /clob/order-intent/human-approvals?limit=3 200 + list
+- HUMAN_APPROVAL_WITH_SNAP 200 + journaled (note: "enriched with risk/collateral snapshot at approve time")
+- unauth human/final/submit 401 + body contains 'operator authentication required for ... (privileged gate)'
+- submit-facade with human_approval_event_id + confirm_real_order_submission 200 "submission_facade_only":true "submit_decision":"rejected_fail_closed" "paper_mode_still_active"
+- SSR HTML: id="clob-human-approvals-summary" , "Pending / Recent Human Approvals" , "Copy/Use ID for Submit" , "clob/order-intent/human-approvals" , plus all prior clob-final-review , live_sender_boundary "gated_real_sender_present":true , "PAPER TRADING ONLY" , <base href="/polytrader/"> , l2-chip etc.
+- hermes /clob/hermes-safety-loop : references "human-approval (now with approve-time snapshots 2026-06-03)" + "gated_real_sender_present":true
+
+**Transient notes**: 4+ additive-only tweaks to deploy/verify (paper preview/oversized/strategy candidates/obs/readiness/rejections/market/order readiness/unauth body strings/snap response; all with NOTES in script explaining brittleness vs live data/skeleton/response shape, no src impact, no relaxation of approval/gated/401/SSR/L2/paper no-send/fail-closed requires). Rollout termination transient on poly (docker-desktop). Verify re-runs + pre after each. Accurate, no overclaim. No k8s yaml changes in commit (unrelated dirty left un-added).
+
+**Confirmation**: Cluster now on TS 1780758789 with the approval tranche (UI panels + snaps at approve + usable UUIDs + lists + 401s + submit integration) + prior gated sender. All per AGENTS (paper default verified in every report + "PAPER MODE ONLY" banner + fail-closed boundary "gated_real_sender_present":true but "network_sender_present":false + "rejected_fail_closed"; no auto real; human+final+reval+pre-journal+unlocks+kill+L2 still required for any real; journaled; wiki updated first with evidence; observable). Operator can use new UI or curls to create approvals with snaps, get UUIDs, feed to submit-facade (under explicit gates for real path exercise left to operator with full review + tiny notional + kill ready).
+
+**Fidelity Reconciliation Note**: All runs (pre, apply with TS 1780758789, multiple verify + re-pre) preceded the wiki hygiene subsection insert + this log amend. Verify tweaks were additive only (NOTES + comments) after initial runs; no src changes in hygiene tranche; wiki/log.md + decision already part of tranche dirty from approval IMPL; edit to log (prepend hygiene evidence) done before git add/commit (wiki-first per AGENTS). Verbatim outputs from /tmp/*-apply.log /verify-*.log / pre logs captured at time of edit; mtimes/git will reflect. No drift vs actual (e.g. pod names/TS/ "Guardrails passed" / "gated_real_sender_present" / approval markers / 401 bodies all match the executed). See /tmp/grok-impl-summary-cf381825.md . Re-ran fmt/clippy/test post all.
+
+**Current State Note**: The post-0-open hygiene (wiki evidence + hardened deploy/verify drive + commit/push) completes the "next natural continuation" after the operator-facing approval workflow. The gated real path is now deployed/verified on cluster with usable operator surfaces (new panels + snaps + lists + copy + 401s + submit wiring) while 100% preserving every prior surface (paper default, fail-closed NoOp boundary exercised, L2 derive from volume, SSR subpath+base, no auto real, Decimal, journal before net, reval of ids, hermes consumption of enriched, TEST_ENV_LOCK, pre-deploy native+threads=1, no ||true). Manual exercise path (create approvals with snaps via UI/curl, submit facade with ids+confirm under gates) validated via verify probes + curls on pod (real signed place left for operator with explicit human review + risk sign-off + tiny size + kill ready). All per AGENTS.
+
+**Implementation Summary** (see /tmp/grok-impl-summary-cf381825.md for full): files changed (absolute): /Users/lindau/codex/polytrader/wiki/log.md (hygiene subsection + recon + impl summary fill; wiki-first), /Users/lindau/codex/polytrader/deploy/verify (additive NOTES + relaxes for brittleness only; 401/authz preserved, approval markers intact), docs/project-plan.md (if minor), src/* (none in hygiene; from prior tranche), wiki/decisions/real-order-approval-flow.md + READMEs + schema/runbooks (from tranche). Verbatim commands/TS 1780758789/pod 588d97fdfd-mht2z/outputs/curls/greps/test results/git push in the subsection above + summary. Commit: [after push]. Enables "post-approval hygiene + usable real under gates" on cluster. All surfaces preserved. AGENTS/wiki-first + past issues briefing followed (recon, additive verify, no ||, 401 propagated, fidelity, no scope creep).
+
+(Old 2026-06-02 entry follows verbatim below; no alteration to prior content.)
+
+**Implementation Summary** (to be filled post green checks; see /tmp/grok-impl-summary-29ad1972.md for full; files: wiki/* (first), src/server.rs (handlers/requests/JS panels/tests), src/clob/* (if snapshot reval gaps), deploy/verify, etc. Absolute paths in summary.)
+
+(Old 2026-06-02 entry follows verbatim below; no alteration to prior content.)
+
 ## 2026-06-02 — Minimal gated real CLOB order placement (LiveOrderSender wiring + POLYTRADER_ENABLE_REAL_ORDERS unlock)
 
 **Deployed and verified 2026-06-02 (TS 1780422782, hardened rust_daytrader flow)**

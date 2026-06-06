@@ -179,15 +179,43 @@ pub fn App() -> Element {
                             th { "Boundary" }
                             th { "Dispatch" }
                             th { "Operator" }
+                            th { "Use ID" }
                         }
                     }
                     tbody { id: "clob-final-review-decisions-list",
                         tr {
-                            td { colspan: "7", "No final review decisions loaded" }
+                            td { colspan: "8", "No final review decisions loaded" }
                         }
                     }
                 }
-                small { "Read-only audit history for final-review decisions. These records do not approve real orders." }
+                small { "Read-only audit history for final-review decisions (enriched with snapshots). Use journal_event_id as final_review_decision_event_id (with human id) for submit-facade gated real path under unlocks. These do not auto-approve." }
+            }
+
+            // 2026-06-03: Pending human approvals list (for operator to inspect recent approvals + copy UUIDs for submit-facade / real gated).
+            // Evidence includes snapshots at approve time. Approve action itself is via "Record Facade Approval" (which now captures snapshots).
+            // "Copy ID" populates window var used by submit button and shows guidance.
+            div { class: "card",
+                h2 { "Pending / Recent Human Approvals (for Gated Real CLOB)" }
+                pre { id: "clob-human-approvals-summary", "No human approvals loaded" }
+                table {
+                    thead {
+                        tr {
+                            th { "Time" }
+                            th { "Decision" }
+                            th { "Approved" }
+                            th { "Operator" }
+                            th { "Risk Snapshot" }
+                            th { "Action" }
+                        }
+                    }
+                    tbody { id: "clob-human-approvals-list",
+                        tr {
+                            td { colspan: "6", "No human approvals loaded" }
+                        }
+                    }
+                }
+                button { "onclick": "updateHumanApprovalsList()", "Refresh Human Approvals List" }
+                small { id: "clob-human-approvals-note", "Recent clob_order_human_approval events (enriched 2026-06-03 with approve-time risk/collateral snapshots). Copy journal_event_id as human_approval_event_id for submit-facade. Use with final id + unlocks for real gated path. Read-only." }
             }
 
             div { class: "card",
@@ -449,7 +477,8 @@ pub fn App() -> Element {
                 setTimeout(updateLiveSenderBoundaryStatus, 1394);
                 setTimeout(updateFinalReviewReadiness, 1395);
                 setTimeout(updateFinalReviewDecisions, 1397);
-                setTimeout(updateHermesSafetyLoop, 1398);
+                setTimeout(updateHumanApprovalsList, 1398);  // 2026-06-03 pending human approvals list + copy ids
+                setTimeout(updateHermesSafetyLoop, 1399);
                 setTimeout(updateClobAccountPanel, 1400);
                 setTimeout(updatePreflightChip, 1500);
                 setTimeout(updatePreflightPanel, 1600);
@@ -996,49 +1025,67 @@ pub fn App() -> Element {
                         panel.style.color = '#ffb366';
                         return;
                     }}
-                    const payload = {{
-                        final_review_event_id: finalReviewEventId,
-                        decision: 'acknowledge_blocked',
-                        confirm_final_review_workflow: true,
-                        note: 'Dashboard final review acknowledges current blockers; no live trading approval',
-                        operator: 'dashboard'
-                    }};
-                    panel.textContent = 'Recording audit-only final review decision...';
-                    fetch('clob/final-review-decision', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/json' }},
-                        body: JSON.stringify(payload)
-                    }}).then(r => r.json()).then(d => {{
-                        const blockers = Array.isArray(d && d.blockers) ? d.blockers : [];
-                        const readinessBlockers = Array.isArray(d && d.readiness_blockers) ? d.readiness_blockers : [];
-                        const boundary = d && d.live_sender_boundary_status ? d.live_sender_boundary_status : {{}};
-                        const lines = [
-                            'final_review_decision_recorded: ' + !!(d && d.final_review_decision_recorded),
-                            'journaled: ' + !!(d && d.journaled),
-                            'decision: ' + ((d && d.decision) || 'n/a'),
-                            'approved_for_real_orders: ' + !!(d && d.approved_for_real_orders),
-                            'ready_for_real_orders: ' + !!(d && d.ready_for_real_orders),
-                            'review_decision_effect: ' + ((d && d.review_decision_effect) || 'n/a'),
-                            'final_review_event_valid: ' + !!(d && d.final_review_event_valid),
-                            'live_sender_boundary_fail_closed: ' + !!(d && d.live_sender_boundary_fail_closed),
-                            'live_sender_boundary: ' + (boundary.boundary_name || 'unknown') + ' / ' + (boundary.implementation_name || 'unknown'),
-                            'network_sender_present: ' + !!boundary.network_sender_present,
-                            'accepted_for_network_dispatch: ' + !!boundary.accepted_for_network_dispatch,
-                            'final_review_event_id: ' + ((d && d.final_review_event_id) || 'n/a'),
-                            'journal_event_id: ' + ((d && d.journal_event_id) || 'n/a'),
-                            'request_sent: ' + !!(d && d.request_sent),
-                            'post_order_called: ' + !!(d && d.post_order_called),
-                            'post_orders_called: ' + !!(d && d.post_orders_called),
-                            'readiness_blockers: ' + (readinessBlockers.length ? readinessBlockers.join(', ') : 'none'),
-                            'blockers: ' + (blockers.length ? blockers.join(', ') : 'none')
-                        ];
-                        if (d && d.error) lines.push('error: ' + d.error);
-                        panel.textContent = lines.join('\\n');
-                        panel.style.color = blockers.length ? '#ffb366' : '#66d98f';
-                        updateFinalReviewDecisions();
-                    }}).catch(e => {{
-                        panel.textContent = 'Final review decision failed: ' + e;
-                        panel.style.color = '#ffb366';
+                    if (panel) panel.textContent = 'Fetching current evidence for snapshot at decision...';
+                    Promise.all([
+                        fetch('clob/collateral-readiness').then(function(r) {{ return r.json(); }}).catch(function() {{ return {{}}; }}),
+                        fetch('clob/final-review-readiness').then(function(r) {{ return r.json(); }}).catch(function() {{ return {{}}; }})
+                    ]).then(function(arr) {{
+                        var coll = arr[0] || {{}};
+                        var fr = arr[1] || {{}};
+                        var collSnap = coll || {{}};
+                        var riskSnap = (fr && (fr.final_review || fr.readiness || fr)) || {{}};
+                        var payload = {{
+                            final_review_event_id: finalReviewEventId,
+                            decision: 'acknowledge_blocked',
+                            confirm_final_review_workflow: true,
+                            note: 'Dashboard final review acknowledges current blockers; no live trading approval',
+                            operator: 'dashboard',
+                            risk_snapshot: riskSnap,
+                            collateral_snapshot: collSnap
+                        }};
+                        panel.textContent = 'Recording audit-only final review decision...';
+                        fetch('clob/final-review-decision', {{
+                            method: 'POST',
+                            headers: {{ 'Content-Type': 'application/json' }},
+                            body: JSON.stringify(payload)
+                        }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+                            var blockers = Array.isArray(d && d.blockers) ? d.blockers : [];
+                            var readinessBlockers = Array.isArray(d && d.readiness_blockers) ? d.readiness_blockers : [];
+                            var boundary = d && d.live_sender_boundary_status ? d.live_sender_boundary_status : {{}};
+                            if (d && d.journal_event_id) {{
+                                window.latestClobFinalReviewEventId = d.journal_event_id;  // now the decision id for submit-facade final_review_decision_event_id
+                            }}
+                            var lines = [
+                                'final_review_decision_recorded: ' + !!(d && d.final_review_decision_recorded),
+                                'journaled: ' + !!(d && d.journaled),
+                                'decision: ' + ((d && d.decision) || 'n/a'),
+                                'approved_for_real_orders: ' + !!(d && d.approved_for_real_orders),
+                                'ready_for_real_orders: ' + !!(d && d.ready_for_real_orders),
+                                'review_decision_effect: ' + ((d && d.review_decision_effect) || 'n/a'),
+                                'final_review_event_valid: ' + !!(d && d.final_review_event_valid),
+                                'live_sender_boundary_fail_closed: ' + !!(d && d.live_sender_boundary_fail_closed),
+                                'live_sender_boundary: ' + (boundary.boundary_name || 'unknown') + ' / ' + (boundary.implementation_name || 'unknown'),
+                                'network_sender_present: ' + !!boundary.network_sender_present,
+                                'accepted_for_network_dispatch: ' + !!boundary.accepted_for_network_dispatch,
+                                'final_review_event_id: ' + ((d && d.final_review_event_id) || 'n/a'),
+                                'journal_event_id: ' + ((d && d.journal_event_id) || 'n/a'),
+                                'request_sent: ' + !!(d && d.request_sent),
+                                'post_order_called: ' + !!(d && d.post_order_called),
+                                'post_orders_called: ' + !!(d && d.post_orders_called),
+                                'readiness_blockers: ' + (readinessBlockers.length ? readinessBlockers.join(', ') : 'none'),
+                                'blockers: ' + (blockers.length ? blockers.join(', ') : 'none')
+                            ];
+                            if (d && d.error) lines.push('error: ' + d.error);
+                            panel.textContent = lines.join('\\n');
+                            panel.style.color = blockers.length ? '#ffb366' : '#66d98f';
+                            updateFinalReviewDecisions();
+                            updateHumanApprovalsList();  // refresh lists after approval actions
+                        }}).catch(function(e) {{
+                            panel.textContent = 'Final review decision failed: ' + e;
+                            panel.style.color = '#ffb366';
+                        }});
+                    }}).catch(function(e) {{
+                        if (panel) panel.textContent = 'Evidence fetch failed for final decision: ' + e;
                     }});
                 }}
 
@@ -1079,7 +1126,7 @@ pub fn App() -> Element {
                         ].join('\\n');
                         const events = Array.isArray(d && d.events) ? d.events : [];
                         if (!events.length) {{
-                            body.innerHTML = '<tr><td colspan="7">No final review decisions loaded</td></tr>';
+                            body.innerHTML = '<tr><td colspan="8">No final review decisions loaded</td></tr>';
                             return;
                         }}
                         body.innerHTML = events.map(event => {{
@@ -1092,6 +1139,7 @@ pub fn App() -> Element {
                                 boundary.accepted_for_network_dispatch === false &&
                                 boundary.request_sent === false;
                             const dispatchState = payload.missing_no_network_evidence === true ? 'missing' : (noNetworkEvidence ? 'no-network' : (boundary.accepted_for_network_dispatch === true ? 'accepted' : 'missing'));
+                            const decId = event.id || payload.journal_event_id || '';
                             return '<tr>' +
                                 '<td>' + escapeHtml(event.created_at || '') + '</td>' +
                                 '<td>' + escapeHtml(payload.decision || 'unknown') + '</td>' +
@@ -1100,6 +1148,7 @@ pub fn App() -> Element {
                                 '<td>' + escapeHtml(boundaryState) + '</td>' +
                                 '<td>' + escapeHtml(dispatchState) + '</td>' +
                                 '<td>' + escapeHtml(payload.operator || 'unspecified') + '</td>' +
+                                '<td><button onclick="useFinalDecisionIdForSubmit(\'' + decId + '\')">Copy/Use Final ID for Submit</button></td>' +
                                 '</tr>';
                         }}).join('');
                     }}).catch(e => {{
@@ -1109,6 +1158,60 @@ pub fn App() -> Element {
 
                 function updateFinalReviewCoverageGaps() {{
                     updateFinalReviewDecisions(50, true);
+                }}
+
+                // 2026-06-03: fetch /clob/order-intent/human-approvals (pending/recent list), render table with copyable ids + snapshot hints.
+                // Buttons allow operator to grab a prior approval id for submit-facade form (pairs with final id).
+                function updateHumanApprovalsList() {{
+                    const summary = document.getElementById('clob-human-approvals-summary');
+                    const body = document.getElementById('clob-human-approvals-list');
+                    if (!summary || !body) return;
+                    fetch('clob/order-intent/human-approvals?limit=5').then(r => r.json()).then(d => {{
+                        const count = (d && d.count) || 0;
+                        summary.textContent = [
+                            'event_type: ' + ((d && d.event_type) || 'clob_order_human_approval'),
+                            'count: ' + count,
+                            'note: ' + ((d && d.note) || '')
+                        ].join('\\n');
+                        const events = Array.isArray(d && d.events) ? d.events : [];
+                        if (!events.length) {{
+                            body.innerHTML = '<tr><td colspan="6">No human approvals loaded</td></tr>';
+                            return;
+                        }}
+                        body.innerHTML = events.map(function(ev) {{
+                            const id = ev.journal_event_id || '';
+                            const risk = ev.risk_snapshot_at_approval ? (ev.risk_snapshot_at_approval.projected_notional || 'see-payload') : 'n/a';
+                            return '<tr>' +
+                                '<td>' + escapeHtml(ev.created_at || '') + '</td>' +
+                                '<td>' + escapeHtml(ev.decision || 'n/a') + '</td>' +
+                                '<td>' + escapeHtml(String(!!ev.approved_for_facade)) + '</td>' +
+                                '<td>' + escapeHtml(ev.operator || 'unspecified') + '</td>' +
+                                '<td>' + escapeHtml(String(risk)) + '</td>' +
+                                '<td><button onclick="useHumanApprovalIdForSubmit(\'' + id + '\')">Copy/Use ID for Submit</button></td>' +
+                                '</tr>';
+                        }}).join('');
+                    }}).catch(function(e) {{
+                        if (summary) summary.textContent = 'Human approvals list unavailable: ' + e;
+                    }});
+                }}
+
+                function useHumanApprovalIdForSubmit(id) {{
+                    if (!id) return;
+                    window.latestClobHumanApprovalEventId = id;
+                    const note = document.getElementById('clob-human-approvals-note');
+                    if (note) note.textContent = 'Set window.latestClobHumanApprovalEventId = ' + id + ' (also use in submit-facade JSON human_approval_event_id). Pair with final_review_decision_event_id from Final Review panel. With unlocks+kill this id enables gated real dispatch.';
+                    // Also update the dry-run result area if present for visibility
+                    const res = document.getElementById('dry-run-result');
+                    if (res) res.textContent = 'Selected human_approval_event_id for submit: ' + id + '\\n(Now click Submit Facade Check or POST with this id + final id + confirm_real_order_submission:true)';
+                }}
+
+                function useFinalDecisionIdForSubmit(id) {{
+                    if (!id) return;
+                    window.latestClobFinalReviewEventId = id;
+                    const note = document.getElementById('clob-final-review-decisions-summary');
+                    if (note) note.textContent = 'Set window.latestClobFinalReviewEventId = ' + id + ' (use in submit-facade JSON as final_review_decision_event_id). Pair with human_approval_event_id. With unlocks+kill this enables gated real dispatch reval.';
+                    const res = document.getElementById('dry-run-result');
+                    if (res) res.textContent = 'Selected final_review_decision_event_id for submit: ' + id + '\\n(Now click Submit Facade Check or POST with human id + this + confirm_real:true)';
                 }}
 
                 function updateHermesSafetyLoop() {{
@@ -1775,49 +1878,66 @@ pub fn App() -> Element {
 
                 function recordHumanApprovalIntent() {{
                     const result = document.getElementById('dry-run-result');
-                    const payload = Object.assign(dryRunIntentPayload(), {{
-                        decision: 'approve_facade',
-                        confirm_human_approval_workflow: true,
-                        note: 'Dashboard operator approval for submit-facade validation only',
-                        operator: 'dashboard'
-                    }});
-                    if (result) result.textContent = 'Recording journaled human approval...';
-                    fetch('clob/order-intent/human-approval', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/json' }},
-                        body: JSON.stringify(payload)
-                    }}).then(r => r.json()).then(d => {{
-                        if (d && d.journal_event_id) {{
-                            window.latestClobHumanApprovalEventId = d.journal_event_id;
-                        }}
-                        const blockers = Array.isArray(d && d.blockers) ? d.blockers : [];
-                        const lines = [
-                            'human_approval_journaled: ' + (d && d.journaled),
-                            'approved_for_facade: ' + (d && d.approved_for_facade),
-                            'approval_event: ' + ((d && d.journal_event_id) || 'n/a'),
-                            'subject_hash: ' + ((d && d.subject_hash) || 'n/a'),
-                            'request_sent: ' + (d && d.request_sent),
-                            'post_order_called: ' + (d && d.post_order_called),
-                            'post_orders_called: ' + (d && d.post_orders_called),
-                            'blockers: ' + (blockers.length ? blockers.join(', ') : 'none'),
-                            'error: ' + ((d && d.error) || 'none')
-                        ];
-                        if (result) result.textContent = lines.join('\n');
-                        updateOrderPlacementReadiness();
-                        updateClobOperatorStatus();
-                    }}).catch(e => {{
-                        if (result) result.textContent = 'Human approval workflow failed: ' + e;
+                    if (result) result.textContent = 'Fetching current evidence for snapshot...';
+                    Promise.all([
+                        fetch('clob/collateral-readiness').then(function(r) {{ return r.json(); }}).catch(function() {{ return {{}}; }}),
+                        fetch('clob/order-placement-readiness').then(function(r) {{ return r.json(); }}).catch(function() {{ return {{}}; }})
+                    ]).then(function(arr) {{
+                        var coll = arr[0] || {{}};
+                        var place = arr[1] || {{}};
+                        var collSnap = coll || {{}};
+                        var riskSnap = (place && (place.readiness || place.order_placement_readiness || place)) || {{}};
+                        var payload = Object.assign(dryRunIntentPayload(), {{
+                            decision: 'approve_facade',
+                            confirm_human_approval_workflow: true,
+                            note: 'Dashboard operator approval for submit-facade validation only',
+                            operator: 'dashboard',
+                            risk_snapshot: riskSnap,
+                            collateral_snapshot: collSnap
+                        }});
+                        if (result) result.textContent = 'Recording journaled human approval...';
+                        fetch('clob/order-intent/human-approval', {{
+                            method: 'POST',
+                            headers: {{ 'Content-Type': 'application/json' }},
+                            body: JSON.stringify(payload)
+                        }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+                            if (d && d.journal_event_id) {{
+                                window.latestClobHumanApprovalEventId = d.journal_event_id;
+                            }}
+                            var blockers = Array.isArray(d && d.blockers) ? d.blockers : [];
+                            var lines = [
+                                'human_approval_journaled: ' + (d && d.journaled),
+                                'approved_for_facade: ' + (d && d.approved_for_facade),
+                                'approval_event: ' + ((d && d.journal_event_id) || 'n/a'),
+                                'subject_hash: ' + ((d && d.subject_hash) || 'n/a'),
+                                'request_sent: ' + (d && d.request_sent),
+                                'post_order_called: ' + (d && d.post_order_called),
+                                'post_orders_called: ' + (d && d.post_orders_called),
+                                'blockers: ' + (blockers.length ? blockers.join(', ') : 'none'),
+                                'error: ' + ((d && d.error) || 'none')
+                            ];
+                            if (result) result.textContent = lines.join('\n');
+                            updateOrderPlacementReadiness();
+                            updateClobOperatorStatus();
+                            updateHumanApprovalsList();
+                        }}).catch(function(e) {{
+                            if (result) result.textContent = 'Human approval workflow failed: ' + e;
+                        }});
+                    }}).catch(function(e) {{
+                        if (result) result.textContent = 'Evidence fetch failed for human approval: ' + e;
                     }});
                 }}
 
                 function submitOrderFacadeIntent() {{
                     const result = document.getElementById('dry-run-result');
                     const approvalEventId = window.latestClobHumanApprovalEventId || null;
+                    const finalEventId = window.latestClobFinalReviewEventId || null;
                     const payload = Object.assign(dryRunIntentPayload(), {{
                         confirm_signed_payload_dry_run: false,
                         confirm_order_post_request_dry_run: false,
-                        confirm_real_order_submission: !!approvalEventId,
+                        confirm_real_order_submission: !!(approvalEventId || finalEventId),
                         human_approval_event_id: approvalEventId,
+                        final_review_decision_event_id: finalEventId,
                         human_approval_token: '',
                         human_approval_note: 'UI safety check only',
                         operator: 'dashboard'
@@ -1840,6 +1960,8 @@ pub fn App() -> Element {
                             'reconciled: ' + (d && d.reconciled),
                             'facade_available: ' + (d && d.facade_available),
                             'human_approval_event_valid: ' + (d && d.human_approval_event_valid),
+                            'final_review_decision_event_id: ' + ((d && d.final_review_decision_event_id) || 'n/a'),
+                            'final_review_decision_event_valid: ' + (d && d.final_review_decision_event_valid),
                             'fresh_collateral_readiness_valid: ' + (collateral && collateral.valid),
                             'fresh_collateral_readiness_event: ' + ((collateral && collateral.event_id) || 'n/a'),
                             'fresh_collateral_balance_positive: ' + (collateral && collateral.collateral_balance_positive),
@@ -2177,8 +2299,20 @@ mod tests {
                 && rendered.contains("missing_no_network_evidence_count")
                 && rendered.contains("all_events_have_boundary_evidence")
                 && rendered.contains("all_events_have_no_network_evidence")
-                && rendered.contains("coverage_gap_count"),
+                && rendered.contains("coverage_gap_count")
+                && rendered.contains("Use ID")
+                && rendered.contains("Copy/Use Final ID for Submit"),
             "read-only final review decision audit list and fetch hook must be rendered"
+        );
+        assert!(
+            rendered.contains("Pending / Recent Human Approvals (for Gated Real CLOB)")
+                && rendered.contains("id=\"clob-human-approvals-summary\"")
+                && rendered.contains("id=\"clob-human-approvals-list\"")
+                && rendered.contains("clob/order-intent/human-approvals")
+                && rendered.contains("updateHumanApprovalsList")
+                && rendered.contains("Copy/Use ID for Submit")
+                && rendered.contains("useHumanApprovalIdForSubmit"),
+            "read-only human approvals pending list panel and fetch hook must be rendered (2026-06-03 tranche)"
         );
         assert!(
             rendered.contains("Hermes CLOB Safety Loop")

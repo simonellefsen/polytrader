@@ -173,6 +173,9 @@ pub struct HumanApprovalValidation {
     pub decision: Option<String>,
     pub subject_hash: Option<String>,
     pub blockers: Vec<String>,
+    // 2026-06-03: populated from the approval event payload for submit-time visibility / reval note (anti-staleness vs current at dispatch).
+    pub risk_snapshot: Option<serde_json::Value>,
+    pub collateral_snapshot: Option<serde_json::Value>,
 }
 
 /// Server-side validation result for a journaled final review decision event.
@@ -188,6 +191,9 @@ pub struct FinalReviewDecisionValidation {
     pub decision: Option<String>,
     pub operator: Option<String>,
     pub blockers: Vec<String>,
+    // 2026-06-03: populated from the decision event payload for submit-time visibility / reval note (anti-staleness vs current at dispatch).
+    pub risk_snapshot: Option<serde_json::Value>,
+    pub collateral_snapshot: Option<serde_json::Value>,
 }
 
 /// Server-side validation result for the latest journaled collateral readiness snapshot.
@@ -1709,6 +1715,8 @@ fn build_submit_facade_gate_report(
             decision: None,
             subject_hash: None,
             blockers: vec!["human_approval_event_missing".to_string()],
+            risk_snapshot: None,
+            collateral_snapshot: None,
         });
     let journaled_approval_valid = approval_validation.valid;
     push_check(
@@ -1732,6 +1740,8 @@ fn build_submit_facade_gate_report(
             decision: None,
             operator: None,
             blockers: vec!["final_review_decision_event_missing".to_string()],
+            risk_snapshot: None,
+            collateral_snapshot: None,
         });
     push_check(
         &mut checks,
@@ -2654,6 +2664,8 @@ mod tests {
                 decision: Some("approve_facade".into()),
                 subject_hash: None,
                 blockers: vec![],
+                risk_snapshot: None,
+                collateral_snapshot: None,
             }),
             server_final_review_decision: Some(FinalReviewDecisionValidation {
                 valid: true,
@@ -2661,6 +2673,8 @@ mod tests {
                 decision: Some("acknowledge_blocked".into()),
                 operator: None,
                 blockers: vec![],
+                risk_snapshot: None,
+                collateral_snapshot: None,
             }),
             server_collateral_readiness: Some(CollateralReadinessValidation {
                 valid: true,
@@ -2691,6 +2705,10 @@ mod tests {
         assert!(!gblockers
             .iter()
             .any(|v| v == "final_review_decision_event_missing"));
+        // Snapshots surfaced from approval events (review fix for submit/gate visibility).
+        let hval = &gate["human_approval"];
+        assert!(hval.get("risk_snapshot").is_some());
+        assert!(hval.get("collateral_snapshot").is_some());
     }
 
     // Expanded tests for place early bails (cover dispatch/place error arms without net).

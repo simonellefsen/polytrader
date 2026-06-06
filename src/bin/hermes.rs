@@ -274,11 +274,11 @@ async fn do_reflection(
         "Track clob_collateral_readiness snapshots until collateral_balance_positive and collateral_allowance_positive are both true; do not treat this as live-order approval".to_string(),
         "Keep clob_real_trading_unlock_status journaled and false until collateral, allowance, paper-mode, live-sender, and final human review gates are all deliberately addressed".to_string(),
         "Use clob_final_review_readiness as the single operator packet for review discussions; it remains no-send and should stay blocked until every gate has evidence".to_string(),
-        "Record clob_final_review_decision events for review outcomes; these are audit-only and must not be treated as live-order approval".to_string(),
+        "Record clob_final_review_decision events for review outcomes; these are audit-only and must not be treated as live-order approval. (2026-06-03: enriched payloads now carry risk/collateral snapshots at approval time for attribution when used in gated real dispatch.)".to_string(),
         "Use clob_live_sender_design_readiness before any live-sender implementation work; it remains no-send and should stay blocked until every external and explicit unlock gate is deliberate".to_string(),
         "Use clob_live_sender_design_review as the ADR-style contract before any live-sender boundary work; a ready design review still does not permit implementation or real orders".to_string(),
         "Track clob_live_sender_boundary_status to ensure the only live-sender implementation remains fail-closed before network dispatch".to_string(),
-        "Review clob_safety_loop human-approval and submit-facade blockers before implementing kill-switch or live-send internals".to_string(),
+        "Review clob_safety_loop human-approval (now with approve-time snapshots 2026-06-03) and submit-facade blockers before implementing kill-switch or live-send internals".to_string(),
     ];
     let final_review_decision_events = clob_safety_loop["final_review_decision_events_24h"]
         .as_i64()

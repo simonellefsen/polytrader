@@ -100,3 +100,29 @@ See [wiki/index.md](../wiki/index.md) and [AGENTS.md](../AGENTS.md).
 
 3. **postgres** (CloudNativePG, 2 replicas)
    - Primary + hot standby.
+
+## 2026-06-03 Tranche: Operator-Facing Approval Workflow for Gated Real Orders (Approval UX)
+
+**Goal**: Close the UX gap so an operator (L2 secret + POLYTRADER_ENABLE_REAL_ORDERS + KILL_SWITCH_OPEN) can create the required journaled human_approval_event_id + final_review_decision_event_id (with risk/collateral snapshots at approve time, operator binding) via UI or simple curls — no raw journal INSERTs — then feed the UUIDs into submit-facade to exercise the (already wired) gated real path end-to-end under all safety gates.
+
+**Wiki-first (non-negotiable)**: Prepended log.md entry, created wiki/decisions/real-order-approval-flow.md, updated schema.md (enriched event payloads), runbooks (extended), this plan, decisions/README cross-ref. All before heavy src edits.
+
+**Approach (smallest, fidelity-preserving)**:
+- Enhance existing POST /clob/order-intent/human-approval and /clob/final-review-decision (compatibly; accept optional snapshot fields) to capture + embed current risk_snapshot (intent-derived + limits) + collateral_snapshot (via existing builders) + operator (AuthUser) into journal payloads at approve time. (Actual paths used; plan short names were informal.)
+- Add/enhance minimal GET pending lists (e.g. /clob/order-intent/human-approvals symmetric to final-review-decisions) returning recent events with evidence/ids.
+- Minimal Dioxus SSR panels (new or enhanced "Pending Human Approvals" + "Final Review Queue" cards) + vanilla JS: list recent candidates/audits, approve buttons that fetch current readiness/collateral/risk evidence, POST with snapshots, surface returned UUIDs copyably for submit form or curls. Wire final id into submit-facade JS too. Preserve all prior verified SSR ids/markers/hooks/base-href/subpath.
+- In submit-facade + LiveOrderSendRequest path: ensure ids from these enriched approvals flow (already), optionally surface snapshots in gate_report for reval note at dispatch (smallest; hard pre-dispatch "clob_live_order_intent_pre_dispatch" journal preserved).
+- Gated sender reval (non-zero ids + envs + kill) unchanged.
+- Risk anti-staleness: snapshot at *approve* (for Hermes attribution + later reval); note in dispatch if practical.
+- New tests: 401 unauthed on approval creation paths (AuthUser), happy journal write + payload contains snapshot/ids/operator, validation happy with fresh approval ids, extend gated positive under TEST_ENV_LOCK + unlocks (auth sim).
+- Hermes: existing consumption of the kinds + live_* (snapshots available in payloads for future P&L/wiki); minimal update if needed for notes.
+- Verify: extend for new UI markers + 401 negatives + positive probes (with snapshots) without relaxing any prior requires.
+- No new event kinds (reuse/enrich), no migration, no auto-real, no default behavior change, no paper regression, Decimal, heavy RISK comments, native-l2 for sign, etc.
+
+**Safety**: All real path still fail-closed by default; paper_only + real_orders_enabled:false + boundary network_present:false exercised; explicit human + final + unlocks + kill + L2 + reval + pre-journal + risk gates mandatory. Snapshots make the human approval evidence richer for audit/attribution.
+
+**Deliverables**: Updated wiki (first), src (server handlers/requests/validations/UI, clob if gaps for snapshot reval, tests), deploy/verify, docs/plan, runbooks. 0 open review issues after implement-review-fix.
+
+**Status in this plan**: The "place where we can start placing actual orders" tranche (gated sender) is complete+hygiene'd; this is the follow-on to make the approval prerequisite *operator usable*.
+
+See wiki/log.md (2026-06-03 entry), wiki/decisions/real-order-approval-flow.md, wiki/schema.md for full details + invariants. All per AGENTS.md.
