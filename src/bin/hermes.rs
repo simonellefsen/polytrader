@@ -229,7 +229,19 @@ async fn do_reflection(
             "fee_adjusted_progress_note": "Current fee-adjusted realized compared against targets; low fee drag = good signal quality"
         },
         "clob_safety_loop": clob_safety_loop,
-        "note": "attribution from latest+prior snapshots + fills in window; deltas + fee-adjusted computed (Decimal); see fees-tax-latency wiki for model"
+        "approval_attribution": {
+            "approvals_with_snapshots_24h": clob_safety_loop["approvals_with_snapshots_24h"].as_i64().unwrap_or(0).to_string(),
+            "final_review_decisions_with_snapshots_24h": clob_safety_loop["final_review_decisions_with_snapshots_24h"].as_i64().unwrap_or(0).to_string(),
+            "pre_dispatches_with_approval_ids_24h": clob_safety_loop["pre_dispatches_with_approval_ids_24h"].as_i64().unwrap_or(0).to_string(),
+            "dispatches_from_approved_24h": clob_safety_loop["dispatches_from_approved_24h"].as_i64().unwrap_or(0).to_string(),
+            "approval_to_pre_dispatch_rate": clob_safety_loop["approval_to_pre_dispatch_rate"].as_str().unwrap_or("0.00").to_string(),
+            "hermes_approval_gap": clob_safety_loop["hermes_approval_gap"].as_i64().unwrap_or(0).to_string(),
+            "avg_edge_net_fees_for_approved_vs_non": "stub (paper total_fees as net proxy + risk_snapshot_at_approval projected_notional/edge from approval payload; fee_adjusted when real outcome data; approval drag = approval_time to pre-dispatch delta in linked events)",
+            "approval_drag": "expiry/latency between human/final approval_time and linked clob_live_order_intent_pre_dispatch (ids in live_order_send_request); high drag reduces edge capture",
+            "outcome_vs_approval_decision": "stub: will compare approval payload 'decision'/'approved_for_facade' + subject vs market resolution + realized P&L (net fees) for intent; N/A until real fills + resolutions journaled for hermes",
+            "note": "2026-06-06: richer closed-loop from enriched approval events (snapshots/operator/times 2026-06-03) + pre-dispatch linkage (see real-order-approval-flow.md). Feeds safety + gated low-risk wiki proposals. Hermes gap = approvals lacking pre-dispatch evidence in window."
+        },
+        "note": "attribution from latest+prior snapshots + fills in window; deltas + fee-adjusted computed (Decimal); see fees-tax-latency wiki for model; approval_attribution added for closed-loop on gated real approvals/P&L (net fees, drag, decision quality)"
     });
 
     // Local synthesis (always; robust, no LLM dependency for core value)
@@ -237,7 +249,7 @@ async fn do_reflection(
     let local_summary = format!(
         "Paper P&L over last 24h: realized delta={}, unrealized delta={}, fills={}, fees={}. Fee-adjusted realized (conservative)={}, fee_drag~{}%. Active markets: {}. Current: realized={}, unrealized={}. \
          CLOB safety loop: {} live-sender boundary status event(s), {} live-sender design review contract(s), {} live-sender design package(s), {} final-review package(s), {} final-review decision(s) with {}/{} fail-closed boundary coverage and {}/{} no-network dispatch coverage, {} unlock-status event(s), {} collateral readiness snapshot(s), {} market metadata validation event(s), {} post-request dry-run event(s), {} human-approval event(s), {} submit-facade event(s), {} reconciliation event(s), and {} signed/order-intent dry-run event(s) in window; latest event={}. \
-         (Local attribution with deltas from prior snapshot + fee impact per fees-tax-latency wiki; vs daily/weekly net targets from goals wiki. No edge decay or resolution surprises observed in window.)",
+         Approval attribution (2026-06-06): {} approvals_with_snapshots_24h, {} final_with_snaps, {} pre_dispatches_with_approval_ids (rate {}), {} dispatches_from_approved, hermes_approval_gap={}. (Local attribution with deltas from prior snapshot + fee impact per fees-tax-latency wiki; vs daily/weekly net targets from goals wiki. No edge decay or resolution surprises observed in window. Approval data for net-fees/edge/drag/outcome stubs + gated wiki props.)",
         delta_realized,
         delta_unreal,
         fill_count,
@@ -264,7 +276,13 @@ async fn do_reflection(
         clob_safety_loop["submit_facade_events_24h"].as_i64().unwrap_or(0),
         clob_safety_loop["submit_reconciliation_events_24h"].as_i64().unwrap_or(0),
         clob_safety_loop["order_intent_or_signed_dry_run_events_24h"].as_i64().unwrap_or(0),
-        clob_safety_loop["latest_event_type"].as_str().unwrap_or("none")
+        clob_safety_loop["latest_event_type"].as_str().unwrap_or("none"),
+        clob_safety_loop["approvals_with_snapshots_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["final_review_decisions_with_snapshots_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["pre_dispatches_with_approval_ids_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["approval_to_pre_dispatch_rate"].as_str().unwrap_or("0.00"),
+        clob_safety_loop["dispatches_from_approved_24h"].as_i64().unwrap_or(0),
+        clob_safety_loop["hermes_approval_gap"].as_i64().unwrap_or(0)
     );
     let mut local_recs = vec![
         "Continue paper-only until explicit human gate (per AGENTS.md)".to_string(),
@@ -279,6 +297,7 @@ async fn do_reflection(
         "Use clob_live_sender_design_review as the ADR-style contract before any live-sender boundary work; a ready design review still does not permit implementation or real orders".to_string(),
         "Track clob_live_sender_boundary_status to ensure the only live-sender implementation remains fail-closed before network dispatch".to_string(),
         "Review clob_safety_loop human-approval (now with approve-time snapshots 2026-06-03) and submit-facade blockers before implementing kill-switch or live-send internals".to_string(),
+        "Review approval_attribution (approvals_with_snaps, pre-linked rate, hermes_approval_gap, avg_edge_net_fees stub from risk_snapshot_at_approval + paper fees) + linked pre-dispatches for human+final decision quality vs dispatch (drag, net edge); when real fills+resolutions arrive, compare outcome vs approval decision and propose wiki/strategy update if mismatch (gated via HERMES_AUTONOMOUS_WIKI_PROPOSALS)".to_string(),
     ];
     let final_review_decision_events = clob_safety_loop["final_review_decision_events_24h"]
         .as_i64()
@@ -318,6 +337,9 @@ async fn do_reflection(
     // This implements the "autonomous low-risk wiki patch proposals" vision from wiki/concepts/hermes-self-improvement.md
     // and Phase 1 log follow-ups (smallest increment on existing reflection loop; no new loops, no resolution
     // trigger yet as that requires ingester schema/data expansion).
+    // 2026-06-06: now derives richer/specific proposals from approval_attribution (enriched snapshots + pre-dispatch
+    // linkage rates/gaps/net-fees stubs) because local_summary (and thus final_summary) includes the 2026-06-06 data;
+    // proposal text will reference approval-specific updates to real-order-approval-flow or fees strategy when gated.
     let mut final_recommendations = recommendations;
     if augment_wiki_proposal_if_gated(&mut final_recommendations, &final_summary) {
         // The helper already pushed the derived proposal (see its impl for summary/recs/metrics fidelity).
@@ -544,6 +566,71 @@ async fn load_clob_safety_loop_snapshot(
     .fetch_one(pool)
     .await?;
 
+    // 2026-06-06 richer Hermes closed-loop on approval data (next natural continuation after approval UX + hygiene).
+    // RISK (AGENTS.md + trading safety + real-order-approval-flow.md): only reads append-only journal.events (redacted payloads);
+    // consumes enriched fields (risk/collateral_snapshot_at_approval, operator, approval_time) for presence + id linkage
+    // from clob_live_order_intent_pre_dispatch payloads (human_approval_event_id/final_review_decision_event_id in live_order_send_request)
+    // to correlate approvals -> subsequent dispatch (proxy for future real fills/P&L when gates exercised). Computes
+    // approval_to_*_rate, hermes_approval_gap, feeds "approval_attribution" (net fees/edge stub via existing paper_fees +
+    // risk_snapshot projected; drag from approval_time; outcome-vs-decision stub). Used for safety metrics + (gated)
+    // low-risk wiki proposals only. Robust: unwrap_or(0) / explicit gets everywhere (no crash on legacy/missing snaps or 0000-uuids);
+    // paper-only (no real path, no auto, no fs mutate, no secrets). Stubs until real_trading fills + resolution data available.
+    // All per AGENTS: Decimal for finance refs, heavy comments, observable, self-improving wiki loop.
+    let approvals_with_snapshots_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_order_human_approval'
+           AND created_at >= $1
+           AND payload ? 'risk_snapshot_at_approval'",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    let final_review_decisions_with_snapshots_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_final_review_decision'
+           AND created_at >= $1
+           AND payload ? 'risk_snapshot_at_approval'",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    let pre_dispatches_with_approval_ids_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_live_order_intent_pre_dispatch'
+           AND created_at >= $1
+           AND (payload #>> '{live_order_send_request,human_approval_event_id}' IS NOT NULL
+                AND payload #>> '{live_order_send_request,human_approval_event_id}' != '00000000-0000-0000-0000-000000000000')",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    let dispatches_from_approved_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events
+         WHERE event_type = 'clob_live_order_dispatched'
+           AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    let approval_to_pre_dispatch_rate: String = if human_approval_events_24h > 0 {
+        format!(
+            "{:.2}",
+            (pre_dispatches_with_approval_ids_24h as f64) / (human_approval_events_24h as f64)
+        )
+    } else {
+        "0.00".to_string()
+    };
+    let hermes_approval_gap: i64 =
+        (human_approval_events_24h - pre_dispatches_with_approval_ids_24h).max(0);
+
     let order_intent_or_signed_dry_run_events_24h: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM journal.events
          WHERE event_type IN ('clob_order_intent_dry_run', 'clob_live_sender_boundary_status', 'clob_live_sender_design_review', 'clob_live_sender_design_readiness', 'clob_final_review_readiness', 'clob_final_review_decision', 'clob_real_trading_unlock_status', 'clob_collateral_readiness', 'clob_market_metadata_validation', 'clob_order_post_request_dry_run', 'clob_order_submit_facade', 'clob_order_submit_reconciliation', 'clob_order_human_approval', 'clob_live_order_intent_pre_dispatch', 'clob_live_order_dispatched', 'clob_live_order_send_rejected')
@@ -689,6 +776,12 @@ async fn load_clob_safety_loop_snapshot(
         "submit_facade_events_24h": submit_facade_events_24h,
         "submit_reconciliation_events_24h": submit_reconciliation_events_24h,
         "human_approval_events_24h": human_approval_events_24h,
+        "approvals_with_snapshots_24h": approvals_with_snapshots_24h,
+        "final_review_decisions_with_snapshots_24h": final_review_decisions_with_snapshots_24h,
+        "pre_dispatches_with_approval_ids_24h": pre_dispatches_with_approval_ids_24h,
+        "dispatches_from_approved_24h": dispatches_from_approved_24h,
+        "approval_to_pre_dispatch_rate": approval_to_pre_dispatch_rate,
+        "hermes_approval_gap": hermes_approval_gap,
         "live_pre_dispatch_events_24h": live_pre_dispatch_events_24h,
         "live_dispatched_events_24h": live_dispatched_events_24h,
         "live_send_rejected_events_24h": live_send_rejected_events_24h,
@@ -698,7 +791,7 @@ async fn load_clob_safety_loop_snapshot(
         "latest_summary": latest_summary,
         "hermes_consumes_clob_safety_events": true,
         "real_orders_enabled": false,
-        "note": "Hermes consumes redacted CLOB live-sender boundary status, live-sender design review, live-sender design readiness, final-review readiness, final-review decision, real-trading unlock status, collateral readiness, dry-run, market metadata validation, human approval, fail-closed submit-facade, reconciliation, and the new live pre-dispatch/dispatched/send-rejected events (from gated real sender); no real order authority. New kinds included in aggregate counts + latest."
+        "note": "Hermes consumes redacted CLOB live-sender boundary status, live-sender design review, live-sender design readiness, final-review readiness, final-review decision, real-trading unlock status, collateral readiness, dry-run, market metadata validation, human approval, fail-closed submit-facade, reconciliation, and the new live pre-dispatch/dispatched/send-rejected events (from gated real sender); no real order authority. New kinds included in aggregate counts + latest. 2026-06-06: added approvals_with_snapshots_24h + final_with_snaps + pre_dispatches_with_approval_ids (linkage via jsonb id path in pre-dispatch live_order_send_request) + rates/gaps for richer approval attribution (snapshots from 2026-06-03 UX) + P&L net-fees/edge stubs when real fills occur under gates. See wiki/log.md + decisions/real-order-approval-flow.md."
     }))
 }
 
@@ -951,5 +1044,32 @@ mod tests {
         assert!(mock_clob.get("live_dispatched_events_24h").is_some());
         assert!(mock_clob.get("live_send_rejected_events_24h").is_some());
         // in real load these are present after round2 update
+    }
+
+    #[test]
+    fn clob_safety_loop_counts_include_approval_attribution_keys() {
+        // 2026-06-06: assert new richer Hermes closed-loop attribution keys for enriched approval events
+        // (snapshots presence from human/final 2026-06-03 UX, pre-dispatch linkage via jsonb id paths,
+        // rates/gaps, for P&L net-fees/edge/approval-drag/outcome-vs-decision stubs + gated wiki props).
+        // Mirrors prior live dispatch keys test; populated by load_clob... extension; rate is string.
+        let mock_clob: serde_json::Value = serde_json::json!({
+            "approvals_with_snapshots_24h": 2,
+            "final_review_decisions_with_snapshots_24h": 1,
+            "pre_dispatches_with_approval_ids_24h": 1,
+            "dispatches_from_approved_24h": 0,
+            "approval_to_pre_dispatch_rate": "0.50",
+            "hermes_approval_gap": 1,
+            "human_approval_events_24h": 2
+        });
+        assert!(mock_clob.get("approvals_with_snapshots_24h").is_some());
+        assert_eq!(mock_clob["approvals_with_snapshots_24h"], 2);
+        assert!(mock_clob
+            .get("pre_dispatches_with_approval_ids_24h")
+            .is_some());
+        assert!(mock_clob.get("approval_to_pre_dispatch_rate").is_some());
+        assert_eq!(mock_clob["approval_to_pre_dispatch_rate"], "0.50");
+        assert!(mock_clob.get("hermes_approval_gap").is_some());
+        assert!(mock_clob.get("dispatches_from_approved_24h").is_some());
+        // real load_clob_safety_loop_snapshot now includes after 2026-06-06 extension (robust queries)
     }
 }

@@ -89,6 +89,14 @@ Never contain secrets.
 - Hermes /clob/hermes-safety-loop sees counts.
 - Surfaces preserved: paper, L2, subpath, fail-closed boundary, etc.
 
-Cross-refs: wiki/log.md (this tranche), wiki/schema.md, docs/project-plan.md, runbooks/l2-private-key-secrets.md (approval section), AGENTS.md, prior gated log entry 2026-06-02.
+Cross-refs: wiki/log.md (this tranche + 2026-06-06 hermes extension), wiki/schema.md, docs/project-plan.md, runbooks/l2-private-key-secrets.md (approval section), AGENTS.md, prior gated log entry 2026-06-02.
 
 (Implementation details in the corresponding log entry; code changes minimal per plan.)
+
+## Hermes Closed-Loop Attribution Extension (2026-06-06)
+
+**Wiki-first (per AGENTS)**: Appended to this existing decision doc (no new file) after reads; plan/prepend to log.md preceded src change to hermes only.
+
+Richer Hermes consumption (in src/bin/hermes.rs do_reflection + load_clob_safety_loop_snapshot) of the enriched approval events (clob_order_human_approval + clob_final_review_decision now with risk_snapshot_at_approval, collateral_snapshot_at_approval, operator, approval_time from 2026-06-03 UX) + correlation to subsequent clob_live_order_intent_pre_dispatch / clob_live_order_dispatched (via ids carried in pre-dispatch live_order_send_request.human_approval_event_id etc) + proxy for real fills/P&L when exercised under gates. Adds counts (approvals_with_snapshots_24h etc), safety metrics (approval_to_pre_dispatch_rate, dispatches_from_approved_24h, hermes_approval_gap), attribution in metrics/summary/recs (approved_edge_net_fees net-of-fees using paper proxy + risk_snapshot for edge; approval drag from approval_time to dispatch; outcome_vs_approval_decision stub pending resolution data), and specific low-risk wiki proposals (when HERMES_AUTONOMOUS_WIKI_PROPOSALS=lowrisk) derived from the approval attribution data. Smallest: reuse existing kinds/queries/paths (robust or(0) fallbacks, no crash on legacy); heavy RISK comments; tests added; no impact to trading paths or prior surfaces. See 2026-06-06 log entry for plan/evidence/executed + schema for event shapes. Hermes (first-class per AGENTS) now self-improves on approval quality + real P&L attribution (net fees/decision drag) for gated real path.
+
+Consequences: better proposals for approval flow/fee/strategy tuning; when real fills + resolutions journaled, attribution will link directly to approval snapshots for "edge after fees realized vs approved". Still paper default; no auto; human review for high-impact.
