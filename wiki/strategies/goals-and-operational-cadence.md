@@ -83,7 +83,7 @@ This is the "meta" loop (much less frequent than the current ~5–10 min reflect
 
 - Runs on its own timer (independent of the 5-min trader loop).
 - **Actions** (extends the existing `do_reflection` + gated proposal logic):
-  1. Query recent fills, portfolio snapshots, and all decision reports logged in the last hour (plus daily/weekly goal state).
+  1. Query recent fills, portfolio snapshots, and all decision reports logged in the last 24h (reflection window per current do_reflection period_start + 5-min DR generator; "last hour" aspirational for full hourly per "Extend `do_reflection`..." + "Compare decision reports vs actual outcomes"; full "hourly" deferred to "fuller backtest harness" follow-up per log "Ready for next / backtest" + plan; preserves goal intent).
   2. Full P&L attribution broken down by:
      - Time-of-day / market category.
      - Individual signal processors (from the fusion attribution).
@@ -118,7 +118,7 @@ No new database tables are required in the smallest increment (reuse existing jo
 
 1. **Config** (env or simple struct): `DAILY_RISK_PCT`, `WEEKLY_DRAWDOWN_LIMIT`, `MIN_EDGE_PCT`, `HERMES_REFLECTION_INTERVAL_SECS=3600`, `DECISION_SCAN_INTERVAL_SECS=300`, goal thresholds, etc.
 2. **5-min layer**: Lightweight timer (or driven by ingester) that calls the existing + new strategy code and writes a `decision_report` JSONB record.
-3. **Hermes hourly**: Change the current ~5–10 min reflection to hourly (or keep a lightweight 5-min idle tick + full reflection only on the hour). Extend `do_reflection` to also read recent decision reports and goal state.
+3. **Hermes hourly**: Change the current ~5–10 min reflection to hourly (or keep a lightweight 5-min idle tick + full reflection only on the hour). Extend `do_reflection` to also read recent decision reports and goal state (current impl uses 24h reflection window for DRs/fills consistent with P&L; "last hour" reconciled in this doc as aspirational for fuller backtest).
 4. **Journal extensions** (comments first): Add `decision_report` and `goal_progress` JSONB columns or separate lightweight tables later.
 5. **UI**: Simple cards showing "Daily goal: 1.4% / 2.0% (70%)", "Current risk utilization: 8%", live top Decision Report, recent Hermes reflections.
 6. **Wiki & decisions**: This page + updates to hermes concepts + project-plan (already in progress).

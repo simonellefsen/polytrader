@@ -175,13 +175,31 @@ async fn do_reflection(
     let recent_dr_count: i64 = clob_safety_loop["decision_reports_considered_24h"]
         .as_i64()
         .unwrap_or(0);
-    let recent_dr_sample: serde_json::Value = sqlx::query_scalar(
-        r#"SELECT COALESCE(json_agg(json_build_object('id', id::text, 'net_edge_after_fees', (payload #>> '{report,net_edge_after_fees}'), 'generated_by', payload->>'generated_by', 'created_at', created_at) ORDER BY created_at DESC), '[]'::json) FROM journal.events WHERE event_type = 'decision_report' AND created_at >= $1 LIMIT 3"#
+    // top-3 most recent DRs guaranteed for sample (Issue 1 review fix): subquery with ORDER BY created_at DESC LIMIT 3 *before* json_agg (prevents arbitrary row selection from scan/index then post-agg sort on subset only; smallest additive per plan "smallest"/"skeleton vs production"/"no new DB harness"/"local cargo sufficient"). Comment documents "most recent" guarantee for backtest/attr quality.
+    let recent_dr_sample: serde_json::Value = match sqlx::query_scalar(
+        r#"SELECT COALESCE(json_agg(j ORDER BY created_at DESC), '[]'::json) FROM (SELECT id::text AS id, (payload #>> '{report,net_edge_after_fees}') AS "net_edge_after_fees", payload->>'generated_by' AS "generated_by", created_at FROM journal.events WHERE event_type = 'decision_report' AND created_at >= $1 ORDER BY created_at DESC LIMIT 3) AS j"#
     )
     .bind(period_start)
     .fetch_one(pool)
     .await
-    .unwrap_or(serde_json::json!([]));
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "recent_dr_sample query failed (using empty; non-fatal; Issue 10 observability fix per AGENTS 'every significant action logged' + #9; consistent with higher-level do_refl warn)");
+            serde_json::json!([])
+        }
+    };
+
+    // compact preview of top-2 sampled nets for local_summary / journaled narrative (Issue 8 fix: improves observability per AGENTS "observable & journaled" without full sample in human text; keep non-overclaim "limited sample (3)"; derived safely from the (now ordered) recent_dr_sample; full array stays in metrics for backtest).
+    let recent_dr_preview = if let Some(arr) = recent_dr_sample.as_array() {
+        arr.iter()
+            .take(2)
+            .filter_map(|v| v.get("net_edge_after_fees").and_then(|s| s.as_str()))
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        "n/a".to_string()
+    };
 
     // Basic P&L attribution (Decimal only; no floats in finance per AGENTS)
     // Now includes prior snapshot deltas for true window change (smallest viable fix for weak attribution)
@@ -271,7 +289,7 @@ async fn do_reflection(
     let local_summary = format!(
         "Paper P&L over last 24h: realized delta={}, unrealized delta={}, fills={}, fees={}. Fee-adjusted realized (conservative)={}, fee_drag~{}%. Active markets: {}. Current: realized={}, unrealized={}. \
          CLOB safety loop: {} live-sender boundary status event(s), {} live-sender design review contract(s), {} live-sender design package(s), {} final-review package(s), {} final-review decision(s) with {}/{} fail-closed boundary coverage and {}/{} no-network dispatch coverage, {} unlock-status event(s), {} collateral readiness snapshot(s), {} market metadata validation event(s), {} post-request dry-run event(s), {} human-approval event(s), {} submit-facade event(s), {} reconciliation event(s), and {} signed/order-intent dry-run event(s) in window; latest event={}. \
-         Approval attribution (2026-06-06): {} approvals_with_snapshots_24h, {} final_with_snaps, {} pre_dispatches_with_approval_ids (rate {}), {} dispatches_from_approved, hermes_approval_gap={}. decision_reports_considered_24h (5-min DR; initial generator in main)={}. DRs read (extend do_reflection per goals; start backtest harness): count={}, sampled net edges for quality vs paper fills/approvals. (Local attribution with deltas from prior snapshot + fee impact per fees-tax-latency wiki; vs daily/weekly net targets from goals wiki. No edge decay or resolution surprises observed in window. Approval data for net-fees/edge/drag/outcome stubs + gated wiki props + 5min DR per goals.)",
+         Approval attribution (2026-06-06): {} approvals_with_snapshots_24h, {} final_with_snaps, {} pre_dispatches_with_approval_ids (rate {}), {} dispatches_from_approved, hermes_approval_gap={}. decision_reports_considered_24h (5-min DR; initial generator in main)={}. DRs read (extend do_reflection per goals; start backtest harness): count={}, preview top-2 nets [{}] (limited sample; full in metrics). (Local attribution with deltas from prior snapshot + fee impact per fees-tax-latency wiki; vs daily/weekly net targets from goals wiki. No edge decay or resolution surprises observed in window. Approval data for net-fees/edge/drag/outcome stubs + gated wiki props + 5min DR per goals.)",
         delta_realized,
         delta_unreal,
         fill_count,
@@ -306,7 +324,8 @@ async fn do_reflection(
         clob_safety_loop["dispatches_from_approved_24h"].as_i64().unwrap_or(0),
         clob_safety_loop["hermes_approval_gap"].as_i64().unwrap_or(0),
         clob_safety_loop["decision_reports_considered_24h"].as_i64().unwrap_or(0),
-        recent_dr_count
+        recent_dr_count,
+        recent_dr_preview
     );
     let mut local_recs = vec![
         "Continue paper-only until explicit human gate (per AGENTS.md)".to_string(),
@@ -339,8 +358,19 @@ async fn do_reflection(
     }
 
     // Conditional LLM synthesis (reqwest OpenAI-comp; smallest, configurable, safe)
+    // Issue 9 (security) fix: construct llm_metrics by redacting full "recent_decision_reports_sampled" (net edges/ids from DRs; PRIMARY signals) from the cadence sub for LLM prompt only (defense-in-depth; keeps full sample in stored `metrics` + local_summary preview for journaled backtest/attr per goals/AGENTS; additive only; does not affect non-LLM path or reflections).
+    let llm_metrics = {
+        let mut m = metrics.clone();
+        if let Some(drc) = m.get_mut("decision_report_cadence") {
+            if let Some(obj) = drc.as_object_mut() {
+                obj.remove("recent_decision_reports_sampled");
+            }
+        }
+        m
+    };
     let (final_summary, recommendations, used_llm) = if let Some(key) = llm_key {
-        match call_llm_for_reflection(llm_endpoint, key, llm_model, &local_summary, &metrics).await
+        match call_llm_for_reflection(llm_endpoint, key, llm_model, &local_summary, &llm_metrics)
+            .await
         {
             Ok((s, r)) => (s, r, true),
             Err(e) => {
@@ -1136,10 +1166,12 @@ mod tests {
         assert!(mock_clob.get("note").is_some());
         // mock for key presence only (mirrors approval attr test); real load_clob_safety_loop_snapshot uses DB COUNT (robust .unwrap_or(0) uniform) post-generator at hermes runtime; dedicated test + re-runs green; full cargo exercises hermes unit paths + server/ui (no new DB harness per plan "smallest hermes-only" + "local cargo + unit sufficient"); generator/journal real paths via manual + runtime + journal inspection. See Issue 4/12 review fixes + plan.
         // 2026-06-06 continuation (new DR read path in do_reflection): dedicated mock assert for new Hermes attribution/metrics path (recent decision reports read per "Extend do_reflection" + backtest start); per past-issues briefing requirement for new paths.
+        // Enhanced (Issues 3/4/5): specificity (assert_eq on count/shape/note contains "extend"); combined old+new cadence keys for full structure post-extension; note recent_dr_count reuses from clob_safety_loop (not fresh query); fn name covers continuation (dr_read half documented here + block comments); TODO for expanded per plan #7 ("mock for key presence only; real via manual+runtime+journal"; "expanded tests" for query exec/err/edge/do_refl-e2e/boundaries/0/>3 in future tranche; no new harness here).
         let mock_dr_read: serde_json::Value = serde_json::json!({
             "decision_report_cadence": {
                 "recent_decision_reports_sampled": [{"id":"11111111-1111-1111-1111-111111111111","net_edge_after_fees":"0.0123","generated_by":"5min_dr_cadence_in_main"}],
                 "recent_dr_count": "1",
+                "decision_reports_considered_24h": 5,  // combined with old key
                 "note": "now reads recent decision reports (extend do_reflection per goals) for attribution/backtest start"
             }
         });
@@ -1150,5 +1182,21 @@ mod tests {
         assert!(mock_dr_read["decision_report_cadence"]
             .get("recent_dr_count")
             .is_some());
+        assert_eq!(
+            mock_dr_read["decision_report_cadence"]["recent_dr_count"],
+            "1"
+        );
+        let sample_arr = mock_dr_read["decision_report_cadence"]["recent_decision_reports_sampled"]
+            .as_array()
+            .unwrap();
+        assert_eq!(sample_arr.len(), 1);
+        assert!(mock_dr_read["decision_report_cadence"]
+            .get("decision_reports_considered_24h")
+            .is_some()); // combined old+new
+        assert!(mock_dr_read["decision_report_cadence"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("extend do_reflection"));
+        // TODO (Issues 3/4/5 + plan #7): expanded coverage for real query exec (seeded DB), error paths (fail/[]), do_reflection e2e (assert recent_* in final metrics/summary/rec), boundaries (0/>3/missing keys/period); indirect via runtime + hermes count test + full 61 suffices for skeleton.
     }
 }
