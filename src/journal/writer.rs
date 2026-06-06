@@ -5,6 +5,7 @@
 
 use crate::journal::models::Reflection;
 use crate::paper::{PaperFill, PaperOrder, PaperPosition, VirtualPortfolio};
+use rust_decimal::Decimal;
 use sqlx::PgPool;
 
 pub struct JournalWriter {
@@ -86,6 +87,28 @@ impl JournalWriter {
             .await?;
         }
         tracing::info!(count = fills.len(), "paper fills recorded to journal");
+
+        // Wire minimal tax producer from the paper fill recording path (per fees-tax-latency-and-execution-tiers.md "treat every paper trade as if it will one day be real for record-keeping purposes" + "The journal should be capable of producing: Per-trade cost basis, Fees paid (deductible...), Realized P&L..." + goals-and-operational-cadence.md "Journal extensions (comments first)" + "Query recent fills... and all decision reports" + "backtest" + "Compare decision reports vs actual outcomes" + log/plan "Ready for next (e.g. fuller backtest harness on DRs vs paper fills ... or wire minimal tax producer)" + writer TODO).
+        // Smallest: after recording the paper_fills batch, emit a tax_snapshot jsonb event (reuse record_tax_snapshot wrapper + its sanitize + record_journal_event; no new tables/kinds/migs; payload has fill count + total fee (for deductible) + note for cost basis proxy / future realized P&L reconstruction; source="paper_fills" for attribution).
+        // RISK (AGENTS.md + fees-tax-latency-and-execution-tiers.md + goals-and-operational-cadence.md 'Journal extensions (comments first)' non-negotiable):
+        // - append-only to journal.events (jsonb payload via reuse of record_journal_event);
+        // - paper proxy only (treat every paper trade as if it will one day be real for record-keeping/audit-grade per fees wiki "Tax & Record-Keeping Strategy");
+        // - never contains secrets, private keys, L2 HMACs, or anything authorizing real orders (sanitize guard at boundary);
+        // - evidence-only for Hermes future attribution of net P&L after modeled 'tax' drag / cost basis (virtual tax reserve is later Phase 3+);
+        // - Decimal strings in payload (rust_decimal for all money/price/position per AGENTS); follows exact prior DR generator + tax skeleton reuse pattern;
+        // - called on every paper fill (from PaperTradingEngine path via this recording fn in main + tests exercising fills); enables backtest harness on DRs vs paper fills + tax-adjusted per goals without touching trading paths, real, paper defaults, fail-closed, L2, reval, envs, kill, 401s, SSR subpath/<base>, *any* old/polish/DR-stub marker, ui, generator, strategy, clob, hermes consumption (already present), or prior surfaces.
+        // - tax_payload contains only aggregate counts + Decimal fees (to_string) + static note; never rationale/decision_context/secrets (sanitized; see sanitize_journal_payload + fees-tax 'treat every paper trade as if real' but evidence-only).
+        // - Note: journal events including tax_snapshot use separate pool from the FOR UPDATE tx in submit_order (pre-existing design for audit separation; tax is append-only paper proxy evidence per AGENTS/fees-tax, not used for position math; non-fatal warn on snapshot err is robust like other journal; producer failure does not affect fill recording or paper engine).
+        // See wiki/strategies/fees-tax-latency-and-execution-tiers.md + goals-and-operational-cadence.md + decisions/real-order-approval-flow.md (tax producer section) + log (new top entry) + writer::record_tax_snapshot + hermes do_reflection tax_journal_skeleton.
+        let total_fee: Decimal = fills.iter().map(|f| f.fee).sum();
+        let tax_payload = serde_json::json!({
+            "fills_count": fills.len(),
+            "total_fee": total_fee.to_string(),
+            "note": "paper fill tax proxy snapshot (fees for deductible; size/price in paper_fills table for cost basis); per fees-tax 'treat every paper trade as if it will one day be real for record-keeping purposes' + goals 'Journal extensions'; append-only evidence for Hermes net-after-tax attr + backtest (DRs vs fills + tax-adjusted); limited skeleton (no reserve/calc yet); see writer record_tax_snapshot + sanitize"
+        });
+        if let Err(e) = self.record_tax_snapshot("paper_fills", tax_payload).await {
+            tracing::warn!(error = %e, "tax snapshot from paper fills (non-fatal; skeleton producer; paper proxy only)");
+        }
         Ok(())
     }
 
@@ -197,12 +220,12 @@ impl JournalWriter {
     /// - never contains secrets, private keys, L2 HMACs, or anything authorizing real orders;
     /// - evidence-only for Hermes future attribution of net P&L after modeled 'tax' drag / cost basis (virtual tax reserve is later Phase 3+);
     /// - Decimal strings in payload; follows exact prior DR generator reuse pattern (no new tables/kinds beyond event_type string "tax_snapshot"; no mig);
-    /// - called from future code (or manual/ops) for tax snapshots; Hermes will lightly consume counts/samples (skeleton).
+    /// - producer wire from paper_fills now live (2026-06-06 tranche; inside record_paper_fills after INSERTs; data flows on actual paper fills; will see >0 in runs exercising paper submit); called from paper fill path + future/manual/ops for other snapshots; Hermes lightly consumes counts/samples (skeleton vs production; limited, no reserve/calc yet; see fees/goals for fuller).
     /// - source is normalized (trim + <=128 chars); payload sanitized at boundary (Issue 5/6).
     ///
     ///   See wiki/strategies/fees-tax-latency-and-execution-tiers.md +
     ///   goals-and-operational-cadence.md +
-    ///   decisions/real-order-approval-flow.md (tax skeleton section) +
+    ///   decisions/real-order-approval-flow.md (tax producer section) +
     ///   log.md (this tranche).
     ///
     /// TODO(future): wire calls to record_tax_snapshot from paper fill paths or produce_5min (after DRs) per fees-tax 'treat every paper trade as if it will one day be real' + goals 'Journal extensions' + backtest tie-in; see wiki/log Current State.
