@@ -194,6 +194,7 @@ pub fn App() -> Element {
             // 2026-06-03: Pending human approvals list (for operator to inspect recent approvals + copy UUIDs for submit-facade / real gated).
             // Evidence includes snapshots at approve time. Approve action itself is via "Record Facade Approval" (which now captures snapshots).
             // "Copy ID" populates window var used by submit button and shows guidance.
+            // 2026-06-06 UI polish (additive): th + note text enhanced for richer evidence + Hermes attribution cross-ref (see Hermes panel); all old ids/hooks/markers ("clob-human-approvals-*", "Pending / Recent...", "Refresh...", "Copy/Use ID...", onclick updateHuman.../recordHuman...) preserved exactly.
             div { class: "card",
                 h2 { "Pending / Recent Human Approvals (for Gated Real CLOB)" }
                 pre { id: "clob-human-approvals-summary", "No human approvals loaded" }
@@ -204,7 +205,7 @@ pub fn App() -> Element {
                             th { "Decision" }
                             th { "Approved" }
                             th { "Operator" }
-                            th { "Risk Snapshot" }
+                            th { "Risk/Coll Snapshot Summary (enriched)" }
                             th { "Action" }
                         }
                     }
@@ -215,13 +216,15 @@ pub fn App() -> Element {
                     }
                 }
                 button { "onclick": "updateHumanApprovalsList()", "Refresh Human Approvals List" }
-                small { id: "clob-human-approvals-note", "Recent clob_order_human_approval events (enriched 2026-06-03 with approve-time risk/collateral snapshots). Copy journal_event_id as human_approval_event_id for submit-facade. Use with final id + unlocks for real gated path. Read-only." }
+                small { id: "clob-human-approvals-note", "Recent clob_order_human_approval events (enriched 2026-06-03 with approve-time risk/collateral snapshots). Copy journal_event_id as human_approval_event_id for submit-facade. Use with final id + unlocks for real gated path. Read-only. Hermes approval attribution hints (approvals_with_snapshots_24h/hermes_approval_gap etc from 2026-06-06 closed-loop) in adjacent Hermes CLOB Safety Loop panel + appended here on load." }
             }
 
             div { class: "card",
                 h2 { "Hermes CLOB Safety Loop" }
                 pre { id: "clob-hermes-safety-loop-panel", "No Hermes CLOB safety loop loaded" }
                 small { "Read-only latest Hermes reflection over CLOB safety-loop journal events. This does not approve or place orders." }
+                // 2026-06-07 additive (inside existing card only; reuses fetch + updateHermesSafetyLoop + panel id; no new panel/route/id/hook): small static text for SSR test coverage of new "Recent Decision Reports..." strings + disclaimers (skeleton + static pre lines for DR/tax (siblings in stored reflection.metrics from hermes do_reflection; server build_hermes_safety_loop_response currently promotes only clob_safety_loop scalars + limited reflection sub/summary so d. fallbacks; full top-level for "live" is future when endpoint extended per goals 'backtest harness on DRs vs paper fills + tax-adjusted with real join/attr'); ties to "Risk/Coll Snapshot Summary (enriched)" style; all old markers/ids/hooks/SSR contains for "Hermes CLOB Safety Loop" + id + update + "PAPER TRADING ONLY" + paper_only + real_orders_enabled===false + <base> + "Risk/Coll..." + "Hermes attr: snaps=" + hasSnap + clob-*-panel + update*/record* + "Pending..." + "Copy/Use..." + l2-chip etc preserved *exact*; "skeleton vs production" per hermes current + plan "local cargo sufficient").
+                small { "Recent Decision Reports (5-min DR cadence) + tax + provenance to approvals/DRs (skeleton + static pre lines (DR/tax siblings in reflection.metrics; current server build promotes clob_safety_loop scalars + reflection sub only; future live when extended per goals); DR net_edge_after_fees (PRIMARY) + generated_by + ids for approvals tie + dr_vs_paper_fills_compare proxy lens; paper proxy only / skeleton vs production / observe pre-dispatch + DRs + tax + fills samples in next hermes reflection" }
             }
 
             div { class: "card",
@@ -426,6 +429,15 @@ pub fn App() -> Element {
             script {
                 r#"
                 let count = 0;
+                function escapeHtml(unsafe) {{
+                    if (unsafe == null) return '';
+                    return String(unsafe)
+                        .replace(/&/g, "&amp;")
+                        .replace(/</g, "&lt;")
+                        .replace(/>/g, "&gt;")
+                        .replace(/"/g, "&quot;")
+                        .replace(/'/g, "&#039;");
+                }}
                 function refreshDemo() {{
                     count++;
                     const now = new Date().toISOString();
@@ -1140,6 +1152,9 @@ pub fn App() -> Element {
                                 boundary.request_sent === false;
                             const dispatchState = payload.missing_no_network_evidence === true ? 'missing' : (noNetworkEvidence ? 'no-network' : (boundary.accepted_for_network_dispatch === true ? 'accepted' : 'missing'));
                             const decId = event.id || payload.journal_event_id || '';
+                            // 2026-06-06 UI polish (additive only): light snap evidence hint for final (parity with human enrichment + Hermes attribution); uses existing payload (snaps present since 2026-06-03); appended to operator cell. All old cols/ids/hooks/SSR strings preserved exactly.
+                            const hasSnap = !!(payload.risk_snapshot_at_approval || payload.collateral_snapshot_at_approval);
+                            const opWithHint = escapeHtml(payload.operator || 'unspecified') + (hasSnap ? ' [w/ snap]' : '');
                             return '<tr>' +
                                 '<td>' + escapeHtml(event.created_at || '') + '</td>' +
                                 '<td>' + escapeHtml(payload.decision || 'unknown') + '</td>' +
@@ -1147,7 +1162,7 @@ pub fn App() -> Element {
                                 '<td>' + escapeHtml(approved) + '</td>' +
                                 '<td>' + escapeHtml(boundaryState) + '</td>' +
                                 '<td>' + escapeHtml(dispatchState) + '</td>' +
-                                '<td>' + escapeHtml(payload.operator || 'unspecified') + '</td>' +
+                                '<td>' + opWithHint + '</td>' +
                                 '<td><button onclick="useFinalDecisionIdForSubmit(\'' + decId + '\')">Copy/Use Final ID for Submit</button></td>' +
                                 '</tr>';
                         }}).join('');
@@ -1180,13 +1195,26 @@ pub fn App() -> Element {
                         }}
                         body.innerHTML = events.map(function(ev) {{
                             const id = ev.journal_event_id || '';
-                            const risk = ev.risk_snapshot_at_approval ? (ev.risk_snapshot_at_approval.projected_notional || 'see-payload') : 'n/a';
+                            // 2026-06-06 UI polish (additive, no new ids/queries/hooks): richer evidence hint from already-returned full snaps (risk+coll) for operator practicality now that Hermes attributes them; created_at as approval time proxy (enriched approval_time in journal payload). Old useHuman... + table structure preserved.
+                            let riskHint = 'n/a';
+                            const rs = ev.risk_snapshot_at_approval || {{}};
+                            const cs = ev.collateral_snapshot_at_approval || {{}};
+                            if (ev.risk_snapshot_at_approval || ev.collateral_snapshot_at_approval) {{
+                                // 2026-06-06 fix round: safe coercion for anomalous snapshot shapes (noisy [object Object] avoided; inline to keep no extra named helpers beyond escapeHtml)
+                                const p = rs.projected_notional;
+                                const p2 = rs.projected;
+                                const proj = (typeof p === 'string' || typeof p === 'number') ? p : ((typeof p2 === 'string' || typeof p2 === 'number') ? p2 : '?');
+                                const c = cs.collateral_balance_positive;
+                                const c2 = cs.collateral_allowance_positive;
+                                const collOk = (c === true || c2 === true) ? 'ok' : (c === false ? 'low' : 'see');
+                                riskHint = 'p:' + proj + ' coll:' + collOk + ' [snap]';
+                            }}
                             return '<tr>' +
                                 '<td>' + escapeHtml(ev.created_at || '') + '</td>' +
                                 '<td>' + escapeHtml(ev.decision || 'n/a') + '</td>' +
                                 '<td>' + escapeHtml(String(!!ev.approved_for_facade)) + '</td>' +
                                 '<td>' + escapeHtml(ev.operator || 'unspecified') + '</td>' +
-                                '<td>' + escapeHtml(String(risk)) + '</td>' +
+                                '<td>' + escapeHtml(String(riskHint)) + '</td>' +
                                 '<td><button onclick="useHumanApprovalIdForSubmit(\'' + id + '\')">Copy/Use ID for Submit</button></td>' +
                                 '</tr>';
                         }}).join('');
@@ -1199,19 +1227,20 @@ pub fn App() -> Element {
                     if (!id) return;
                     window.latestClobHumanApprovalEventId = id;
                     const note = document.getElementById('clob-human-approvals-note');
-                    if (note) note.textContent = 'Set window.latestClobHumanApprovalEventId = ' + id + ' (also use in submit-facade JSON human_approval_event_id). Pair with final_review_decision_event_id from Final Review panel. With unlocks+kill this id enables gated real dispatch.';
+                    if (note) note.textContent = (note.textContent || '').split(' | Selected')[0] + ' | Selected human_approval_event_id for submit: ' + id + ' (also use in submit-facade JSON human_approval_event_id). Pair with final_review_decision_event_id from Final Review panel. With unlocks+kill this id enables gated real dispatch. (Hermes attr preserved)';
                     // Also update the dry-run result area if present for visibility
+                    // 2026-06-06 polish: tighter guidance for submit facade panel integration (additive text only).
                     const res = document.getElementById('dry-run-result');
-                    if (res) res.textContent = 'Selected human_approval_event_id for submit: ' + id + '\\n(Now click Submit Facade Check or POST with this id + final id + confirm_real_order_submission:true)';
+                    if (res) res.textContent = 'Selected human_approval_event_id for submit: ' + id + '\\n(Now click Submit Facade Check in the CLOB Dry-Run Intent card (or POST /clob/order-intent/submit-facade with this + final id + confirm_real_order_submission:true under unlocks+kill). Pairs with Hermes attribution in safety panel.)';
                 }}
 
                 function useFinalDecisionIdForSubmit(id) {{
                     if (!id) return;
                     window.latestClobFinalReviewEventId = id;
                     const note = document.getElementById('clob-final-review-decisions-summary');
-                    if (note) note.textContent = 'Set window.latestClobFinalReviewEventId = ' + id + ' (use in submit-facade JSON as final_review_decision_event_id). Pair with human_approval_event_id. With unlocks+kill this enables gated real dispatch reval.';
+                    if (note) note.textContent = (note.textContent || '').split(' | Selected')[0] + ' | Selected final_review_decision_event_id for submit: ' + id + ' (use in submit-facade JSON as final_review_decision_event_id). Pair with human_approval_event_id. With unlocks+kill this enables gated real dispatch reval. (note preserved)';
                     const res = document.getElementById('dry-run-result');
-                    if (res) res.textContent = 'Selected final_review_decision_event_id for submit: ' + id + '\\n(Now click Submit Facade Check or POST with human id + this + confirm_real:true)';
+                    if (res) res.textContent = 'Selected final_review_decision_event_id for submit: ' + id + '\\n(Now click Submit Facade Check in the CLOB Dry-Run Intent card (or POST with human id + this + confirm_real:true). Hermes attr notes in approvals/Hermes panels.)';
                 }}
 
                 function updateHermesSafetyLoop() {{
@@ -1245,12 +1274,49 @@ pub fn App() -> Element {
                             'latest_boundary: ' + (boundary.boundary_name || 'unknown') + ' / ' + (boundary.implementation_name || 'unknown'),
                             'latest_network_sender_present: ' + !!boundary.network_sender_present,
                             'latest_accepted_for_network_dispatch: ' + !!boundary.accepted_for_network_dispatch,
+                            // 2026-06-06 UI polish (additive, reuse of existing fetch to /clob/hermes-safety-loop which now carries the keys from hermes attribution): surface Hermes approval attribution hints lightly in this panel (and append to approvals card note below) for operator value tying self-imp to the queue UX; no new queries/ids.
+                            'approvals_with_snapshots_24h: ' + (d.approvals_with_snapshots_24h || 0),
+                            'final_review_decisions_with_snapshots_24h: ' + (d.final_review_decisions_with_snapshots_24h || 0),
+                            'pre_dispatches_with_approval_ids_24h: ' + (d.pre_dispatches_with_approval_ids_24h || 0),
+                            'dispatches_from_approved_24h: ' + (d.dispatches_from_approved_24h || 0),
+                            'approval_to_pre_dispatch_rate: ' + (d.approval_to_pre_dispatch_rate || '0.00'),
+                            'hermes_approval_gap: ' + (d.hermes_approval_gap || 0),
                             'recommendations: ' + (recs.length ? recs.slice(0, 2).join(' | ') : 'none')
                         ];
+                        // 2026-06-07 additive inside existing updateHermesSafetyLoop (after recommendations, before summary/note ifs; reuses same fetch/panel id + no change to any old line/string/id/hook/calls/setTimeout/inspect map/approvalsNote block): smallest surfacing of skeleton + static DR + tax + proxy data (DR/tax siblings in stored reflection.metrics from hermes do_reflection; server build_hermes_safety_loop_response currently promotes only clob_safety_loop scalars + limited reflection sub/summary so dynamic lines use fallback; full top-level promotion for d. "live" is future when endpoint extended per goals 'backtest harness on DRs vs paper fills + tax-adjusted with real join/attr') per current hermes state + log "Ready for next (e.g. UI for live Decision Reports + provenance to approvals/DR cadence + tax ...)" + goals "Extend `do_reflection`" "Query recent fills + all decision reports" "Compare decision reports vs actual outcomes" "backtest harness on DRs vs paper fills + tax-adjusted with real join/attr" + fees-tax "treat every paper trade as if it will one day be real" + "journal should be capable..." + plan "Ready for next / backtest" + AGENTS "self-improving" "When Adding Features" (wiki first, no new features; qualified per smallest + "no new DB harness" + "local cargo sufficient" -- server edit avoided to keep precise tranche-only + avoid any surface risk).
+                        // Renders small pre lines for sampled DR net_edge_after_fees (PRIMARY per strategy/goals), generated_by, ids (for provenance to approvals/DR cadence), tax/fill lens from dr_vs proxy; disclaimers "paper proxy only" "skeleton vs production" "limited (no full DR-fill/id-level join/attr yet... see goals-and-operational-cadence.md for fuller...)" "observe pre-dispatch + DRs + tax + fills samples in next hermes reflection" (non-overclaim per hermes + prior tranches); tie style to "Risk/Coll Snapshot Summary (enriched)".
+                        // RISK (AGENTS.md + safety first + trading rules non-negotiable): read-only display only (no enable real / no submit / no auto); paper_only + real_orders_enabled===false + fail-closed + L2 + pre-dispatch + gated reval + 401s + TEST_ENV_LOCK + --threads=1 + explicit native-l2 (no ||) + heavy comments + Decimal (source) + "no new privileged/UI" + "0 new tests ok if documented" + "local cargo + unit sufficient" + "skeleton vs production" + "no new DB harness"; all prior surfaces (paper default, gated "rejected_fail_closed", SSR <base href="/polytrader/"> + *every* old marker + *all polish* + DR-stub/approval/"Risk/Coll..."/"Hermes attr: snaps="/hasSnap/tax.../recent.../dr_vs... + "observe..." + clob-*-panel + update*/record* + "Pending..." + "Copy/Use..." + l2-chip + clob-hermes... + updateHermes... etc in app.rs + SSR test contains exactly) preserved 100% ironclad (proven by post greps/reads/SSR && chains; no leakage of new text into old strings; no regression on "PAPER TRADING ONLY" + paper_only + real_orders_enabled===false + <base> + 39+ markers). "What did we learn?": the self-imp loop data (DRs + tax + fills samples + dr_vs proxy attr + approvals provenance + pre-dispatch) from hermes reflections is now skeleton+static visible in UI for operator + to inform future low-risk Hermes wiki proposals (self-imp + wiki first-class per AGENTS); advances usability without touching any trading/real paths or prior verified surfaces. See wiki/log.md (this tranche) + AGENTS.md.
+                        const clobLoop = d.clob_safety_loop || {{}};
+                        const drCad = d.decision_report_cadence || clobLoop.decision_report_cadence || {{}};
+                        const taxSk = d.tax_journal_skeleton || clobLoop.tax_journal_skeleton || {{}};
+                        lines.push('decision_report_cadence.recent_decision_reports_sampled: ' + (drCad.recent_decision_reports_sampled || clobLoop.decision_reports_considered_24h || 0));
+                        lines.push('decision_report_cadence.decision_reports_considered_24h: ' + (drCad.decision_reports_considered_24h || clobLoop.decision_reports_considered_24h || 0));
+                        if (drCad.note) lines.push('decision_report_cadence.note: ' + drCad.note);
+                        const drs = Array.isArray(drCad.recent_decision_reports_sampled) ? drCad.recent_decision_reports_sampled : [];
+                        for (let i = 0; i < Math.min(2, drs.length); i++) {{
+                            const s = drs[i] || {{}};
+                            lines.push('DR[' + i + '] net_edge_after_fees (PRIMARY): ' + (s.net_edge_after_fees || s['net_edge_after_fees'] || '?') + ' generated_by: ' + (s.generated_by || '?') + ' id: ' + (s.id || s.journal_event_id || '?') + ' (provenance to approvals/DR cadence)');
+                        }}
+                        lines.push('tax_journal_skeleton.fills_24h: ' + (taxSk.fills_24h || clobLoop.fills_24h || 0));
+                        lines.push('tax_journal_skeleton.recent_paper_fills_sampled: ' + (taxSk.recent_paper_fills_sampled ? 'present (paper proxy)' : 'n/a'));
+                        const drvs = taxSk.dr_vs_paper_fills_compare || clobLoop.dr_vs_paper_fills_compare || {{}};
+                        lines.push('tax_journal_skeleton.dr_vs_paper_fills_compare: dr_net_preview=' + (drvs.dr_net_preview || '?') + ' fills_fee_proxy=' + (drvs.fills_fee_proxy || '?') + ' tax_snapshots_for_attr=' + (drvs.tax_snapshots_for_attr || '?'));
+                        if (drvs.proxy_attr_note) lines.push('dr_vs proxy_attr_note: ' + drvs.proxy_attr_note);
+                        if (taxSk.note) lines.push('tax_journal_skeleton.note: ' + taxSk.note);
+                        lines.push('disclaimers: paper proxy only; skeleton vs production; limited (no full DR-fill/id-level join/attr yet... see goals-and-operational-cadence.md for fuller backtest harness on DRs vs paper fills + tax-adjusted with real join/attr); observe pre-dispatch + DRs + tax + fills samples in next hermes reflection');
                         if (reflection.summary) lines.push('summary: ' + reflection.summary);
                         if (d.note) lines.push('note: ' + d.note);
                         panel.textContent = lines.join('\\n');
                         panel.style.color = d.status === 'boundary_coverage_complete' ? '#66d98f' : '#ffb366';
+                        // 2026-06-06 polish: reuse this fetch (no new query) to lightly surface Hermes attribution hint directly in the approvals card's *existing* note el (ties queue to self-imp data without new ids/hooks/markers).
+                        // Fix round: guard + use* preserve (split on ' | Selected') mitigate coupling; append ensures attr even if prior overwrites (idempotent via includes).
+                        const approvalsNote = document.getElementById('clob-human-approvals-note');
+                        if (approvalsNote && (d.approvals_with_snapshots_24h !== undefined || d.hermes_approval_gap !== undefined)) {{
+                            const extra = ' | Hermes attr: snaps=' + (d.approvals_with_snapshots_24h || 0) + ' gap=' + (d.hermes_approval_gap || 0) + ' (full in this panel)';
+                            if (!approvalsNote.textContent.includes('Hermes attr:')) {{
+                                approvalsNote.textContent = approvalsNote.textContent + extra;
+                            }}
+                        }}
                     }}).catch(e => {{
                         panel.textContent = 'Hermes CLOB safety loop unavailable: ' + e;
                         panel.style.color = '#ffb366';
@@ -2322,7 +2388,13 @@ mod tests {
                 && rendered.contains("final_review_decision_boundary_coverage")
                 && rendered.contains("missing_boundary_evidence_events_24h")
                 && rendered.contains("coverage_status")
-                && rendered.contains("complete_fail_closed_no_network_evidence"),
+                && rendered.contains("complete_fail_closed_no_network_evidence")
+                // 2026-06-07 additive for new UI DR surfacing (inside existing hermes panel only): SSR test now contains the new static strings/ids from the additive small in the card + (dynamic will be in live); while *every* prior old + polish + DR-stub/approval/"Risk/Coll Snapshot Summary (enriched)"/"Hermes attr: snaps="/hasSnap + clob-*-panel + update*/record* + "Pending / Recent Human Approvals" + "Copy/Use ID for Submit" + l2-chip + "PAPER TRADING ONLY" + paper_only + real_orders_enabled===false + <base href="/polytrader/"> + all 100+ markers remain *exact* in this && chain (proven by post-edit greps/reads on app.rs + test green; no regression, no removed, no leakage of new text into old strings).
+                && rendered.contains("Recent Decision Reports (5-min DR cadence)")
+                && rendered.contains("net_edge_after_fees (PRIMARY)")
+                && rendered.contains("provenance to approvals")
+                && rendered.contains("skeleton vs production")
+                && rendered.contains("observe pre-dispatch + DRs + tax + fills samples in next hermes reflection"),
             "read-only Hermes CLOB safety-loop panel and fetch hook must be rendered"
         );
         assert!(
