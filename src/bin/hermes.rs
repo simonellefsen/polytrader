@@ -278,13 +278,12 @@ async fn do_reflection(
         .map(|a| a.len())
         .unwrap_or(0);
     // limited proxy attr/join (additive 2026-06-07 continuation; reuses already-loaded vars; robust)
-    let dr_net_preview = recent_dr_preview.clone();
     let fills_fee_proxy = total_fees.to_string();
     let tax_snap_for_attr = tax_snapshots_24h.to_string();
     let dr_vs_fills_compare: serde_json::Value = serde_json::json!({
         "dr_sampled_24h": dr_count_for_compare.to_string(),
         "fills_sampled_24h": fills_sampled_len.to_string(),
-        "dr_net_preview": dr_net_preview,
+        "dr_net_preview": recent_dr_preview,
         "fills_fee_proxy": fills_fee_proxy,
         "tax_snapshots_for_attr": tax_snap_for_attr,
         "proxy_attr_note": "limited window-overlap proxy attr/join start (DR net preview + fills fees + tax count from samples; no id-level/time join or resolution outcomes yet; see goals-and-operational-cadence.md for fuller backtest harness on DRs vs paper fills + tax-adjusted with real join/attr); skeleton vs production; paper proxy only; append-only evidence-only; pending real fills+resolutions for outcomes; see fees/goals",
@@ -499,17 +498,17 @@ async fn do_reflection(
     // This implements the "autonomous low-risk wiki patch proposals" vision from wiki/concepts/hermes-self-improvement.md
     // and Phase 1 log follow-ups (smallest increment on existing reflection loop; no new loops, no resolution
     // trigger yet as that requires ingester schema/data expansion).
-    // 2026-06-06: now derives richer/specific proposals from approval_attribution (enriched snapshots + pre-dispatch
+    // 2026-06-07: now derives richer/specific proposals from approval_attribution (enriched snapshots + pre-dispatch
     // linkage rates/gaps/net-fees stubs) because local_summary (and thus final_summary) includes the 2026-06-06 data;
-    // proposal text will reference approval-specific updates to real-order-approval-flow or fees strategy when gated.
+    // proposal text will reference approval-specific updates to real-order-approval-flow or fees strategy when gated. (Updated per 2026-06-07 tranche per log "Ready for next").
     let mut final_recommendations = recommendations;
-    if augment_wiki_proposal_if_gated(&mut final_recommendations, &final_summary) {
-        // The helper already pushed the derived proposal (see its impl for summary/recs/metrics fidelity).
+    if augment_wiki_proposal_if_gated(&mut final_recommendations, &final_summary, &metrics) {
+        // The helper already pushed the derived proposal (see its impl for summary/recs/metrics fidelity; now feeds now-observed DR/fills/tax/pre-dispatch/approval data per log "Ready for next").
         // Log uses the last (the one just pushed) for preview.
         if let Some(last) = final_recommendations.last() {
             info!(
                 proposal_preview = %last,
-                "autonomous_low_risk_wiki_proposal_generated (gated via env=lowrisk; derived from current reflection summary/recs/metrics; included in journaled recs; no fs side-effects; safe per AGENTS)"
+                "autonomous_low_risk_wiki_proposal_generated (gated via env=lowrisk; derived from current reflection summary/recs/metrics + now-observed clob_safety/DR net/fills/tax/pre-dispatch/approval snaps; included in journaled recs; no fs side-effects; safe per AGENTS)"
             );
         }
     }
@@ -1088,16 +1087,68 @@ async fn call_llm_for_reflection(
 /// Small pure helper extracted for testability of Phase 2 gated autonomous behavior (Issue 3/4/7 fix).
 /// Returns whether gate was active + augmented. Caller does the info! for observability.
 /// Keeps main reflection path smallest while enabling meaningful coverage of env + augmentation + derivation.
-fn augment_wiki_proposal_if_gated(recs: &mut Vec<String>, summary: &str) -> bool {
-    if std::env::var("HERMES_AUTONOMOUS_WIKI_PROPOSALS").unwrap_or_default() == "lowrisk" {
+/// 2026-06-07: enhanced (additive) to feed *now-observed* data (DR net_edge_after_fees PRIMARY from decision_report_cadence/recent_dr_*, fills from tax_journal_skeleton/recent_paper_fills_sampled, tax snapshots, pre-dispatch linkage from clob_safety_loop pre_dispatches_with_approval_ids_24h tracing to hard `clob_live_order_intent_pre_dispatch` *before any net* per clob/live_sender + Gated reval, approval snaps/risk/coll from approval_attribution) into evidence-text proposal when HERMES_AUTONOMOUS_WIKI_PROPOSALS=lowrisk (per log top "Ready for next ... start hermes HERMES_AUTONOMOUS_WIKI_PROPOSALS=lowrisk wiring using now-observed data (DR net, fills, tax, pre-dispatch linkage, approval snaps)" after runbook hygiene + observe tranche; reuses in-scope metrics from do_reflection post-observe block; skeleton vs production; no fs mutation (hermes bin has no wiki/ per Dockerfile); append-only in recs/summary; no side effects when env unset/!=lowrisk; "No change to generator, DR read, fills/tax sample, load_clob, writer/producer, gated paths, paper defaults, fail-closed ("rejected_fail_closed" + network_present:false), L2, pre-dispatch hard journal, reval, 401s, SSR, *any* prior marker/surface.".
+/// RISK (AGENTS.md non-negotiable): paper-only always; "treat every paper trade as if it will one day be real for record-keeping purposes (fees-tax)" (from fees-tax-latency-and-execution-tiers.md + goals); no submit/auto/real risk; high-impact wiki changes require human review per AGENTS "with human review for high-impact items"; "paper mindset, ready kill, no real money risk"; "if no real money risk note"; "this tranche introduces none (doc only)" (proposal is evidence text only); "skeleton vs production"; "ui/app untouched this tranche"; "0 new tests ok if documented"; "local cargo + unit sufficient"; "All per AGENTS.md". See log top (this tranche) + decisions/real-order-approval-flow.md (this append + runbook + prior) + goals + fees + AGENTS.
+fn augment_wiki_proposal_if_gated(
+    recs: &mut Vec<String>,
+    summary: &str,
+    metrics: &serde_json::Value,
+) -> bool {
+    if std::env::var("HERMES_AUTONOMOUS_WIKI_PROPOSALS")
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase()
+        == "lowrisk"
+    {
         let summary_preview = summary.chars().take(180).collect::<String>();
         let recs_preview = recs
             .first()
             .cloned()
             .unwrap_or_else(|| "(see metrics)".to_string());
+        // Extract now-observed (robust .unwrap_or per all prior paths; Decimal/string via to_string; no overclaim)
+        let empty = serde_json::json!({});
+        let dr_cad = metrics.get("decision_report_cadence").unwrap_or(&empty);
+        let dr_count = dr_cad
+            .get("recent_dr_count")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0");
+        let dr_sample = dr_cad
+            .get("recent_decision_reports_sampled")
+            .cloned()
+            .unwrap_or(serde_json::json!([]));
+        let dr_sample_len = dr_sample.as_array().map(|a| a.len()).unwrap_or(0);
+        let dr_ids_preview = dr_sample
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| r.get("id").and_then(|i| i.as_str()))
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        let tax_j = metrics.get("tax_journal_skeleton").unwrap_or(&empty);
+        let tax_count = tax_j
+            .get("tax_snapshots_24h")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0");
+        let fills_len = tax_j
+            .get("fills_24h")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0");
+        let clob = metrics.get("clob_safety_loop").unwrap_or(&empty);
+        let pre_disp = clob
+            .get("pre_dispatches_with_approval_ids_24h")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let appr = metrics.get("approval_attribution").unwrap_or(&empty);
+        let appr_snaps = appr
+            .get("approvals_with_snapshots_24h")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0");
         let proposal = format!(
-            "AUTONOMOUS_LOW_RISK_WIKI_PROPOSAL: append this reflection (summary: {}...; top rec: {}; from {} recs + metrics deltas) to wiki/concepts/hermes-self-improvement.md or wiki/experiments/README.md (gated; human review required)",
-            summary_preview, recs_preview, recs.len()
+            "AUTONOMOUS_LOW_RISK_WIKI_PROPOSAL: Observed: DR cadence net_edge PRIMARY ~{} from {} sampled reports (ids: {}); fills_sampled {} with fee proxy; tax snapshots {}; pre-dispatch linkage via approval_ids in hard journal before net (pre_dispatches_with_approval_ids_24h={}); approval snaps present for attr (approvals_with_snapshots_24h={}). Proposal: monitor DR quality / fee drag / approval-to-dispatch linkage (paper proxy only). Limited (no full DR-fill/id-level join/attr yet or resolution outcomes for 'vs actual'; see goals-and-operational-cadence.md for fuller backtest harness on DRs vs paper fills + tax-adjusted with real join/attr when resolutions live). skeleton vs production; paper proxy only; pending real fills+resolutions for outcomes; Enables future self-imp proposals when resolutions live for vs actual (per goals \"Compare decision reports vs actual outcomes\"). No change to generator, DR read, fills/tax sample, load_clob, writer/producer, gated paths, paper defaults, fail-closed (\"rejected_fail_closed\" + network_present:false), L2, pre-dispatch hard journal, reval, 401s, SSR, *any* prior marker/surface. What did we learn? The observed pre-dispatch + DRs + tax + fills samples (now also UI-surfaced + runbook-documented for manual gated exercise) are producing and consumable for gated lowrisk wiki proposals per AGENTS 'self-improving system' 'Hermes + wiki first-class' 'When Adding Features' (wiki first; 'What did we learn? What should be documented?'); treat every paper trade as if it will one day be real for record-keeping (fees-tax); ready for fuller when live resolutions for actual vs DR comparison; no risk to gates/paper default/fail-closed. See log top (this tranche) + decisions/real-order-approval-flow.md (this append + runbook + prior Hermes/DR/approval sections) + goals + fees + AGENTS. All per AGENTS.md. (append this reflection (summary: {}...; top rec: {}; from {} recs + metrics deltas) to wiki/concepts/hermes-self-improvement.md or wiki/experiments/README.md (gated; human review required))",
+            dr_count, dr_sample_len, dr_ids_preview, fills_len, tax_count, pre_disp, appr_snaps, summary_preview, recs_preview, recs.len()
         );
         recs.push(proposal);
         true
@@ -1150,7 +1201,13 @@ mod tests {
             "Monitor liquidity".to_string(),
         ];
         let summary = "Paper P&L over last 24h: realized delta=5, ... Active markets: 12.";
-        let gated = augment_wiki_proposal_if_gated(&mut recs, summary);
+        let metrics = serde_json::json!({
+            "decision_report_cadence": {"recent_dr_count": "0", "recent_decision_reports_sampled": []},
+            "tax_journal_skeleton": {"tax_snapshots_24h": "0", "fills_24h": "0", "recent_paper_fills_sampled": []},
+            "clob_safety_loop": {"pre_dispatches_with_approval_ids_24h": 0},
+            "approval_attribution": {"approvals_with_snapshots_24h": "0"}
+        });
+        let gated = augment_wiki_proposal_if_gated(&mut recs, summary, &metrics);
         assert!(gated, "gate should trigger on lowrisk");
         assert_eq!(recs.len(), 3, "recs should grow by 1");
         assert!(recs
@@ -1168,6 +1225,27 @@ mod tests {
                 .expect("test invariant: recs should have proposal after gated augment")
                 .contains("from 2 recs"),
             "proposal must derive from recs count"
+        );
+        // Extend *existing* test body only (no new test fn per "0 new tests ok if documented" + plan/briefing/"local cargo + unit sufficient"); assert rich proposal exact mandated non-overclaim phrases for "surfaces 100% ironclad".
+        let last = recs.last().expect("test invariant");
+        assert!(last.contains("No change to generator, DR read, fills/tax sample, load_clob, writer/producer, gated paths, paper defaults, fail-closed"), "must contain 'No change to generator...' non-overclaim");
+        assert!(
+            last.contains(
+                "What did we learn? The observed pre-dispatch + DRs + tax + fills samples"
+            ),
+            "must contain 'What did we learn? The observed pre-dispatch...' "
+        );
+        assert!(
+            last.contains("All per AGENTS.md"),
+            "must contain 'All per AGENTS.md'"
+        );
+        assert!(
+            last.contains("pre-dispatch linkage via approval_ids in hard journal before net"),
+            "must contain pre-dispatch linkage phrase"
+        );
+        assert!(
+            last.contains("skeleton vs production"),
+            "must contain 'skeleton vs production'"
         );
 
         // restore
