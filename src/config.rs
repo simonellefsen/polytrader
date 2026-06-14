@@ -28,13 +28,29 @@ pub struct Config {
     #[arg(long, env = "POLYTRADER_PAPER_FEE_BPS", default_value_t = 50)]
     pub paper_fee_bps: u16,
 
-    /// Comma-separated list of market slugs (or ids) for focused ingestion + paper trading in Phase 0.
+    /// Comma-separated list of market slugs (or ids) for focused ingestion + paper trading.
+    /// Spans Geopolitics / Breaking / Finance plus Sports (the sports ones are arbitrage-only —
+    /// see arb_only_markets). Finance/Tech with genuinely-uncertain prices are scarce on Polymarket
+    /// right now, so the directional set is geopolitics-heavy; add more as they appear. The directional
+    /// set deliberately spreads across resolution horizons (June 14/15/30, July 31) and includes a
+    /// non-Iran-deal diversifier (Israeli PM) so signals aren't all correlated to one binary outcome.
+    /// Every market still passes the per-trade risk gate (>=4% net edge, exposure/concentration caps)
+    /// before any paper position is opened, so widening this list only widens the opportunity funnel.
     #[arg(
         long,
         env = "POLYTRADER_BOOTSTRAP_MARKETS",
-        default_value = "will-bitcoin-hit-150k-by-june-30-2026"
+        default_value = "us-x-iran-permanent-peace-deal-by-june-30-2026-837-641-896-877-363-892-537-597,strait-of-hormuz-traffic-returns-to-normal-by-end-of-june,us-iran-nuclear-deal-by-june-30,will-donald-trump-announce-that-the-united-states-blockade-of-the-strait-of-hormuz-has-been-lifted-by-june-30-2026-159-962,us-x-iran-permanent-peace-deal-by-june-15-2026-734-856-129,us-announces-new-iran-agreementceasefire-extension-by-june-14,will-bitcoin-hit-150k-by-june-30-2026,strait-of-hormuz-traffic-returns-to-normal-by-july-31,us-x-iran-permanent-peace-deal-by-july-31-2026-831-252,will-benjamin-netanyahu-be-the-next-prime-minister-of-israel,us-x-iran-diplomatic-meeting-by-june-30-2026-983-259-948-431-294-182-296-883-134-598,us-announces-new-iran-agreementceasefire-extension-by-june-15-2889-539,will-france-win-the-2026-fifa-world-cup-924,will-spain-win-the-2026-fifa-world-cup-963,will-the-new-york-knicks-win-the-2026-nba-finals,will-usa-win-the-2026-fifa-world-cup-467"
     )]
     pub bootstrap_markets: String,
+
+    /// Slugs that are ARBITRAGE-ONLY: the autonomous directional executor skips them; only risk-free
+    /// YES+NO arbitrage may trade them. Sports / World Cup go here (we don't take directional sports bets).
+    #[arg(
+        long,
+        env = "POLYTRADER_ARB_ONLY_MARKETS",
+        default_value = "will-france-win-the-2026-fifa-world-cup-924,will-spain-win-the-2026-fifa-world-cup-963,will-the-new-york-knicks-win-the-2026-nba-finals,will-usa-win-the-2026-fifa-world-cup-467"
+    )]
+    pub arb_only_markets: String,
 
     /// Ingestion poll interval in seconds (conservative to respect public rate limits).
     #[arg(long, env = "POLYTRADER_INGEST_INTERVAL_SECS", default_value_t = 300)]
@@ -144,6 +160,15 @@ impl Config {
 
     pub fn bootstrap_market_list(&self) -> Vec<String> {
         self.bootstrap_markets
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// Slugs that may only be traded via arbitrage (sports/World Cup); directional executor skips these.
+    pub fn arb_only_market_list(&self) -> Vec<String> {
+        self.arb_only_markets
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())

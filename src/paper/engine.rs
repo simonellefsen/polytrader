@@ -167,19 +167,39 @@ impl PaperTradingEngine {
         .execute(&mut *tx)
         .await?;
 
-        // Raw portfolio snapshot under tx (completes the full sequence atomically)
-        let cash_flow = if delta_shares > dec!(0) {
-            -(total_gross + total_fee)
-        } else {
-            total_gross - total_fee + dec!(0)
-        };
-        let new_usdc = (Decimal::from(10000u64) + cash_flow).max(dec!(0)); // seed fallback consistent with prior
+        // Raw portfolio snapshot under tx (completes the full sequence atomically).
+        // FIX: total_locked + virtual_usdc must reflect AGGREGATE state across all open positions,
+        // not just this order. The old code wrote total_locked=new_coll (this position only) and
+        // virtual_usdc=10000+this_order_cashflow, so multi-position portfolios were badly undercounted
+        // — which in turn made the RiskManager exposure cap (which reads total_locked) far too loose.
+        // Aggregate from the position + fill tables (within the tx, after the upsert above).
+        let total_locked_agg: Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(collateral_locked), 0) FROM paper_trading.paper_positions",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let total_fees_agg: Decimal =
+            sqlx::query_scalar("SELECT COALESCE(SUM(fee), 0) FROM paper_trading.paper_fills")
+                .fetch_one(&mut *tx)
+                .await?;
+        // Carry forward cumulative realized P&L from settlements (do NOT reset to 0 on each fill,
+        // else a fill after a settlement would wipe realized P&L — the input the "proven" gate needs).
+        let realized_agg: Decimal = sqlx::query_scalar(
+            "SELECT realized_pnl FROM paper_trading.virtual_portfolio_snapshots ORDER BY as_of DESC LIMIT 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(dec!(0));
+        // Buy-only paper model: cash = seed − open cost basis − fees + realized P&L from settlements.
+        let new_usdc = (Decimal::from(10000u64) - total_locked_agg - total_fees_agg + realized_agg)
+            .max(dec!(0));
         sqlx::query(
             r#"INSERT INTO paper_trading.virtual_portfolio_snapshots (as_of, virtual_usdc, total_locked, unrealized_pnl, realized_pnl, snapshot_reason, positions)
-               VALUES (now(), $1, $2, 0, 0, 'post_fill_tx', '[]'::jsonb)"#,
+               VALUES (now(), $1, $2, 0, $3, 'post_fill_tx', '[]'::jsonb)"#,
         )
         .bind(new_usdc)
-        .bind(new_coll)
+        .bind(total_locked_agg)
+        .bind(realized_agg)
         .execute(&mut *tx)
         .await?;
 
@@ -314,6 +334,21 @@ impl PaperTradingEngine {
             (vec![], mid)
         };
 
+        // CRITICAL: the walk below assumes the BEST price is first, but CLOB snapshots are not
+        // guaranteed best-first (observed asks sorted worst-first: [0.999, …, 0.168]). Without this
+        // sort, a market buy fills the most expensive asks first (catastrophic overspend) and a
+        // limit buy breaks on the first over-limit level (never fills). Sort best-first explicitly:
+        // asks ascending (lowest first) for buys, bids descending (highest first) for sells.
+        let mut levels_vec = levels_vec;
+        levels_vec.sort_by(|a, b| {
+            let pa = Decimal::from_str(&a.price).unwrap_or(Decimal::ZERO);
+            let pb = Decimal::from_str(&b.price).unwrap_or(Decimal::ZERO);
+            if is_buy {
+                pa.cmp(&pb)
+            } else {
+                pb.cmp(&pa)
+            }
+        });
         let levels: &[PriceSize] = &levels_vec; // for the for loop below (owned vec from clone or empty)
 
         let mut filled_size = dec!(0);

@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -322,9 +323,45 @@ async fn do_reflection(
         }
     };
 
+    // Per-signal strategy attribution (the closed-loop "learn" input): parses decision_report
+    // attribution jsonb for the new overreaction_fade signal + Kelly sizing + arb_scan events.
+    // Robust: non-fatal on failure (degrades to empty), so a transient DB issue never drops the reflection.
+    let strategy_signal_attribution = match load_strategy_signal_attribution(pool, period_start)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "strategy_signal_attribution load failed (using empty; non-fatal)");
+            json!({"error": e.to_string(), "learning_signals": []})
+        }
+    };
+
+    // Per-signal REALIZED P&L from settled positions (ground truth). Empty until markets resolve;
+    // once present, it drives P&L-based weight boosting (net-winners >1.0) instead of trim-only.
+    let (realized_pnl_summary, realized_pnl_map) = load_per_signal_realized_pnl(pool).await;
+
+    // Closed loop: turn measured attribution + realized P&L into actual FusionEngine weight changes
+    // (gated by HERMES_AUTONOMOUS_WEIGHT_TUNING=on). Writes a strategy_weights event the app loads.
+    let processor_weight_tuning = match maybe_update_processor_weights(
+        pool,
+        &strategy_signal_attribution,
+        &realized_pnl_map,
+    )
+    .await
+    {
+        Some(weights) => json!({"enabled": true, "applied_weights": weights}),
+        None => json!({
+            "enabled": std::env::var("HERMES_AUTONOMOUS_WEIGHT_TUNING").unwrap_or_default().trim().to_lowercase() == "on",
+            "note": "no change this cycle (weights unchanged, no data, or tuning disabled). Set HERMES_AUTONOMOUS_WEIGHT_TUNING=on to enable closed-loop FusionEngine weight adjustment."
+        }),
+    };
+
     let metrics = json!({
         "window_hours": 24,
         "active_markets": active_markets,
+        "strategy_signal_attribution": strategy_signal_attribution.clone(),
+        "per_signal_realized_pnl": realized_pnl_summary,
+        "processor_weight_tuning": processor_weight_tuning,
         "fills_in_window": fill_count,
         "total_fees_in_window": total_fees.to_string(),
         "latest_usdc": usdc.to_string(),
@@ -456,6 +493,21 @@ async fn do_reflection(
         );
     }
 
+    // Closed-loop: surface the data-driven strategy learning signals as recommendations.
+    // These are derived from real per-signal measurement (overreaction_fade fire rate + avg edge,
+    // Kelly sizing outcomes, arbitrage opportunities), so Hermes "learns" what is/ isn't working
+    // and recommends concrete tuning (widen thresholds, down-weight, prioritize arb wiring).
+    if let Some(signals) = strategy_signal_attribution
+        .get("learning_signals")
+        .and_then(|s| s.as_array())
+    {
+        for s in signals {
+            if let Some(txt) = s.as_str() {
+                local_recs.push(format!("[strategy-learning] {txt}"));
+            }
+        }
+    }
+
     // Conditional LLM synthesis (reqwest OpenAI-comp; smallest, configurable, safe)
     // Issue 9 (security) fix: construct llm_metrics by redacting full "recent_decision_reports_sampled" (net edges/ids from DRs; PRIMARY signals) from the cadence sub for LLM prompt only (defense-in-depth; keeps full sample in stored `metrics` + local_summary preview for journaled backtest/attr per goals/AGENTS; additive only; does not affect non-LLM path or reflections).
     // Issue 4 (security) parity: also redact "recent_tax_sample" from tax_journal_skeleton (future may include cost basis/fees/P&L per fees-tax "audit-grade" + goals backtest; defense-in-depth for LLM path; full kept in stored metrics + local_summary count for attr; cross-ref Issue 9 redaction).
@@ -474,6 +526,8 @@ async fn do_reflection(
         }
         m
     };
+    let llm_configured = llm_key.is_some();
+    let mut llm_error: Option<String> = None;
     let (final_summary, recommendations, used_llm) = if let Some(key) = llm_key {
         match call_llm_for_reflection(llm_endpoint, key, llm_model, &local_summary, &llm_metrics)
             .await
@@ -481,12 +535,24 @@ async fn do_reflection(
             Ok((s, r)) => (s, r, true),
             Err(e) => {
                 warn!(error = %e, "LLM call failed (fallback to local synthesis; robust handling)");
+                llm_error = Some(e.to_string());
                 (local_summary, local_recs, false)
             }
         }
     } else {
         (local_summary, local_recs, false)
     };
+
+    // Journal LLM/AI health so the UI can surface failures (out of credits, auth, rate-limit, …).
+    journal_llm_health(
+        pool,
+        llm_configured,
+        llm_endpoint,
+        llm_model,
+        used_llm,
+        llm_error.as_deref(),
+    )
+    .await;
 
     // === Phase 2: Gated autonomous low-risk wiki patch proposal (new behavior) ===
     // SAFETY / AGENTS / paper gate: Explicit opt-in env only (HERMES_AUTONOMOUS_WIKI_PROPOSALS=lowrisk).
@@ -1009,6 +1075,571 @@ fn build_final_review_decision_boundary_coverage(
     })
 }
 
+/// Robustly parse a Decimal from a JSON value that may be a number or a string.
+/// rust_decimal serde can emit either form depending on feature flags; never use float for finance.
+fn dec_from_json(v: &serde_json::Value) -> Decimal {
+    if v.is_null() {
+        return Decimal::ZERO;
+    }
+    if let Some(s) = v.as_str() {
+        return s.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+    }
+    serde_json::from_value::<Decimal>(v.clone()).unwrap_or(Decimal::ZERO)
+}
+
+/// Compact "reason=count" summary of the most common Kelly cap reasons.
+fn capped_summary(m: &BTreeMap<String, i64>) -> String {
+    let mut v: Vec<(&String, &i64)> = m.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1));
+    v.iter()
+        .take(3)
+        .map(|(k, c)| format!("{k}={c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Pure aggregation of per-signal strategy attribution (extracted for unit testing).
+///
+/// Reads the decision_report attribution jsonb (one entry per FusionEngine processor) plus the
+/// kelly_sizing block, and the latest arb_scan summary, then produces:
+///   - per_processor: how often each signal was present / fired (non-zero score), avg confidence/edge
+///   - kelly_sizing_summary: avg recommended size, positive-size count, cap-reason histogram
+///   - arbitrage_summary: scan count + best net profit observed
+///   - learning_signals: concrete, data-driven recommendations Hermes feeds back into the loop
+///
+/// This is the genuine "learn" step: it replaces the old "pending_fusion_5min_reports" stub with
+/// real measurement of the new overreaction_fade signal + Kelly sizing + arbitrage. All Decimal.
+fn aggregate_strategy_signal_attribution(
+    dr_payloads: &[serde_json::Value],
+    arb_scans_24h: i64,
+    arb_best_net: Option<String>,
+    arb_latest_opportunity_count: i64,
+) -> serde_json::Value {
+    const PROCESSORS: [&str; 5] = [
+        "orderbook_momentum",
+        "spike_divergence",
+        "overreaction_fade",
+        "yahoo_finance",
+        "news_sentiment",
+    ];
+    let reports = dr_payloads.len() as i64;
+
+    let avg = |sum: Decimal, n: i64| -> Decimal {
+        if n > 0 {
+            (sum / Decimal::from(n)).round_dp(4)
+        } else {
+            Decimal::ZERO
+        }
+    };
+
+    let mut per_processor = serde_json::Map::new();
+    for name in PROCESSORS {
+        let mut present = 0i64;
+        let mut fired = 0i64;
+        let mut conf_sum = Decimal::ZERO;
+        let mut abs_score_sum = Decimal::ZERO;
+        let mut edge_sum = Decimal::ZERO;
+        for p in dr_payloads {
+            let attr = &p["report"]["attribution"][name];
+            if attr.is_object() {
+                present += 1;
+                let score = dec_from_json(&attr["score"]);
+                conf_sum += dec_from_json(&attr["confidence"]);
+                abs_score_sum += score.abs();
+                edge_sum += dec_from_json(&attr["edge"]);
+                if !score.is_zero() {
+                    fired += 1;
+                }
+            }
+        }
+        let fire_rate = if present > 0 {
+            (Decimal::from(fired) / Decimal::from(present)).round_dp(3)
+        } else {
+            Decimal::ZERO
+        };
+        per_processor.insert(
+            name.to_string(),
+            json!({
+                "present_in_reports": present,
+                "fired_nonzero_score": fired,
+                "fire_rate": fire_rate.to_string(),
+                "avg_confidence": avg(conf_sum, present).to_string(),
+                "avg_abs_score": avg(abs_score_sum, present).to_string(),
+                "avg_edge": avg(edge_sum, present).to_string(),
+            }),
+        );
+    }
+
+    // Kelly sizing summary
+    let mut kelly_n = 0i64;
+    let mut kelly_pos = 0i64;
+    let mut kelly_rec_sum = Decimal::ZERO;
+    let mut capped: BTreeMap<String, i64> = BTreeMap::new();
+    for p in dr_payloads {
+        let k = &p["kelly_sizing"];
+        if k.is_object() {
+            kelly_n += 1;
+            let rec = dec_from_json(&k["recommended_usdc"]);
+            kelly_rec_sum += rec;
+            if rec > Decimal::ZERO {
+                kelly_pos += 1;
+            }
+            let cap = k["capped_by"].as_str().unwrap_or("none").to_string();
+            *capped.entry(cap).or_insert(0) += 1;
+        }
+    }
+    let kelly_avg = avg(kelly_rec_sum, kelly_n).round_dp(2);
+
+    // Learning signals: concrete, data-driven recommendations (the closed-loop output).
+    let mut learning: Vec<String> = Vec::new();
+    if reports == 0 {
+        learning.push(
+            "No decision reports in window — verify the 5-min DR generator is running before drawing strategy conclusions.".to_string(),
+        );
+    } else {
+        if let Some(o) = per_processor.get("overreaction_fade") {
+            let fired = o["fired_nonzero_score"].as_i64().unwrap_or(0);
+            let fr = o["fire_rate"].as_str().unwrap_or("0");
+            let avg_edge = o["avg_edge"].as_str().unwrap_or("0");
+            if fired == 0 {
+                learning.push(format!(
+                    "overreaction_fade never fired across {reports} reports — prices sat inside the 0.28/0.72 fade band (calm regime). Expected; no action."
+                ));
+            } else {
+                learning.push(format!(
+                    "overreaction_fade fired {fired} time(s) (fire_rate {fr}, avg_edge {avg_edge}). If avg_edge stays below the 4% net gate, widen the 0.28/0.72 thresholds or down-weight this processor."
+                ));
+            }
+        }
+        if kelly_n > 0 {
+            let neg = capped.get("negative_kelly").copied().unwrap_or(0);
+            if neg * 2 > kelly_n {
+                learning.push(format!(
+                    "Kelly returned negative size in {neg}/{kelly_n} reports — signals lack positive expected value at current prices; do not size up."
+                ));
+            } else {
+                learning.push(format!(
+                    "Kelly avg recommended size {kelly_avg} USDC over {kelly_n} reports ({kelly_pos} positive); top cap reasons: {}.",
+                    capped_summary(&capped)
+                ));
+            }
+        }
+    }
+    match &arb_best_net {
+        Some(best) => learning.push(format!(
+            "Arbitrage scanner journaled {arb_scans_24h} scan(s); latest found {arb_latest_opportunity_count} opportunity(ies), best net/unit {best}. Prioritize live arb execution wiring (currently identification-only)."
+        )),
+        None => learning.push(format!(
+            "Arbitrage scanner journaled {arb_scans_24h} scan(s); no net-positive opportunities in window (efficient markets) — keep scanning, no execution needed."
+        )),
+    }
+
+    json!({
+        "reports_considered_24h": reports,
+        "per_processor": serde_json::Value::Object(per_processor),
+        "kelly_sizing_summary": {
+            "reports_with_kelly": kelly_n,
+            "avg_recommended_usdc": kelly_avg.to_string(),
+            "positive_size_reports": kelly_pos,
+            "capped_by_counts": json!(capped),
+        },
+        "arbitrage_summary": {
+            "arb_scans_24h": arb_scans_24h,
+            "latest_opportunity_count": arb_latest_opportunity_count,
+            "best_net_profit_per_unit": arb_best_net,
+        },
+        "learning_signals": learning,
+        "note": "Per-signal attribution parsed from decision_report attribution jsonb (overreaction_fade + momentum/divergence) + kelly_sizing + arb_scan events. Replaces the prior 'pending_fusion_5min_reports' stub with real measurement; feeds gated wiki proposals + future processor weight tuning. Paper-only; Decimal exclusively."
+    })
+}
+
+/// Load + aggregate per-signal strategy attribution for the reflection window.
+///
+/// RISK: append-only reads from journal.events only (decision_report + arb_scan payloads, no secrets).
+/// Never submits orders or mutates strategy. Robust: empty/failed queries degrade to empty samples.
+async fn load_strategy_signal_attribution(
+    pool: &sqlx::PgPool,
+    period_start: DateTime<Utc>,
+) -> Result<serde_json::Value> {
+    let dr_payloads: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload FROM journal.events
+         WHERE event_type = 'decision_report' AND created_at >= $1
+         ORDER BY created_at DESC LIMIT 200",
+    )
+    .bind(period_start)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let arb_scans_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal.events WHERE event_type = 'arb_scan' AND created_at >= $1",
+    )
+    .bind(period_start)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    let latest_arb: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload FROM journal.events
+         WHERE event_type = 'arb_scan' AND created_at >= $1
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(period_start)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+
+    let (arb_best_net, arb_latest_count) = match &latest_arb {
+        Some(p) => (
+            p["best_net_profit_per_unit"]
+                .as_str()
+                .map(|s| s.to_string()),
+            p["opportunity_count"].as_i64().unwrap_or(0),
+        ),
+        None => (None, 0),
+    };
+
+    Ok(aggregate_strategy_signal_attribution(
+        &dr_payloads,
+        arb_scans_24h,
+        arb_best_net,
+        arb_latest_count,
+    ))
+}
+
+// ===== Closed-loop processor weight tuning =====
+// FusionEngine multiplies each processor's confidence-weight by a learned multiplier. Hermes
+// measures per-signal behaviour and writes the new multipliers to a `strategy_weights` journal
+// event; the main app + server load them on the next cycle. This is what turns Hermes' learning
+// into an actual change of trading behaviour. Bounds mirror strategy::weights (separate bin, so
+// duplicated intentionally — bins don't share the main binary's modules).
+const WEIGHT_MIN: Decimal = dec!(0.25);
+const WEIGHT_MAX: Decimal = dec!(2.0);
+
+fn clamp_weight(w: Decimal) -> Decimal {
+    w.max(WEIGHT_MIN).min(WEIGHT_MAX)
+}
+
+/// Pure: compute new per-processor weights from previous weights + measured attribution.
+///
+/// Target selection (per processor), in priority order:
+///   1. REALIZED-P&L-BASED (when the signal has attributed realized P&L from settled positions):
+///      target = 1.0 + realized_pnl / PNL_SCALE, clamped [MIN, MAX]. Net-winners get BOOSTED above
+///      1.0; net-losers get trimmed below. This is real outcome-driven learning.
+///   2. Fire-rate heuristic fallback (no realized P&L yet — markets unresolved):
+///      present-but-never-fired → 0.5 (trim dilution); fired → 1.0 (neutral); absent → hold.
+///
+/// New weight moves toward target by STEP (gradual; avoids oscillation), clamped to [MIN, MAX].
+fn compute_weight_adjustments(
+    prev: &BTreeMap<String, Decimal>,
+    attribution: &serde_json::Value,
+    realized_pnl: &BTreeMap<String, Decimal>,
+) -> BTreeMap<String, Decimal> {
+    const STEP: Decimal = dec!(0.34);
+    const PNL_SCALE: Decimal = dec!(40); // $40 cumulative realized → full boost (2.0) / trim (0.25)
+    let mut out = BTreeMap::new();
+    if let Some(per) = attribution.get("per_processor").and_then(|p| p.as_object()) {
+        for (name, stats) in per {
+            let present = stats
+                .get("present_in_reports")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let fired = stats
+                .get("fired_nonzero_score")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let current = prev.get(name).copied().unwrap_or(dec!(1.0));
+            let target = if let Some(pnl) = realized_pnl.get(name) {
+                // Realized-P&L-based (the real learning signal).
+                clamp_weight(dec!(1.0) + (*pnl / PNL_SCALE))
+            } else if present == 0 {
+                current
+            } else if fired == 0 {
+                dec!(0.5)
+            } else {
+                dec!(1.0)
+            };
+            let next = clamp_weight(current + STEP * (target - current)).round_dp(3);
+            out.insert(name.clone(), next);
+        }
+    }
+    out
+}
+
+/// Pure: attribute each settled position's realized P&L to the signals that drove its market, using
+/// the decision-report attribution as influence weights (|score × effective_weight| per signal).
+/// `settled`: (market_id, realized_pnl). `dr_attr_by_market`: market_id → that market's
+/// `report.attribution` objects. Returns (per-signal realized P&L, unattributed P&L).
+fn attribute_pnl_to_signals(
+    settled: &[(String, Decimal)],
+    dr_attr_by_market: &BTreeMap<String, Vec<serde_json::Value>>,
+) -> (BTreeMap<String, Decimal>, Decimal) {
+    const PROCESSORS: [&str; 5] = [
+        "orderbook_momentum",
+        "spike_divergence",
+        "overreaction_fade",
+        "yahoo_finance",
+        "news_sentiment",
+    ];
+    let mut per_signal: BTreeMap<String, Decimal> = BTreeMap::new();
+    let mut unattributed = Decimal::ZERO;
+    for (market, pnl) in settled {
+        let mut influence: BTreeMap<String, Decimal> = BTreeMap::new();
+        if let Some(attrs) = dr_attr_by_market.get(market) {
+            for attr in attrs {
+                for name in PROCESSORS {
+                    if let Some(sig) = attr.get(name) {
+                        let inf = dec_from_json(&sig["score"]).abs()
+                            * dec_from_json(&sig["effective_weight"]).abs();
+                        if inf > Decimal::ZERO {
+                            *influence.entry(name.to_string()).or_insert(Decimal::ZERO) += inf;
+                        }
+                    }
+                }
+            }
+        }
+        let total: Decimal = influence.values().copied().sum();
+        if total > Decimal::ZERO {
+            for (name, inf) in &influence {
+                let share = inf / total;
+                *per_signal.entry(name.clone()).or_insert(Decimal::ZERO) +=
+                    (share * pnl).round_dp(4);
+            }
+        } else {
+            unattributed += *pnl;
+        }
+    }
+    (per_signal, unattributed)
+}
+
+/// Load settled positions + their markets' decision-report attribution and compute per-signal
+/// realized P&L. Returns (summary JSON for metrics, per-signal map for weight tuning).
+async fn load_per_signal_realized_pnl(
+    pool: &sqlx::PgPool,
+) -> (serde_json::Value, BTreeMap<String, Decimal>) {
+    let settled: Vec<(Option<String>, Option<Decimal>)> = sqlx::query_as(
+        "SELECT payload->>'market_id', (payload->>'realized_pnl')::numeric
+         FROM journal.events WHERE event_type = 'paper_position_settled'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let settled: Vec<(String, Decimal)> = settled
+        .into_iter()
+        .filter_map(|(m, p)| Some((m?, p?)))
+        .collect();
+
+    let mut dr_by_market: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+    for (m, _) in &settled {
+        if dr_by_market.contains_key(m) {
+            continue;
+        }
+        let attrs: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload->'report'->'attribution' FROM journal.events
+             WHERE event_type = 'decision_report' AND payload->>'market_id' = $1
+             ORDER BY created_at DESC LIMIT 20",
+        )
+        .bind(m)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        dr_by_market.insert(m.clone(), attrs);
+    }
+
+    let (per_signal, unattributed) = attribute_pnl_to_signals(&settled, &dr_by_market);
+    let total_realized: Decimal = settled.iter().map(|(_, p)| *p).sum();
+    let per_signal_json: serde_json::Map<String, serde_json::Value> = per_signal
+        .iter()
+        .map(|(k, v)| (k.clone(), json!(v.to_string())))
+        .collect();
+    let summary = json!({
+        "settled_positions": settled.len(),
+        "total_realized_pnl": total_realized.to_string(),
+        "per_signal": per_signal_json,
+        "unattributed_pnl": unattributed.to_string(),
+        "note": "Realized P&L attributed to signals by decision-report influence (|score×effective_weight|). When present, drives P&L-based weight BOOSTING (net-winners >1.0); else weights fall back to the fire-rate heuristic. Empty until positions resolve.",
+    });
+    (summary, per_signal)
+}
+
+/// Load the most recent Hermes-written processor weights (for incremental adjustment).
+async fn load_prev_weights(pool: &sqlx::PgPool) -> BTreeMap<String, Decimal> {
+    let latest: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload FROM journal.events
+         WHERE event_type = 'strategy_weights'
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    let mut out = BTreeMap::new();
+    if let Some(p) = latest {
+        if let Some(obj) = p.get("weights").and_then(|w| w.as_object()) {
+            for (k, v) in obj {
+                let w = v
+                    .as_str()
+                    .and_then(|s| s.parse::<Decimal>().ok())
+                    .unwrap_or(dec!(1.0));
+                out.insert(k.clone(), clamp_weight(w));
+            }
+        }
+    }
+    out
+}
+
+/// Gated closed-loop weight update. Returns the new weights map (as JSON) if written.
+///
+/// Gate: env HERMES_AUTONOMOUS_WEIGHT_TUNING=on (default off — neutral 1.0 weights, no behaviour
+/// change). When on, writes a `strategy_weights` event only if weights changed materially.
+/// RISK: paper-only; weights clamped + gradual; affects only simulated fusion ranking. No order path.
+async fn maybe_update_processor_weights(
+    pool: &sqlx::PgPool,
+    attribution: &serde_json::Value,
+    realized_pnl: &BTreeMap<String, Decimal>,
+) -> Option<serde_json::Value> {
+    if std::env::var("HERMES_AUTONOMOUS_WEIGHT_TUNING")
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase()
+        != "on"
+    {
+        return None;
+    }
+
+    let prev = load_prev_weights(pool).await;
+    let next = compute_weight_adjustments(&prev, attribution, realized_pnl);
+    if next.is_empty() {
+        return None;
+    }
+    let changed = next.iter().any(|(k, v)| {
+        prev.get(k)
+            .map(|p| (*p - *v).abs() > dec!(0.001))
+            .unwrap_or(*v != dec!(1.0))
+    });
+    if !changed {
+        return None;
+    }
+
+    let weights_json: serde_json::Map<String, serde_json::Value> = next
+        .iter()
+        .map(|(k, v)| (k.clone(), json!(v.to_string())))
+        .collect();
+    let prev_json: serde_json::Map<String, serde_json::Value> = prev
+        .iter()
+        .map(|(k, v)| (k.clone(), json!(v.to_string())))
+        .collect();
+    let realized_basis = !realized_pnl.is_empty();
+    let realized_json: serde_json::Map<String, serde_json::Value> = realized_pnl
+        .iter()
+        .map(|(k, v)| (k.clone(), json!(v.to_string())))
+        .collect();
+    let payload = json!({
+        "weights": weights_json,
+        "previous": prev_json,
+        "basis": if realized_basis { "realized_pnl_v1" } else { "heuristic_fire_rate_v1" },
+        "per_signal_realized_pnl": realized_json,
+        "paper_only": true,
+        "note": "Hermes closed-loop weight tuning. When per-signal realized P&L exists (settled positions), weights move toward 1.0 + pnl/40 — net-winners BOOSTED above 1.0, net-losers trimmed. Otherwise falls back to the fire-rate heuristic (trim never-firing). Clamped [0.25,2.0], gradual step 0.34. FusionEngine applies these to confidence-weights next cycle."
+    });
+
+    let insert = sqlx::query(
+        "INSERT INTO journal.events (id, event_type, source, severity, payload)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind("strategy_weights")
+    .bind("hermes_weight_tuner")
+    .bind("info")
+    .bind(&payload)
+    .execute(pool)
+    .await;
+
+    match insert {
+        Ok(_) => {
+            info!(weights = %json!(weights_json), "closed-loop processor weights updated (gated; paper-only)");
+            Some(json!(weights_json))
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to write strategy_weights event (non-fatal)");
+            None
+        }
+    }
+}
+
+/// Classify an LLM error string into a coarse, UI-friendly cause.
+fn classify_llm_error(e: &str) -> &'static str {
+    let l = e.to_lowercase();
+    if l.contains("402")
+        || l.contains("credit")
+        || l.contains("insufficient")
+        || l.contains("quota")
+    {
+        "out_of_credits"
+    } else if l.contains("401") || l.contains("403") || l.contains("auth") || l.contains("api key")
+    {
+        "auth_error"
+    } else if l.contains("429") || l.contains("rate") {
+        "rate_limited"
+    } else if l.contains("timed out") || l.contains("timeout") {
+        "timeout"
+    } else if l.contains("model") || l.contains("404") {
+        "model_error"
+    } else {
+        "unknown"
+    }
+}
+
+/// Journal an `llm_health` event each reflection so the dashboards can show whether the AI model is
+/// working, disabled, or failing (and why — e.g. out of credits). Append-only; no secrets.
+async fn journal_llm_health(
+    pool: &sqlx::PgPool,
+    configured: bool,
+    endpoint: &str,
+    model: &str,
+    used_llm: bool,
+    error: Option<&str>,
+) {
+    let status = if !configured {
+        "disabled"
+    } else if used_llm {
+        "ok"
+    } else {
+        "failed"
+    };
+    let provider = if endpoint.contains("openrouter") {
+        "openrouter"
+    } else if endpoint.contains("openai") {
+        "openai"
+    } else {
+        "custom"
+    };
+    let payload = json!({
+        "status": status,
+        "provider": provider,
+        "model": model,
+        "configured": configured,
+        "error": error,
+        "likely_cause": error.map(classify_llm_error),
+        "checked_at": Utc::now().to_rfc3339(),
+    });
+    let _ = sqlx::query(
+        "INSERT INTO journal.events (id, event_type, source, severity, payload)
+         VALUES ($1, 'llm_health', 'hermes_llm', $2, $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(if status == "ok" { "info" } else { "warn" })
+    .bind(&payload)
+    .execute(pool)
+    .await;
+    if status != "ok" {
+        warn!(status, provider, model, error = ?error, "LLM health: not OK");
+    } else {
+        info!(provider, model, "LLM health: ok");
+    }
+}
+
 /// Minimal reqwest call to OpenAI-compatible chat completions (no extra crates, timeout, error mapped).
 /// Prompt engineered for structured output; parse simple.
 async fn call_llm_for_reflection(
@@ -1040,15 +1671,31 @@ async fn call_llm_for_reflection(
         "max_tokens": 300
     });
 
-    let resp = client
+    // OpenRouter-friendly headers (harmless for OpenAI). Capture status + body on non-2xx so the
+    // health event can distinguish "out of credits" (402) from auth (401) / rate-limit (429).
+    let http = client
         .post(endpoint)
         .bearer_auth(key)
+        .header("HTTP-Referer", "https://polytrader.local")
+        .header("X-Title", "polytrader-hermes")
         .json(&body)
         .send()
-        .await?
-        .error_for_status()?
-        .json::<serde_json::Value>()
         .await?;
+    let status = http.status();
+    if !status.is_success() {
+        let body_text = http.text().await.unwrap_or_default();
+        let detail = serde_json::from_str::<serde_json::Value>(&body_text)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| body_text.chars().take(200).collect());
+        return Err(anyhow::anyhow!("HTTP {}: {}", status.as_u16(), detail));
+    }
+    let resp = http.json::<serde_json::Value>().await?;
 
     // Extract (safer .get chains per review; still robust fallback)
     let content = resp
@@ -1159,9 +1806,175 @@ fn augment_wiki_proposal_if_gated(
 
 #[cfg(test)]
 mod tests {
-    use super::{augment_wiki_proposal_if_gated, build_final_review_decision_boundary_coverage};
+    use super::{
+        aggregate_strategy_signal_attribution, augment_wiki_proposal_if_gated,
+        build_final_review_decision_boundary_coverage, compute_weight_adjustments, dec_from_json,
+    };
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use serde_json::json;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn weight_tuning_trims_dead_processor_holds_active() {
+        // overreaction_fade fired (active) → stays ~1.0; orderbook_momentum present but never
+        // fired (dead stub) → trimmed toward 0.5; absent processor → untouched.
+        let attribution = json!({
+            "per_processor": {
+                "overreaction_fade": {"present_in_reports": 3, "fired_nonzero_score": 3},
+                "orderbook_momentum": {"present_in_reports": 3, "fired_nonzero_score": 0},
+            }
+        });
+        let prev: BTreeMap<String, Decimal> = BTreeMap::new(); // all default 1.0
+        let no_pnl: BTreeMap<String, Decimal> = BTreeMap::new();
+        let next = compute_weight_adjustments(&prev, &attribution, &no_pnl);
+
+        // active processor held at 1.0 (target 1.0, already there)
+        assert_eq!(next.get("overreaction_fade").copied().unwrap(), dec!(1.0));
+        // dead stub trimmed: 1.0 + 0.34*(0.5-1.0) = 0.83
+        assert_eq!(next.get("orderbook_momentum").copied().unwrap(), dec!(0.83));
+        // a second cycle keeps trimming toward 0.5 (gradual)
+        let next2 = compute_weight_adjustments(&next, &attribution, &no_pnl);
+        assert!(next2.get("orderbook_momentum").copied().unwrap() < dec!(0.83));
+        assert!(next2.get("orderbook_momentum").copied().unwrap() >= dec!(0.25));
+        // never below floor
+    }
+
+    #[test]
+    fn weight_tuning_respects_floor_and_holds_absent_processors() {
+        let attribution = json!({
+            "per_processor": {
+                "spike_divergence": {"present_in_reports": 5, "fired_nonzero_score": 0},
+            }
+        });
+        // Start already near the floor; must not go below MIN_WEIGHT (0.25)
+        let mut prev = BTreeMap::new();
+        prev.insert("spike_divergence".to_string(), dec!(0.26));
+        let no_pnl: BTreeMap<String, Decimal> = BTreeMap::new();
+        let next = compute_weight_adjustments(&prev, &attribution, &no_pnl);
+        assert!(next.get("spike_divergence").copied().unwrap() >= dec!(0.25));
+    }
+
+    #[test]
+    fn realized_pnl_boosts_winners_and_trims_losers() {
+        use super::attribute_pnl_to_signals;
+        // overreaction_fade fired strongly (score 0.4, effective_weight 0.5) on a market that
+        // settled at −$20 → it should get attributed the loss and be trimmed below 1.0.
+        let mut dr_by_market = BTreeMap::new();
+        dr_by_market.insert(
+            "M1".to_string(),
+            vec![json!({
+                "overreaction_fade": {"score": "0.4", "effective_weight": "0.5"},
+                "news_sentiment": {"score": "0", "effective_weight": "0.1"},
+            })],
+        );
+        let (per_signal, unattributed) =
+            attribute_pnl_to_signals(&[("M1".to_string(), dec!(-20))], &dr_by_market);
+        assert_eq!(
+            per_signal.get("overreaction_fade").copied().unwrap(),
+            dec!(-20)
+        );
+        assert_eq!(unattributed, dec!(0));
+
+        // Now feed that realized loss into weight tuning → overreaction trimmed; a +$40 winner → boosted.
+        let attribution = json!({"per_processor": {
+            "overreaction_fade": {"present_in_reports": 3, "fired_nonzero_score": 3},
+            "news_sentiment": {"present_in_reports": 3, "fired_nonzero_score": 3},
+        }});
+        let prev: BTreeMap<String, Decimal> = BTreeMap::new();
+        let mut realized = BTreeMap::new();
+        realized.insert("overreaction_fade".to_string(), dec!(-20)); // loser
+        realized.insert("news_sentiment".to_string(), dec!(40)); // winner
+        let next = compute_weight_adjustments(&prev, &attribution, &realized);
+        // loser target = 1 + (-20/40) = 0.5 → 1.0 + 0.34*(0.5-1.0) = 0.83
+        assert_eq!(next.get("overreaction_fade").copied().unwrap(), dec!(0.83));
+        // winner target = 1 + (40/40) = 2.0 → 1.0 + 0.34*(2.0-1.0) = 1.34 (boosted ABOVE 1.0)
+        assert_eq!(next.get("news_sentiment").copied().unwrap(), dec!(1.34));
+    }
+
+    #[test]
+    fn strategy_signal_attribution_aggregates_overreaction_kelly_and_arb() {
+        // Dedicated unit test for the new closed-loop strategy attribution path (per codebase
+        // convention: new Hermes attribution paths get a dedicated mock-assert test).
+        // Two decision_report payloads: one where overreaction_fade fired, one where it didn't;
+        // each carries a kelly_sizing block. Plus an arb summary.
+        let dr_payloads = vec![
+            json!({
+                "report": {"attribution": {
+                    "overreaction_fade": {"score": "0.30", "confidence": "0.55", "edge": "0.165"},
+                    "orderbook_momentum": {"score": "0", "confidence": "0.10", "edge": "0"},
+                }},
+                "kelly_sizing": {"recommended_usdc": "12.50", "capped_by": "max_position_usdc"},
+            }),
+            json!({
+                "report": {"attribution": {
+                    "overreaction_fade": {"score": "0", "confidence": "0", "edge": "0"},
+                    "orderbook_momentum": {"score": "0", "confidence": "0.10", "edge": "0"},
+                }},
+                "kelly_sizing": {"recommended_usdc": "0", "capped_by": "negative_kelly"},
+            }),
+        ];
+
+        let out =
+            aggregate_strategy_signal_attribution(&dr_payloads, 4, Some("0.0123".to_string()), 2);
+
+        assert_eq!(out["reports_considered_24h"], 2);
+        // overreaction_fade present twice, fired once
+        let ov = &out["per_processor"]["overreaction_fade"];
+        assert_eq!(ov["present_in_reports"], 2);
+        assert_eq!(ov["fired_nonzero_score"], 1);
+        assert_eq!(
+            ov["fire_rate"]
+                .as_str()
+                .unwrap()
+                .parse::<Decimal>()
+                .unwrap(),
+            Decimal::new(5, 1)
+        );
+        // kelly: 2 reports, 1 positive, one negative_kelly cap recorded
+        assert_eq!(out["kelly_sizing_summary"]["reports_with_kelly"], 2);
+        assert_eq!(out["kelly_sizing_summary"]["positive_size_reports"], 1);
+        assert_eq!(
+            out["kelly_sizing_summary"]["capped_by_counts"]["negative_kelly"],
+            1
+        );
+        // arb summary carried through
+        assert_eq!(out["arbitrage_summary"]["arb_scans_24h"], 4);
+        assert_eq!(
+            out["arbitrage_summary"]["best_net_profit_per_unit"],
+            "0.0123"
+        );
+        // learning signals are produced and non-empty (the closed-loop output)
+        let signals = out["learning_signals"]
+            .as_array()
+            .expect("learning_signals array");
+        assert!(!signals.is_empty());
+        assert!(signals
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("overreaction_fade")));
+        assert!(signals
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("Arbitrage scanner")));
+    }
+
+    #[test]
+    fn strategy_attribution_handles_empty_reports() {
+        let out = aggregate_strategy_signal_attribution(&[], 0, None, 0);
+        assert_eq!(out["reports_considered_24h"], 0);
+        let signals = out["learning_signals"].as_array().expect("array");
+        // Should warn about no decision reports + arb note
+        assert!(signals
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("No decision reports")));
+    }
+
+    #[test]
+    fn dec_from_json_parses_string_and_number_forms() {
+        assert_eq!(dec_from_json(&json!("0.25")), Decimal::new(25, 2));
+        assert_eq!(dec_from_json(&json!(2)), Decimal::from(2));
+        assert_eq!(dec_from_json(&json!(null)), Decimal::ZERO);
+        assert_eq!(dec_from_json(&json!("garbage")), Decimal::ZERO);
+    }
 
     #[test]
     fn test_pl_delta_attribution_basic() {

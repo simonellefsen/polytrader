@@ -38,6 +38,44 @@ spec:
           env:
             - name: POLYTRADER_MODE
               value: "paper"
+            # Bootstrap market slugs across Geopolitics / Breaking / Finance + Sports (World Cup, NBA).
+            # Sports are arbitrage-only (see POLYTRADER_ARB_ONLY_MARKETS). Uncertain Finance/Tech
+            # markets are scarce on Polymarket right now, so the directional set is geopolitics-heavy.
+            - name: POLYTRADER_BOOTSTRAP_MARKETS
+              value: "us-x-iran-permanent-peace-deal-by-june-30-2026-837-641-896-877-363-892-537-597,strait-of-hormuz-traffic-returns-to-normal-by-end-of-june,us-iran-nuclear-deal-by-june-30,will-donald-trump-announce-that-the-united-states-blockade-of-the-strait-of-hormuz-has-been-lifted-by-june-30-2026-159-962,us-x-iran-permanent-peace-deal-by-june-15-2026-734-856-129,us-announces-new-iran-agreementceasefire-extension-by-june-14,will-bitcoin-hit-150k-by-june-30-2026,strait-of-hormuz-traffic-returns-to-normal-by-july-31,us-x-iran-permanent-peace-deal-by-july-31-2026-831-252,will-benjamin-netanyahu-be-the-next-prime-minister-of-israel,us-x-iran-diplomatic-meeting-by-june-30-2026-983-259-948-431-294-182-296-883-134-598,us-announces-new-iran-agreementceasefire-extension-by-june-15-2889-539,will-france-win-the-2026-fifa-world-cup-924,will-spain-win-the-2026-fifa-world-cup-963,will-the-new-york-knicks-win-the-2026-nba-finals,will-usa-win-the-2026-fifa-world-cup-467"
+            # Arb-only markets (sports/World Cup): directional executor skips these; only risk-free
+            # YES+NO arbitrage may trade them.
+            - name: POLYTRADER_ARB_ONLY_MARKETS
+              value: "will-france-win-the-2026-fifa-world-cup-924,will-spain-win-the-2026-fifa-world-cup-963,will-the-new-york-knicks-win-the-2026-nba-finals,will-usa-win-the-2026-fifa-world-cup-467"
+            # Autonomous paper executor: when "on", passing Decision Reports go through RiskManager
+            # gates and place Kelly-sized PAPER orders (never real). Default off = evaluation only.
+            - name: POLYTRADER_AUTONOMOUS_PAPER_EXECUTION
+              value: "on"
+            # External advisory signals: Yahoo Finance spot (asset markets) + newsdata.io news
+            # headline sentiment, fed into FusionEngine as low-confidence advisory inputs.
+            - name: POLYTRADER_EXTERNAL_SIGNALS
+              value: "on"
+            # newsdata.io API key (free plan, 200 credits/day — usage is cached + budget-capped).
+            - name: NEWSDATA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: polytrader-newsdata
+                  key: NEWSDATA_API_KEY
+            # READ-ONLY real CLOB access: lets the fail-closed shadow pipeline validate would-be
+            # orders against real account/market state (balance, allowance, tick size). No writes.
+            # Real ORDER submission stays gated separately (ENABLE_REAL_ORDER_SUBMISSION, unset).
+            - name: POLYTRADER_ENABLE_REAL_CLOB_READS
+              value: "true"
+            # Real Polymarket account (read-only reconciliation): proxy/funder wallet that holds the
+            # PUSD collateral, and the signer's proxy type. signature_type=1 (POLY_PROXY) confirmed
+            # on-chain (proxy is a Polymarket ProxyWallet, not a Gnosis Safe). No order path enabled.
+            - name: POLYMARKET_ADDRESS
+              valueFrom:
+                secretKeyRef:
+                  name: polytrader-polymarket
+                  key: POLYMARKET_ADDRESS
+            - name: POLYMARKET_SIGNATURE_TYPE
+              value: "1"
             - name: RUST_LOG
               value: "info,polytrader=debug"
             # Extra visibility for container debugging

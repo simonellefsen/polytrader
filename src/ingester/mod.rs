@@ -24,27 +24,65 @@ pub async fn ingest_tick(
     pool: &PgPool,
     bootstrap: &[String],
 ) -> Result<()> {
-    let candidates = gamma.list_active_markets().await?;
+    // When a bootstrap allowlist is configured, fetch those markets by slug directly (guaranteed
+    // to retrieve them). Otherwise fall back to generic active-market discovery.
+    let candidates = if bootstrap.is_empty() {
+        gamma.list_active_markets().await?
+    } else {
+        gamma.fetch_markets_by_slugs(bootstrap).await?
+    };
     let mut processed = 0usize;
 
     for m in candidates {
+        // Defensive: with the slug path this always matches; kept so discovery mode + any stray
+        // results are still constrained to the allowlist.
         if !bootstrap.is_empty() && !bootstrap.iter().any(|b| b == &m.id || b == &m.slug) {
             continue;
         }
 
         let outcomes_j = serde_json::to_value(&m.outcomes)?;
         let tokens_j = serde_json::to_value(&m.clob_token_ids)?;
+        let prices_j = serde_json::to_value(&m.outcome_prices)?;
 
-        // Upsert market (ignore some fields for bootstrap)
+        // Resolution: when closed and exactly one outcome is priced ~$1, that's the winner.
+        // (Normalized to canonical "Yes"/"No" to match position rows.)
+        let resolved_outcome: Option<String> = if m.closed {
+            let winners: Vec<usize> = m
+                .outcome_prices
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.parse::<f64>().map(|x| x >= 0.99).unwrap_or(false))
+                .map(|(i, _)| i)
+                .collect();
+            if winners.len() == 1 {
+                m.outcomes.get(winners[0]).map(|o| {
+                    if o.eq_ignore_ascii_case("yes") {
+                        "Yes".to_string()
+                    } else if o.eq_ignore_ascii_case("no") {
+                        "No".to_string()
+                    } else {
+                        o.clone()
+                    }
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Upsert market (resolution fields refreshed on conflict so closes are captured).
         sqlx::query(
             r#"INSERT INTO market_data.markets
-               (gamma_id, slug, question, outcomes, clob_token_ids, active, closed, updated_at, raw_json)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8)
+               (gamma_id, slug, question, outcomes, clob_token_ids, active, closed, updated_at, raw_json, outcome_prices, resolved_outcome)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10)
                ON CONFLICT (gamma_id) DO UPDATE SET
                  slug = EXCLUDED.slug,
                  question = EXCLUDED.question,
                  active = EXCLUDED.active,
                  closed = EXCLUDED.closed,
+                 outcome_prices = EXCLUDED.outcome_prices,
+                 resolved_outcome = COALESCE(EXCLUDED.resolved_outcome, market_data.markets.resolved_outcome),
                  updated_at = now()"#,
         )
         .bind(&m.id)
@@ -55,6 +93,8 @@ pub async fn ingest_tick(
         .bind(m.active)
         .bind(m.closed)
         .bind(serde_json::json!(&m)) // raw for now
+        .bind(prices_j)
+        .bind(&resolved_outcome)
         .execute(pool)
         .await?;
 

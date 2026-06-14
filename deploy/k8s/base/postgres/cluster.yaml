@@ -31,9 +31,25 @@ spec:
       secret:
         name: polytrader-postgres-superuser  # create this secret separately
 
-  # Monitoring & backup scaffolding (expand later)
   monitoring:
     enablePodMonitor: false   # set true if prometheus operator present
+
+  backup:
+    retentionPolicy: "30d"
+    barmanObjectStore:
+      destinationPath: s3://polytrader-cnpg/
+      endpointURL: http://host.docker.internal:9000
+      s3Credentials:
+        accessKeyId:
+          name: polytrader-minio-backup
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: polytrader-minio-backup
+          key: ACCESS_SECRET_KEY
+      wal:
+        compression: gzip
+      data:
+        compression: gzip
 
   # PostgreSQL configuration
   postgresql:

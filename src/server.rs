@@ -13,7 +13,7 @@
 //! ngrok header trust only from edge, $150 personal data exposure (future per-user), no migs.
 //! Credits: AGENTS.md, prior ngrok deploy (edge SSO context), no UI auth from 5 polymarket repos.
 
-use crate::strategy::{FeeContext, FusionEngine};
+use crate::strategy::{ArbitrageScanner, FeeContext, FusionEngine};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -267,7 +267,9 @@ pub async fn start_server(
     // rewrite /polytrader/* to /*, but serving both forms makes the deployment robust
     // when the edge forwards the original path after SSO.
     let app_routes = Router::new()
-        .route("/", get(dashboard_handler))
+        // Landing page = the lively Markets board. The legacy Dioxus console moves to /console.
+        .route("/", get(board_page_handler))
+        .route("/console", get(dashboard_handler))
         .route("/markets", get(markets_handler))
         .route("/market-categories", get(market_categories_handler))
         .route(
@@ -287,6 +289,11 @@ pub async fn start_server(
             "/strategy/paper-orders",
             post(strategy_paper_order_submit_handler),
         )
+        .route("/strategy/arb", get(strategy_arb_handler))
+        .route("/trades", get(trades_page_handler))
+        .route("/trades/data", get(trades_data_handler))
+        .route("/board", get(board_page_handler))
+        .route("/board/data", get(board_data_handler))
         .route("/paper/portfolio", get(portfolio_handler))
         .route("/paper/order-preview", post(paper_order_preview_handler))
         .route(
@@ -658,6 +665,38 @@ async fn strategy_paper_order_readiness_handler(
                 "post_order_called": false,
                 "post_orders_called": false,
                 "error": format!("Failed to build strategy paper-order readiness: {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn strategy_arb_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    //! Scan active markets for YES+NO missing-probability arbitrage opportunities.
+    //!
+    //! Returns markets where best_ask_yes + best_ask_no < $1.00 (net of taker fees).
+    //! Sorted by net_profit_per_unit descending (best first).
+    //!
+    //! RISK: Snapshots are up to ~5 min stale (ingester cadence). Prices shown are
+    //! indicative only. Real arb execution requires live WebSocket feeds and
+    //! simultaneous order placement. Paper-only; read-only; no orders submitted.
+    let scanner = ArbitrageScanner::with_default_fees();
+    match scanner.scan(&state.pool).await {
+        Ok(opps) => Json(serde_json::json!({
+            "paper_only": true,
+            "real_orders_enabled": false,
+            "strategy": "arbitrage_missing_probability",
+            "note": "YES+NO best-ask sum below $1.00 after taker fees. Snapshot-based; prices may have moved. Never auto-executed.",
+            "count": opps.len(),
+            "opportunities": opps,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "error": format!("arb scan failed: {e}"),
             })),
         )
             .into_response(),
@@ -1140,6 +1179,861 @@ async fn paper_positions_handler(State(state): State<Arc<AppState>>) -> impl Int
     }
 }
 
+/// JSON backing the /trades visualization: portfolio summary, open positions with live unrealized
+/// P&L (current mid vs avg entry), and the recent autonomous execution feed. Read-only, paper-only.
+async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let pool = &state.pool;
+
+    let portfolio: Option<(
+        Decimal,
+        Decimal,
+        Decimal,
+        Decimal,
+        chrono::DateTime<chrono::Utc>,
+    )> = sqlx::query_as(
+        "SELECT virtual_usdc, total_locked, unrealized_pnl, realized_pnl, as_of
+             FROM paper_trading.virtual_portfolio_snapshots ORDER BY as_of DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    // Open positions joined to market metadata + the current mid for the held outcome.
+    // (market_id, slug, question, outcome, shares, avg_entry, collateral_locked, current_mid)
+    type PositionRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Decimal,
+        Decimal,
+        Decimal,
+        Option<Decimal>,
+    );
+    let pos_rows: Vec<PositionRow> = sqlx::query_as(
+        "SELECT p.market_id, m.slug, m.question, p.outcome, p.shares, p.avg_entry_price,
+                p.collateral_locked,
+                CASE WHEN p.outcome = 'Yes' THEN m.last_mid_yes ELSE m.last_mid_no END AS current_mid
+         FROM paper_trading.paper_positions p
+         LEFT JOIN market_data.markets m ON m.gamma_id = p.market_id
+         WHERE p.shares > 0
+         ORDER BY p.collateral_locked DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let positions: Vec<serde_json::Value> = pos_rows
+        .into_iter()
+        .map(
+            |(market_id, slug, question, outcome, shares, avg_entry, locked, current_mid)| {
+                let mid = current_mid.unwrap_or(avg_entry);
+                let unrealized = (shares * (mid - avg_entry)).round_dp(2);
+                serde_json::json!({
+                    "market_id": market_id,
+                    "slug": slug,
+                    "question": question,
+                    "outcome": outcome,
+                    "shares": shares.round_dp(2).to_string(),
+                    "avg_entry_price": avg_entry.round_dp(4).to_string(),
+                    "current_mid": mid.round_dp(4).to_string(),
+                    "collateral_locked": locked.round_dp(2).to_string(),
+                    "unrealized_pnl": unrealized.to_string(),
+                })
+            },
+        )
+        .collect();
+
+    let exec_rows: Vec<(String, serde_json::Value, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as(
+            "SELECT event_type, payload, created_at FROM journal.events
+         WHERE event_type IN ('autonomous_paper_execution', 'autonomous_arb_execution')
+         ORDER BY created_at DESC LIMIT 40",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+    let executions: Vec<serde_json::Value> = exec_rows
+        .into_iter()
+        .map(|(event_type, payload, created_at)| {
+            serde_json::json!({
+                "kind": event_type,
+                "action": payload.get("action").and_then(|v| v.as_str()).unwrap_or("?"),
+                "market_id": payload.get("market_id"),
+                "outcome": payload.get("outcome"),
+                "approved_usdc": payload.get("approved_usdc"),
+                "gross_notional": payload.get("gross_notional"),
+                "net_edge": payload.get("net_edge"),
+                "reason": payload.get("reason"),
+                "both_legs_filled": payload.get("both_legs_filled"),
+                "at": created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    let total_unrealized: Decimal = positions
+        .iter()
+        .filter_map(|p| p["unrealized_pnl"].as_str()?.parse::<Decimal>().ok())
+        .sum();
+
+    let portfolio_json = match portfolio {
+        Some((usdc, locked, _unreal, realized, as_of)) => serde_json::json!({
+            "virtual_usdc": usdc.round_dp(2).to_string(),
+            "total_locked": locked.round_dp(2).to_string(),
+            "realized_pnl": realized.round_dp(2).to_string(),
+            "live_unrealized_pnl": total_unrealized.round_dp(2).to_string(),
+            "equity": (usdc + locked + total_unrealized).round_dp(2).to_string(),
+            "as_of": as_of.to_rfc3339(),
+        }),
+        None => serde_json::json!({}),
+    };
+
+    // Real-trading shadow orders (fail-closed) + the latest go-live gate, for the readiness panel.
+    let shadow_rows: Vec<(serde_json::Value, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT payload, created_at FROM journal.events
+         WHERE event_type = 'clob_shadow_order' ORDER BY created_at DESC LIMIT 10",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let go_live_gate = shadow_rows
+        .first()
+        .map(|(p, _)| {
+            p.get("go_live_gate")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        })
+        .unwrap_or(serde_json::Value::Null);
+    let shadow_orders: Vec<serde_json::Value> = shadow_rows
+        .into_iter()
+        .map(|(p, at)| {
+            serde_json::json!({
+                "at": at.to_rfc3339(),
+                "would_send": p.get("would_send"),
+                "dispatched": p.get("fail_closed_result").and_then(|r| r.get("request_sent")),
+                "rejection_reason": p.get("fail_closed_result").and_then(|r| r.get("rejection_reason")),
+            })
+        })
+        .collect();
+
+    // Real Polymarket account: latest PUSD balance of the proxy (read-only, journaled by main).
+    let real_balance: Option<(serde_json::Value, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT payload, created_at FROM journal.events
+         WHERE event_type = 'real_account_balance' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let real_account = match real_balance {
+        Some((p, at)) => serde_json::json!({
+            "proxy_address": p.get("proxy_address"),
+            "collateral_token": p.get("collateral_token"),
+            "balance": p.get("balance"),
+            "as_of": at.to_rfc3339(),
+        }),
+        None => serde_json::Value::Null,
+    };
+
+    // Settlements: resolved positions → realized P&L (ground truth on strategy performance).
+    let settle_rows: Vec<(serde_json::Value, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT payload, created_at FROM journal.events
+         WHERE event_type = 'paper_position_settled' ORDER BY created_at DESC LIMIT 25",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let settlements: Vec<serde_json::Value> = settle_rows
+        .iter()
+        .map(|(p, at)| {
+            serde_json::json!({
+                "at": at.to_rfc3339(),
+                "market_id": p.get("market_id"),
+                "outcome": p.get("outcome"),
+                "won": p.get("won"),
+                "realized_pnl": p.get("realized_pnl"),
+                "payout": p.get("payout"),
+                "cost_basis": p.get("cost_basis"),
+            })
+        })
+        .collect();
+    let settled_count = settlements.len();
+    let settled_pnl: Decimal = settle_rows
+        .iter()
+        .filter_map(|(p, _)| p.get("realized_pnl")?.as_str()?.parse::<Decimal>().ok())
+        .sum();
+    let wins = settle_rows
+        .iter()
+        .filter(|(p, _)| p.get("won").and_then(|v| v.as_bool()).unwrap_or(false))
+        .count();
+
+    let llm_health: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload FROM journal.events WHERE event_type = 'llm_health' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    // Total-P&L time series for the live equity chart: running P&L = realized + unrealized at each
+    // snapshot (zero at inception, independent of starting bankroll). Ascending for left-to-right plot.
+    let series_rows: Vec<(chrono::DateTime<chrono::Utc>, Decimal, Decimal)> = sqlx::query_as(
+        "SELECT as_of, realized_pnl, unrealized_pnl FROM (
+             SELECT as_of, realized_pnl, unrealized_pnl
+             FROM paper_trading.virtual_portfolio_snapshots
+             ORDER BY as_of DESC LIMIT 300
+         ) s ORDER BY as_of ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let pnl_series: Vec<serde_json::Value> = series_rows
+        .into_iter()
+        .map(|(at, realized, unreal)| {
+            serde_json::json!({
+                "t": at.timestamp(),
+                "pnl": (realized + unreal).round_dp(2).to_string(),
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "portfolio": portfolio_json,
+        "pnl_series": pnl_series,
+        "open_positions": positions,
+        "recent_executions": executions,
+        "real_account": real_account,
+        "llm_health": llm_health,
+        "settlements": {
+            "count": settled_count,
+            "wins": wins,
+            "total_realized_pnl": settled_pnl.round_dp(2).to_string(),
+            "recent": settlements,
+        },
+        "real_trading": {
+            "go_live_gate": go_live_gate,
+            "recent_shadow_orders": shadow_orders,
+        },
+    }))
+    .into_response()
+}
+
+/// Self-contained HTML page that visualizes paper trades (polls /trades/data). Kept separate from
+/// the Dioxus dashboard to stay low-risk; linked by URL. Paper-only, read-only.
+async fn trades_page_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let prefix = state.subpath_prefix.clone();
+    Html(render_trades_page(&prefix))
+}
+
+/// Render the self-contained trades dashboard HTML. `__PREFIX__` placeholders are replaced with the
+/// subpath prefix so fetches resolve under reverse-proxy deployments. (No format! to avoid escaping
+/// every brace in the embedded CSS/JS.)
+fn render_trades_page(prefix: &str) -> String {
+    const PAGE: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Polytrader — Paper Trades</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#0d1117; color:#e6edf3; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:16px 24px; border-bottom:1px solid #21262d; display:flex; align-items:center; gap:12px; }
+  h1 { font-size:18px; margin:0; }
+  .badge { background:#1f6feb22; color:#58a6ff; border:1px solid #1f6feb55; padding:2px 8px; border-radius:12px; font-size:12px; }
+  .paper { background:#23863622; color:#3fb950; border-color:#23863655; }
+  main { padding:24px; max-width:1100px; margin:0 auto; }
+  .cards { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:24px; }
+  .card { background:#161b22; border:1px solid #21262d; border-radius:8px; padding:14px 18px; min-width:140px; }
+  .card .label { color:#8b949e; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  .card .val { font-size:20px; font-weight:600; margin-top:4px; }
+  h2 { font-size:14px; color:#8b949e; text-transform:uppercase; letter-spacing:.04em; margin:24px 0 8px; }
+  table { width:100%; border-collapse:collapse; background:#161b22; border:1px solid #21262d; border-radius:8px; overflow:hidden; }
+  th,td { text-align:left; padding:8px 12px; border-bottom:1px solid #21262d; font-variant-numeric:tabular-nums; }
+  th { color:#8b949e; font-weight:500; font-size:12px; }
+  tr:last-child td { border-bottom:none; }
+  .pos { color:#3fb950; } .neg { color:#f85149; } .muted { color:#8b949e; }
+  .pill { font-size:11px; padding:1px 7px; border-radius:10px; border:1px solid #30363d; }
+  .arb { color:#d2a8ff; border-color:#8957e555; } .dir { color:#58a6ff; border-color:#1f6feb55; }
+  .empty { color:#8b949e; padding:18px; text-align:center; }
+  .chartbox { background:#161b22; border:1px solid #21262d; border-radius:8px; padding:10px 12px; }
+  .chartbox svg { display:block; width:100%; height:auto; }
+  .t { color:#8b949e; font-size:12px; }
+  footer { color:#8b949e; font-size:12px; padding:0 24px 24px; max-width:1100px; margin:0 auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Polytrader — Paper Trades</h1>
+  <span class="badge paper">PAPER ONLY</span>
+  <span class="badge" id="updated">loading…</span>
+  <span class="badge" id="llm" title="Hermes AI model health">AI: …</span>
+  <nav style="display:flex;gap:4px;margin-left:auto;">
+    <a href="__ROOT__" style="color:#8b949e;text-decoration:none;padding:5px 12px;border-radius:7px;font-size:13px;">Markets</a>
+    <a href="__PREFIX__/trades" style="background:#1f6feb22;color:#58a6ff;text-decoration:none;padding:5px 12px;border-radius:7px;font-size:13px;">Trades</a>
+    <a href="__PREFIX__/console" style="color:#8b949e;text-decoration:none;padding:5px 12px;border-radius:7px;font-size:13px;">Console</a>
+  </nav>
+</header>
+<main>
+  <div class="cards" id="cards"></div>
+  <h2>Profit &amp; Loss <span class="pill" id="pnl-now"></span></h2>
+  <div id="pnl-chart" class="chartbox"><div class="empty">loading P&amp;L history…</div></div>
+  <h2>Open Positions</h2>
+  <div id="positions"></div>
+  <h2>Settlements <span class="pill dir" id="settle-summary"></span></h2>
+  <div id="settlements"></div>
+  <h2>Recent Autonomous Executions</h2>
+  <div id="exec-filter" style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap;"></div>
+  <div id="executions"></div>
+  <h2>Real-Trading Readiness <span class="pill dir">fail-closed · nothing sent</span></h2>
+  <div id="readiness"></div>
+  <div id="shadows"></div>
+</main>
+<footer>Auto-refreshes every 15s · all activity simulated against live public market data · no real orders.</footer>
+<script>
+const PREFIX = "__PREFIX__";
+const fmt = (v) => (v===null||v===undefined) ? "—" : v;
+const num = (v) => { const n = parseFloat(v); return isNaN(n) ? "—" : n; };
+const cls = (v) => { const n = parseFloat(v); return n>0?"pos":(n<0?"neg":"muted"); };
+const sign = (v) => { const n = parseFloat(v); return (n>0?"+":"") + (isNaN(n)?"—":n.toFixed(2)); };
+
+// Live P&L area chart: green when the latest total P&L is >= 0, red when underwater. Plots the
+// running realized+unrealized series. Pure inline SVG (no chart lib) so it stays self-contained.
+function renderPnlChart(series){
+  const box = document.getElementById("pnl-chart");
+  const pts = (series||[]).map(s => ({t: s.t, v: parseFloat(s.pnl)})).filter(p => !isNaN(p.v));
+  const nowEl = document.getElementById("pnl-now");
+  if (pts.length < 2) { box.innerHTML = `<div class="empty">Not enough P&L history yet — the chart appears once a few snapshots accrue.</div>`; nowEl.textContent=""; return; }
+  const last = pts[pts.length-1].v;
+  const up = last >= 0;
+  const stroke = up ? "#3fb950" : "#f85149";
+  const fill   = up ? "rgba(63,185,80,0.16)" : "rgba(248,81,73,0.16)";
+  nowEl.textContent = (last>=0?"+":"") + last.toFixed(2);
+  nowEl.style.color = stroke; nowEl.style.borderColor = stroke+"55";
+  const W=1000, H=220, padL=46, padR=12, padT=14, padB=22;
+  const xs = pts.map(p=>p.t), vs = pts.map(p=>p.v);
+  const minT=Math.min(...xs), maxT=Math.max(...xs);
+  let minV=Math.min(...vs,0), maxV=Math.max(...vs,0);
+  if (minV===maxV){ minV-=1; maxV+=1; }
+  const pad=(maxV-minV)*0.1||1; minV-=pad; maxV+=pad;
+  const sx=t=> padL + (maxT===minT?0:(t-minT)/(maxT-minT))*(W-padL-padR);
+  const sy=v=> padT + (1-(v-minV)/(maxV-minV))*(H-padT-padB);
+  const line = pts.map((p,i)=>`${i?'L':'M'}${sx(p.t).toFixed(1)},${sy(p.v).toFixed(1)}`).join("");
+  const area = `M${sx(pts[0].t).toFixed(1)},${sy(minV<0?0:minV).toFixed(1)} ` +
+               pts.map(p=>`L${sx(p.t).toFixed(1)},${sy(p.v).toFixed(1)}`).join(" ") +
+               ` L${sx(pts[pts.length-1].t).toFixed(1)},${sy(minV<0?0:minV).toFixed(1)} Z`;
+  const zeroY = sy(0);
+  const fmtAxis=(v)=> (v>=0?"+":"")+v.toFixed(0);
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Profit and loss over time">
+    <line x1="${padL}" y1="${padT}" x2="${padL}" y2="${H-padB}" stroke="#30363d" stroke-width="1"/>
+    <line x1="${padL}" y1="${zeroY.toFixed(1)}" x2="${W-padR}" y2="${zeroY.toFixed(1)}" stroke="#484f58" stroke-width="1" stroke-dasharray="4 4"/>
+    <text x="6" y="${(padT+8).toFixed(0)}" fill="#8b949e" font-size="12">${fmtAxis(maxV)}</text>
+    <text x="6" y="${(zeroY+4).toFixed(0)}" fill="#8b949e" font-size="12">0</text>
+    <text x="6" y="${(H-padB).toFixed(0)}" fill="#8b949e" font-size="12">${fmtAxis(minV)}</text>
+    <path d="${area}" fill="${fill}" stroke="none"/>
+    <path d="${line}" fill="none" stroke="${stroke}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+    <circle cx="${sx(pts[pts.length-1].t).toFixed(1)}" cy="${sy(last).toFixed(1)}" r="3.5" fill="${stroke}"/>
+  </svg>`;
+}
+
+// Executions feed with filtering (hide the rejection noise).
+let lastExec = [];
+let execFilter = "active"; // active = filled + no-fill (hides rejections); all/filled/rejected
+const FILTERS = [["active","Active"],["filled","Filled only"],["rejected","Rejected"],["all","All"]];
+function passFilter(r){
+  const a = r.action||"";
+  if (execFilter==="all") return true;
+  if (execFilter==="filled") return a.includes("filled");
+  if (execFilter==="rejected") return a.includes("rejected");
+  return !a.includes("rejected"); // "active": everything except rejections
+}
+function renderExec(){
+  document.getElementById("exec-filter").innerHTML = FILTERS.map(([k,l])=>
+    `<button onclick="execFilter='${k}';renderExec();" style="cursor:pointer;font-size:12px;padding:3px 10px;border-radius:7px;border:1px solid #30363d;background:${execFilter===k?'#1f6feb22':'#161b22'};color:${execFilter===k?'#58a6ff':'#8b949e'};">${l}</button>`
+  ).join("");
+  const ex = lastExec.filter(passFilter);
+  document.getElementById("executions").innerHTML = ex.length ? `<table>
+    <tr><th>Time</th><th>Type</th><th>Action</th><th>Market</th><th>Side</th><th>Detail</th></tr>
+    ${ex.map(r => {
+      const isArb = (r.kind||"").includes("arb");
+      const detail = r.gross_notional ? ("$" + num(r.gross_notional)) : (r.reason ? fmt(r.reason) : (r.approved_usdc ? ("$"+num(r.approved_usdc)) : "—"));
+      const aCls = (r.action||"").includes("filled")?"pos":((r.action||"").includes("rejected")?"muted":"");
+      return `<tr>
+        <td class="t">${new Date(r.at).toLocaleString()}</td>
+        <td><span class="pill ${isArb?'arb':'dir'}">${isArb?'arb':'directional'}</span></td>
+        <td class="${aCls}">${fmt(r.action)}</td>
+        <td>${fmt(r.market_id)}</td>
+        <td>${fmt(r.outcome)}</td>
+        <td>${detail}</td>
+      </tr>`;
+    }).join("")}
+  </table>` : `<div class="empty">No executions match this filter.</div>`;
+}
+
+async function load() {
+  let d;
+  try { d = await (await fetch(PREFIX + "/trades/data", {cache:"no-store"})).json(); }
+  catch (e) { document.getElementById("updated").textContent = "fetch error"; return; }
+  const p = d.portfolio || {};
+  const ra = d.real_account || null;
+  const cards = [
+    ["Paper equity", "$" + fmt(p.equity)],
+    ["Paper cash", "$" + fmt(p.virtual_usdc)],
+    ["Locked", "$" + fmt(p.total_locked)],
+    ["Realized P&L", "$" + fmt(p.realized_pnl)],
+    ["Unrealized P&L", "$" + fmt(p.live_unrealized_pnl)],
+  ];
+  if (ra && ra.balance != null) {
+    cards.push(["REAL " + fmt(ra.collateral_token||"PUSD"), "$" + fmt(ra.balance)]);
+  }
+  document.getElementById("cards").innerHTML = cards
+    .map(([l,v]) => `<div class="card"><div class="label">${l}</div><div class="val">${v}</div></div>`).join("");
+  document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
+
+  renderPnlChart(d.pnl_series);
+
+  const pos = d.open_positions || [];
+  document.getElementById("positions").innerHTML = pos.length ? `<table>
+    <tr><th>Market</th><th>Side</th><th>Shares</th><th>Avg entry</th><th>Current</th><th>Locked</th><th>Unrealized</th></tr>
+    ${pos.map(r => `<tr>
+      <td title="${fmt(r.question)}">${fmt(r.slug||r.market_id)}</td>
+      <td>${fmt(r.outcome)}</td>
+      <td>${num(r.shares)}</td>
+      <td>${num(r.avg_entry_price)}</td>
+      <td>${num(r.current_mid)}</td>
+      <td>$${num(r.collateral_locked)}</td>
+      <td class="${cls(r.unrealized_pnl)}">${sign(r.unrealized_pnl)}</td>
+    </tr>`).join("")}
+  </table>` : `<div class="empty">No open positions — the strategy is waiting for a qualifying opportunity.</div>`;
+
+  const st = d.settlements || {count:0,recent:[]};
+  document.getElementById("settle-summary").textContent =
+    st.count ? `${st.count} settled · ${st.wins} won · realized ${st.total_realized_pnl}` : "none yet";
+  document.getElementById("settlements").innerHTML = (st.recent||[]).length ? `<table>
+    <tr><th>Time</th><th>Market</th><th>Side</th><th>Result</th><th>Payout</th><th>Realized P&amp;L</th></tr>
+    ${st.recent.map(s => `<tr>
+      <td class="t">${new Date(s.at).toLocaleString()}</td>
+      <td>${fmt(s.market_id)}</td>
+      <td>${fmt(s.outcome)}</td>
+      <td class="${s.won?'pos':'neg'}">${s.won?'WON':'lost'}</td>
+      <td>$${num(s.payout)}</td>
+      <td class="${cls(s.realized_pnl)}">${sign(s.realized_pnl)}</td>
+    </tr>`).join("")}
+  </table>` : `<div class="empty">No settlements yet — positions realize P&L when their markets resolve.</div>`;
+
+  const llm = d.llm_health;
+  const llmEl = document.getElementById("llm");
+  if (!llm) { llmEl.textContent = "AI: n/a"; llmEl.style.color="#8b949e"; }
+  else {
+    const s = llm.status;
+    const label = s==="ok" ? `AI ✓ ${fmt(llm.model)}` : (s==="disabled" ? "AI: local-only" : `AI ✗ ${fmt(llm.likely_cause||"failed")}`);
+    llmEl.textContent = label;
+    llmEl.style.color = s==="ok" ? "#3fb950" : (s==="disabled" ? "#8b949e" : "#f85149");
+    llmEl.title = (llm.error||"")+" ("+fmt(llm.provider)+"/"+fmt(llm.model)+")";
+  }
+
+  lastExec = d.recent_executions || [];
+  renderExec();
+
+  const rt = d.real_trading || {};
+  const g = rt.go_live_gate || {};
+  const yn = (ok) => ok ? '<span class="pos">&#10003;</span>' : '<span class="neg">&#10007;</span>';
+  if (g && g.proven) {
+    const ready = g.ready_for_real_dispatch;
+    document.getElementById("readiness").innerHTML = `<table>
+      <tr><th>Go-live gate</th><th>Status</th><th>Detail</th></tr>
+      <tr><td>Proven (realized P&amp;L &gt; 0 over &ge;${g.proven.min_required} settled)</td><td>${yn(g.proven.ok)}</td><td class="muted">realized ${g.proven.realized_pnl} &middot; settled ${g.proven.settled_positions}</td></tr>
+      <tr><td>Funded (real collateral &gt; 0)</td><td>${yn(g.funded.ok)}</td><td class="muted">${g.funded.source||''}</td></tr>
+      <tr><td>Approved (operator)</td><td>${yn(g.approved.ok)}</td><td class="muted">${g.approved.how||''}</td></tr>
+      <tr><td><b>Ready for real dispatch</b></td><td>${yn(ready)}</td><td class="muted">${ready?'':'blocked — paper/shadow only'}</td></tr>
+    </table>`;
+  } else {
+    document.getElementById("readiness").innerHTML = `<div class="empty">No shadow orders yet — they record once a directional paper order fills.</div>`;
+  }
+
+  const sh = rt.recent_shadow_orders || [];
+  document.getElementById("shadows").innerHTML = sh.length ? `<table>
+    <tr><th>Time</th><th>Would send (market / side / size @ price)</th><th>Dispatched?</th><th>Reason</th></tr>
+    ${sh.map(s => { const w = s.would_send||{}; return `<tr>
+      <td class="t">${new Date(s.at).toLocaleString()}</td>
+      <td>${fmt(w.market_id)} &middot; ${fmt(w.side)} ${fmt(w.size)} @ ${fmt(w.price)}</td>
+      <td class="${s.dispatched?'neg':'pos'}">${s.dispatched ? 'SENT' : 'no (fail-closed)'}</td>
+      <td class="muted">${fmt(s.rejection_reason)}</td>
+    </tr>`; }).join("")}
+  </table>` : "";
+}
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>"##;
+    let root = if prefix.is_empty() { "/" } else { prefix };
+    PAGE.replace("__PREFIX__", prefix).replace("__ROOT__", root)
+}
+
+/// Slug/question-derived category (Gamma doesn't tag these markets — category is always null there).
+fn classify_category(slug: &str, question: &str) -> &'static str {
+    let s = format!("{} {}", slug, question).to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| s.contains(w));
+    if has(&[
+        "world-cup",
+        "world cup",
+        "fifa",
+        "nba",
+        "nfl",
+        "nhl",
+        "fifwc",
+        "win the",
+        "-vs-",
+        "champion",
+        "super bowl",
+        "ufc",
+        "soccer",
+        "knicks",
+    ]) {
+        "Sports"
+    } else if has(&[
+        "bitcoin",
+        "ethereum",
+        "btc",
+        "eth",
+        "crypto",
+        "solana",
+        "fed ",
+        "rate",
+        "s&p",
+        "nasdaq",
+        "recession",
+        "inflation",
+        "stock",
+        "gdp",
+        "price of",
+        "150k",
+        "64k",
+    ]) {
+        "Finance"
+    } else if has(&[
+        "openai",
+        "gpt",
+        "-ai-",
+        " ai ",
+        "google",
+        "apple",
+        "tesla",
+        "spacex",
+        "nvidia",
+        "chip",
+        "anthropic",
+        "claude",
+        "grok",
+    ]) {
+        "Tech"
+    } else if has(&[
+        "iran",
+        "israel",
+        "russia",
+        "ukraine",
+        "china",
+        "taiwan",
+        "war",
+        "ceasefire",
+        "peace",
+        "nuclear",
+        "election",
+        "president",
+        "sanction",
+        "hormuz",
+        "gaza",
+        "trump",
+        "blockade",
+        "tariff",
+    ]) {
+        "Geopolitics"
+    } else {
+        "Other"
+    }
+}
+
+/// Rich per-market data for the Markets board: prices, the latest fused signal (net edge + which
+/// processors fired + Kelly size), news sentiment, any held position, and resolution status.
+/// Read-only, paper-only — surfaces data we already collect.
+async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let pool = &state.pool;
+
+    type MktRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<Decimal>,
+        Option<Decimal>,
+        bool,
+        bool,
+        Option<String>,
+    );
+    let markets: Vec<MktRow> = sqlx::query_as(
+        "SELECT gamma_id, slug, question, category, last_mid_yes, last_mid_no, active, closed, resolved_outcome
+         FROM market_data.markets ORDER BY closed ASC, updated_at DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    // Latest decision report, news cache, and open position per market.
+    let dr_rows: Vec<(Option<String>, serde_json::Value)> = sqlx::query_as(
+        "SELECT DISTINCT ON (payload->>'market_id') payload->>'market_id', payload
+         FROM journal.events WHERE event_type = 'decision_report'
+         ORDER BY payload->>'market_id', created_at DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let dr_map: HashMap<String, serde_json::Value> = dr_rows
+        .into_iter()
+        .filter_map(|(m, p)| Some((m?, p)))
+        .collect();
+
+    let news_rows: Vec<(Option<String>, serde_json::Value)> = sqlx::query_as(
+        "SELECT DISTINCT ON (payload->>'market_id') payload->>'market_id', payload->'news'
+         FROM journal.events WHERE event_type = 'news_cache'
+         ORDER BY payload->>'market_id', created_at DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let news_map: HashMap<String, serde_json::Value> = news_rows
+        .into_iter()
+        .filter_map(|(m, p)| Some((m?, p)))
+        .collect();
+
+    let pos_rows: Vec<(String, String, Decimal, Decimal)> = sqlx::query_as(
+        "SELECT market_id, outcome, shares, avg_entry_price FROM paper_trading.paper_positions WHERE shares > 0",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let pos_map: HashMap<String, (String, Decimal, Decimal)> = pos_rows
+        .into_iter()
+        .map(|(m, o, s, a)| (m, (o, s, a)))
+        .collect();
+
+    const SIGNALS: [&str; 5] = [
+        "orderbook_momentum",
+        "spike_divergence",
+        "overreaction_fade",
+        "yahoo_finance",
+        "news_sentiment",
+    ];
+    let out: Vec<serde_json::Value> = markets
+        .into_iter()
+        .map(|(gid, slug, question, db_category, my, mn, active, closed, resolved)| {
+            let category = db_category.unwrap_or_else(|| classify_category(&slug, &question).to_string());
+            let signal = dr_map.get(&gid).map(|dr| {
+                let attr = dr.pointer("/report/attribution");
+                let fired: Vec<serde_json::Value> = attr
+                    .and_then(|a| a.as_object())
+                    .map(|o| {
+                        SIGNALS
+                            .iter()
+                            .filter_map(|name| {
+                                let s = o.get(*name)?;
+                                let score = s.get("score")?.as_str()?.parse::<Decimal>().ok()?;
+                                if score.is_zero() {
+                                    return None;
+                                }
+                                Some(serde_json::json!({"name": name, "score": score.round_dp(3).to_string()}))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "net_edge": dr.pointer("/report/net_edge_after_fees").and_then(|v| v.as_str()),
+                    "target_outcome": dr.get("target_outcome"),
+                    "kelly_usdc": dr.pointer("/kelly_sizing/recommended_usdc").and_then(|v| v.as_str()),
+                    "fired": fired,
+                })
+            });
+            let position = pos_map.get(&gid).map(|(o, s, a)| {
+                // Live unrealized P&L for the held outcome: (current_mid - avg_entry) * shares.
+                let held_mid = if o.eq_ignore_ascii_case("yes") { my } else { mn };
+                let cost_basis = (*a * *s).round_dp(2);
+                let (mid_json, unrealized_json, market_value_json) = match held_mid {
+                    Some(mid) => {
+                        let mv = (mid * *s).round_dp(2);
+                        let upnl = (mv - cost_basis).round_dp(2);
+                        (
+                            Some(mid.round_dp(4).to_string()),
+                            Some(upnl.to_string()),
+                            Some(mv.to_string()),
+                        )
+                    }
+                    None => (None, None, None),
+                };
+                serde_json::json!({
+                    "outcome": o,
+                    "shares": s.round_dp(1).to_string(),
+                    "avg_entry": a.round_dp(4).to_string(),
+                    "cost_basis": cost_basis.to_string(),
+                    "mid": mid_json,
+                    "market_value": market_value_json,
+                    "unrealized": unrealized_json,
+                })
+            });
+            serde_json::json!({
+                "slug": slug,
+                "question": question,
+                "category": category,
+                "yes": my.map(|v| v.round_dp(4).to_string()),
+                "no": mn.map(|v| v.round_dp(4).to_string()),
+                "active": active,
+                "closed": closed,
+                "resolved_outcome": resolved,
+                "held": position.is_some(),
+                "signal": signal,
+                "news": news_map.get(&gid),
+                "position": position,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "count": out.len(),
+        "markets": out,
+    }))
+    .into_response()
+}
+
+async fn board_page_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Html(render_board_page(&state.subpath_prefix))
+}
+
+/// Lively Markets board: one card per tracked market with a probability bar, the latest fused signal
+/// (net edge + which processors fired), news sentiment, held position, and resolution status.
+fn render_board_page(prefix: &str) -> String {
+    const PAGE: &str = r##"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Polytrader — Markets</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#0d1117; color:#e6edf3; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:14px 24px; border-bottom:1px solid #21262d; display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; }
+  .badge { background:#23863622; color:#3fb950; border:1px solid #23863655; padding:2px 8px; border-radius:12px; font-size:12px; }
+  nav { display:flex; gap:4px; margin-left:auto; }
+  nav a { color:#8b949e; text-decoration:none; padding:5px 12px; border-radius:7px; font-size:13px; }
+  nav a:hover { background:#161b22; color:#e6edf3; }
+  nav a.active { background:#1f6feb22; color:#58a6ff; }
+  main { padding:20px; max-width:1240px; margin:0 auto; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(360px,1fr)); gap:14px; }
+  .card { background:#161b22; border:1px solid #21262d; border-radius:10px; padding:14px 16px; display:flex; flex-direction:column; gap:10px; }
+  .card.resolved { opacity:.72; }
+  .card.held { border-color:#bb8009; box-shadow:0 0 0 1px #bb800955, 0 0 16px #bb800922; }
+  .pos { font-size:12px; border-top:1px solid #21262d; padding-top:8px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .pos .lbl { color:#e3b341; font-weight:600; }
+  .pnl.pos2 { color:#3fb950; } .pnl.neg2 { color:#f85149; }
+  .q { font-weight:600; font-size:14px; line-height:1.35; }
+  .row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .spacer { margin-left:auto; }
+  .tag { font-size:11px; padding:1px 7px; border-radius:10px; border:1px solid #30363d; color:#8b949e; }
+  .tag.cat { color:#d2a8ff; border-color:#8957e555; text-transform:capitalize; }
+  .tag.hold { color:#e3b341; border-color:#bb800955; }
+  .tag.won { color:#3fb950; border-color:#23863655; }
+  .tag.lost { color:#f85149; border-color:#da363355; }
+  .bar { height:22px; border-radius:6px; overflow:hidden; display:flex; font-size:11px; font-weight:600; }
+  .bar .yes { background:#238636; display:flex; align-items:center; padding:0 7px; color:#fff; white-space:nowrap; }
+  .bar .no { background:#6e2620; display:flex; align-items:center; justify-content:flex-end; padding:0 7px; color:#fff; flex:1; white-space:nowrap; }
+  .sig { font-size:12px; color:#8b949e; }
+  .chip { font-size:11px; padding:1px 7px; border-radius:10px; border:1px solid #1f6feb55; color:#58a6ff; }
+  .chip.fade { color:#f0883e; border-color:#bb540955; }
+  .chip.news { color:#56d364; border-color:#23863655; }
+  .chip.yahoo { color:#79c0ff; border-color:#1f6feb55; }
+  .edge.pos { color:#3fb950; } .edge.neg { color:#f85149; } .muted { color:#8b949e; }
+  .news { font-size:12px; color:#8b949e; border-top:1px solid #21262d; padding-top:8px; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; vertical-align:middle; }
+  .empty { color:#8b949e; padding:24px; text-align:center; }
+  footer { color:#8b949e; font-size:12px; padding:8px 24px 24px; max-width:1240px; margin:0 auto; }
+</style></head>
+<body>
+<header>
+  <h1>Polytrader — Markets</h1>
+  <span class="badge">PAPER</span>
+  <span class="tag" id="updated">loading…</span>
+  <nav>
+    <a href="__ROOT__" class="active">Markets</a>
+    <a href="__PREFIX__/trades">Trades</a>
+    <a href="__PREFIX__/console">Console</a>
+  </nav>
+</header>
+<main><div class="grid" id="grid"></div></main>
+<footer>Auto-refreshes every 15s · live public Polymarket data · all trading simulated, no real orders.</footer>
+<script>
+const PREFIX = "__PREFIX__";
+const fmt=(v)=>v==null?"—":v;
+const pct=(v)=>{const n=parseFloat(v); return isNaN(n)?null:Math.round(n*1000)/10;};
+const edgeCls=(v)=>{const n=parseFloat(v); return n>0?"pos":(n<0?"neg":"muted");};
+const chipCls=(n)=>n.includes("fade")?"fade":(n.includes("news")?"news":(n.includes("yahoo")?"yahoo":""));
+const polDot=(p)=>{const n=parseFloat(p); if(isNaN(n))return"#8b949e"; return n>0.15?"#3fb950":(n<-0.15?"#f85149":"#8b949e");};
+
+async function load(){
+  let d; try { d = await (await fetch(PREFIX+"/board/data",{cache:"no-store"})).json(); }
+  catch(e){ document.getElementById("updated").textContent="fetch error"; return; }
+  const all = (d.markets||[]).slice();
+  const held = all.filter(m=>m.held).length;
+  const heldSum = all.reduce((a,m)=>a + (m.position&&m.position.unrealized!=null?parseFloat(m.position.unrealized):0), 0);
+  document.getElementById("updated").textContent =
+    `${d.count} markets · ${held} held${held?` · unrealized ${heldSum>=0?'+':''}$${heldSum.toFixed(2)}`:''} · ${new Date().toLocaleTimeString()}`;
+  // Surface held positions first, then live markets, resolved last.
+  all.sort((a,b)=> (b.held?1:0)-(a.held?1:0) || (b.active?1:0)-(a.active?1:0));
+  const pnlCls=(v)=>{const n=parseFloat(v); return n>0?"pos2":(n<0?"neg2":"muted");};
+  const cards = all.map(m => {
+    const yes = pct(m.yes), no = pct(m.no);
+    const haveBar = yes!=null && no!=null;
+    const sig = m.signal, pos = m.position, news = m.news;
+    const firedChips = (sig&&sig.fired||[]).map(f=>`<span class="chip ${chipCls(f.name)}">${f.name.replace(/_/g,' ')} ${f.score}</span>`).join(" ");
+    const statusTag = m.resolved_outcome ? `<span class="tag ${ (pos&&pos.outcome===m.resolved_outcome)?'won': (pos?'lost':'') }">RESOLVED · ${fmt(m.resolved_outcome)}</span>`
+                     : (m.active ? `<span class="tag" style="color:#3fb950;border-color:#23863655">LIVE</span>` : `<span class="tag">closed</span>`);
+    const upnl = pos&&pos.unrealized!=null ? parseFloat(pos.unrealized) : null;
+    const holdTag = pos ? `<span class="tag hold">HOLDING ${fmt(pos.outcome)} · ${pos.shares} sh${upnl!=null?` · <span class="pnl ${pnlCls(upnl)}">${upnl>=0?'+':''}$${upnl.toFixed(2)}</span>`:''}</span>` : '';
+    const posLine = pos ? `<div class="pos">
+        <span class="lbl">Position</span>
+        <span>${fmt(pos.shares)} ${fmt(pos.outcome)} @ ${fmt(pos.avg_entry)}</span>
+        ${pos.mid!=null?`<span class="muted">now ${pos.mid}</span>`:''}
+        ${pos.market_value!=null?`<span class="muted">· value $${pos.market_value}</span>`:''}
+        ${upnl!=null?`<span class="spacer"></span><span class="pnl ${pnlCls(upnl)}">${upnl>=0?'+':''}$${upnl.toFixed(2)} unrealized</span>`:''}
+      </div>` : '';
+    return `<div class="card ${m.resolved_outcome?'resolved':''} ${pos&&!m.resolved_outcome?'held':''}">
+      <div class="q">${fmt(m.question||m.slug)}</div>
+      <div class="row">
+        ${m.category?`<span class="tag cat">${m.category}</span>`:''}
+        ${statusTag}
+        ${holdTag}
+      </div>
+      ${haveBar?`<div class="bar"><div class="yes" style="width:${yes}%">YES ${yes}%</div><div class="no">${no}% NO</div></div>`:'<div class="muted">no orderbook yet</div>'}
+      ${sig?`<div class="sig row">
+        <span>net edge <b class="edge ${edgeCls(sig.net_edge)}">${parseFloat(sig.net_edge||0).toFixed(3)}</b></span>
+        ${sig.kelly_usdc&&parseFloat(sig.kelly_usdc)>0?`<span class="muted">· Kelly $${parseFloat(sig.kelly_usdc).toFixed(0)} (${fmt(sig.target_outcome)})</span>`:''}
+        <span class="spacer"></span>${firedChips||'<span class="muted">no signal fired</span>'}
+      </div>`:'<div class="sig muted">no decision report yet</div>'}
+      ${posLine}
+      ${news?`<div class="news"><span class="dot" style="background:${polDot(news.polarity)}"></span>news ${fmt(news.headline_count)} headlines · polarity ${fmt(news.polarity)}${(news.top_titles&&news.top_titles[0])?` — <span class="muted">${news.top_titles[0]}</span>`:''}</div>`:''}
+    </div>`;
+  }).join("");
+  document.getElementById("grid").innerHTML = cards || `<div class="empty">No markets ingested yet.</div>`;
+}
+load(); setInterval(load, 15000);
+</script>
+</body></html>"##;
+    let root = if prefix.is_empty() { "/" } else { prefix };
+    PAGE.replace("__PREFIX__", prefix).replace("__ROOT__", root)
+}
+
 async fn paper_rejections_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DryRunEventsQuery>,
@@ -1345,6 +2239,28 @@ async fn dashboard_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
     }
     if !rendered.contains("<base href") {
         tracing::warn!(prefix = %prefix, "subpath <base> injection may have failed (string post-process assumption); relative client fetches in SSR output may not resolve correctly under /polytrader rewrite");
+    }
+
+    // Inject the shared nav (Markets · Trades · Console) right after <body> so the console page has
+    // the same navigation as the board/trades pages.
+    let root = if prefix.is_empty() {
+        "/"
+    } else {
+        prefix.as_str()
+    };
+    let nav = format!(
+        r#"<nav style="display:flex;gap:6px;padding:10px 16px;background:#0d1117;border-bottom:1px solid #21262d;font:13px -apple-system,Segoe UI,Roboto,sans-serif;">
+<a href="{root}" style="color:#8b949e;text-decoration:none;padding:5px 12px;border-radius:7px;">Markets</a>
+<a href="{prefix}/trades" style="color:#8b949e;text-decoration:none;padding:5px 12px;border-radius:7px;">Trades</a>
+<a href="{prefix}/console" style="background:#1f6feb22;color:#58a6ff;text-decoration:none;padding:5px 12px;border-radius:7px;">Console</a>
+</nav>"#,
+        root = root,
+        prefix = prefix
+    );
+    if let Some(bpos) = rendered.find("<body") {
+        if let Some(gt) = rendered[bpos..].find('>') {
+            rendered.insert_str(bpos + gt + 1, &nav);
+        }
     }
 
     // Full document wrapper (rsx provides head + body siblings)
@@ -7453,7 +8369,10 @@ async fn build_strategy_paper_candidates(pool: &PgPool) -> anyhow::Result<serde_
     .fetch_all(pool)
     .await?;
 
-    let engine = FusionEngine::new();
+    // Load Hermes-learned processor weights (closed loop) so candidates rank with the same tuned
+    // weighting the 5-min generator uses. Empty map → all 1.0 (neutral).
+    let learned_weights = crate::strategy::load_processor_weights(pool).await;
+    let engine = FusionEngine::with_weights(learned_weights);
     let fee_ctx = FeeContext {
         taker_bps: Decimal::from(paper_fee_bps_from_env()),
         maker_bps: Decimal::from(20u64),

@@ -80,6 +80,21 @@ spec:
                   key: uri
             - name: RUST_LOG
               value: "info,hermes=debug"
+            # Closed-loop FusionEngine weight tuning: when 'on', Hermes writes strategy_weights events
+            # that the app loads to adjust per-processor weights. Paper-only; clamped + gradual.
+            - name: HERMES_AUTONOMOUS_WEIGHT_TUNING
+              value: "on"
+            # LLM synthesis via OpenRouter (OpenAI-compatible). Health journaled as llm_health events
+            # (status/cause) so the dashboards surface failures (out of credits, auth, rate-limit).
+            - name: LLM_API_ENDPOINT
+              value: "https://openrouter.ai/api/v1/chat/completions"
+            - name: LLM_MODEL
+              value: "openai/gpt-5.4-mini"
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: polytrader-openrouter
+                  key: OPENROUTER_API_KEY
             # Phase 2: set HERMES_AUTONOMOUS_WIKI_PROPOSALS=lowrisk (via secret or env override) to enable
             # the gated autonomous low-risk wiki proposal behavior (see src/bin/hermes.rs). Default off for safety.
             # No manifest change required; opt-in per AGENTS "human review for high-impact" + smallest viable.

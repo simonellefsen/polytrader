@@ -27,10 +27,24 @@
 // This is the smallest change delivering the artifact (trait + 2 processors + FusionEngine + attribution) while satisfying fmt/clippy -D warnings + AGENTS.
 #![allow(dead_code)]
 
+pub mod arbitrage;
+pub mod external;
+pub mod overreaction;
+pub mod weights;
+
+pub use arbitrage::ArbitrageScanner;
+pub use external::{
+    fetch_newsdata_news, fetch_yahoo_context, newsdata_query, NewsSentimentProcessor,
+    YahooFinanceProcessor,
+};
+pub use overreaction::OverreactionProcessor;
+pub use weights::{clamp_weight, load_processor_weights};
+
 use anyhow::Result;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::json;
+use std::collections::BTreeMap;
 use tracing::warn;
 
 /// Normalized signal from a processor (inspired by BTC bot base_processor.py Signal + confidence/edge).
@@ -150,17 +164,35 @@ impl SignalProcessor for SpikeDivergenceProcessor {
 /// Mitigation: paper-only; Hermes 3.3 closed-loop will measure real P&L per signal and propose weight changes (gated).
 pub struct FusionEngine {
     processors: Vec<Box<dyn SignalProcessor>>,
+    /// Per-processor learned multipliers (name -> weight). Empty/missing entries default to 1.0.
+    /// Populated by Hermes' closed-loop weight tuning via load_processor_weights(). Clamped on read.
+    weights: BTreeMap<String, Decimal>,
 }
 
 impl FusionEngine {
     pub fn new() -> Self {
+        Self::with_weights(BTreeMap::new())
+    }
+
+    /// Construct with Hermes-learned processor weights (from strategy::load_processor_weights).
+    /// Unknown/missing processors fall back to weight 1.0 (neutral), so this is always safe.
+    pub fn with_weights(weights: BTreeMap<String, Decimal>) -> Self {
         Self {
             processors: vec![
                 Box::new(OrderbookMomentumProcessor),
                 Box::new(SpikeDivergenceProcessor),
-                // Future: add liquidity (poly-maker), AI edge (Poly-Trader), sentiment (agents/BTC), etc.
+                Box::new(OverreactionProcessor),
+                // External advisory signals (low confidence; risk gate still governs; Hermes learns weights).
+                Box::new(YahooFinanceProcessor),
+                Box::new(NewsSentimentProcessor),
             ],
+            weights,
         }
+    }
+
+    /// Effective learned multiplier for a processor (default 1.0, always clamped to the safe band).
+    fn weight_for(&self, name: &str) -> Decimal {
+        clamp_weight(self.weights.get(name).copied().unwrap_or(dec!(1.0)))
     }
 
     /// Fuse signals for a market. Returns fused score + attribution map (for journal.metrics jsonb).
@@ -177,7 +209,10 @@ impl FusionEngine {
         for p in &self.processors {
             match p.compute_signal(snapshot, ctx) {
                 Ok(sig) => {
-                    let w = sig.confidence; // weight by confidence (simple; future learned)
+                    // Effective weight = confidence × Hermes-learned multiplier (closed loop).
+                    // Default multiplier 1.0 reproduces the original confidence-only weighting.
+                    let learned = self.weight_for(sig.processor_name);
+                    let w = sig.confidence * learned;
                     total_weighted += sig.score * w;
                     total_weight += w;
                     attribution.insert(
@@ -185,6 +220,8 @@ impl FusionEngine {
                         json!({
                             "score": sig.score,
                             "confidence": sig.confidence,
+                            "learned_weight": learned,
+                            "effective_weight": w,
                             "edge": sig.edge,
                             "metadata": sig.metadata
                         }),

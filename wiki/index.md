@@ -8,6 +8,7 @@ Start here, then follow links. For full context, also read:
 
 ## Structure
 
+- **architecture.md** — System topology, decision→execution loop, fusion brain, Hermes loop, fail-closed gate, and data model, all as Mermaid diagrams. Start here for the big picture.
 - **concepts/** — Core ideas, architecture principles, trading mental models.
 - **decisions/** — Important architectural, tech, process, and risk decisions with rationale.
 - **experiments/** — Past/present/future experiments, backtests, ideas under test.
@@ -20,6 +21,7 @@ Start here, then follow links. For full context, also read:
 
 ## Quick Navigation for Agents
 
+0. **See the whole system fast**: [architecture.md](architecture.md) (Mermaid diagrams).
 1. **Understand the "why" and constraints**: Read [concepts/llm-maintained-project-wiki.md](concepts/llm-maintained-project-wiki.md), [concepts/hermes-self-improvement.md](concepts/hermes-self-improvement.md), [concepts/polymarket-trading.md](concepts/polymarket-trading.md) (create if missing).
 2. **Current state & plan**: [../docs/project-plan.md](../docs/project-plan.md), this index, recent [log.md](log.md) entries.
 3. **How to change things safely**: [../AGENTS.md](../AGENTS.md), relevant decisions/.
