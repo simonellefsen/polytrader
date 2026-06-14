@@ -1693,6 +1693,20 @@ function renderPnlChart(series){
     <path d="${line}" fill="none" stroke="${stroke}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
     <circle cx="${sx(pts[pts.length-1].t).toFixed(1)}" cy="${sy(last).toFixed(1)}" r="3.5" fill="${stroke}"/>
   </svg>`;
+  // X axis = time (snapshot timestamp). Labels + caption rendered as HTML below the SVG so they are
+  // not horizontally stretched by preserveAspectRatio="none". Resolution ≈ one point per 5-min cycle.
+  const tLabel = (ts)=> new Date(ts*1000).toLocaleString([], {month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
+  const midT = pts[Math.floor(pts.length/2)].t;
+  const spanH = Math.max(0, (maxT - minT) / 3600);
+  const spanTxt = spanH >= 48 ? (spanH/24).toFixed(1)+" days" : spanH.toFixed(1)+" h";
+  box.insertAdjacentHTML("beforeend",
+    `<div class="t" style="display:flex;justify-content:space-between;padding:2px 12px 0 46px;">
+       <span>${tLabel(minT)}</span><span>${tLabel(midT)}</span><span>${tLabel(maxT)}</span>
+     </div>
+     <div class="t" style="padding:4px 12px 0 46px;color:#6e7681;">
+       X axis: time · ${pts.length} points over ~${spanTxt} · ~1 point / 5-min decision cycle (last 300 snapshots) ·
+       Y axis: running total P&amp;L = realized + unrealized
+     </div>`);
 }
 
 // Dual-gate (A/B) simulation: live gate (lenient, all fills) vs the stricter shadow subset.
@@ -1726,23 +1740,41 @@ function renderParams(c){
   const r = c.risk;
   const pct = (v)=>{ const n=parseFloat(v); return isNaN(n)?"—":(n*100).toFixed(n*100%1?1:0)+"%"; };
   const onoff = (b)=> b ? '<span class="pos">on</span>' : '<span class="muted">off</span>';
+  // [label, value, description] — description shows as a hover tooltip + a small caption.
   const items = [
-    ["Live min net edge", pct(r.min_net_edge)],
-    ["Shadow (A/B) edge", pct(r.shadow_net_edge)],
-    ["Kelly fraction", r.kelly_fraction],
-    ["Max position", "$"+r.max_position_usdc],
-    ["Max market exposure", pct(r.max_market_exposure_pct)],
-    ["Max total exposure", pct(r.max_total_exposure_pct)],
-    ["P&L floor (stop)", pct(r.pnl_floor)],
-    ["Decision cadence", c.decision_cadence_secs+"s"],
-    ["Ingest interval", c.ingest_interval_secs+"s"],
-    ["Markets tracked", c.markets_tracked + " ("+c.arb_only_markets+" arb-only)"],
-    ["Autonomous execution", onoff(c.autonomous_paper_execution)],
-    ["External signals", onoff(c.external_signals)],
-    ["Real orders", '<span class="neg">disabled</span>'],
+    ["Live min net edge", pct(r.min_net_edge),
+      "The active gate. A trade is only placed if its fused edge after fees clears this. LOWER = more trades but thinner margins (more noise/false signals); HIGHER = fewer, higher-conviction trades."],
+    ["Shadow (A/B) edge", pct(r.shadow_net_edge),
+      "A stricter comparison gate that is recorded but NOT enforced. Lets the Gate Simulation show how a tighter gate would have performed on the same fills. No effect on live trading."],
+    ["Kelly fraction", r.kelly_fraction,
+      "Fraction of full Kelly used for sizing. 0.25 = quarter-Kelly. HIGHER bets more per edge (faster growth but much higher variance / ruin risk on mis-estimated probabilities); LOWER is safer and smoother."],
+    ["Max position", "$"+r.max_position_usdc,
+      "Hard dollar cap on any single position, regardless of what Kelly suggests. Caps the worst-case loss on one market."],
+    ["Max market exposure", pct(r.max_market_exposure_pct),
+      "Max share of the portfolio allowed in one market. Caps concentration so a single resolution can't sink the book. Positions are trimmed to fit rather than rejected."],
+    ["Max total exposure", pct(r.max_total_exposure_pct),
+      "Max share of the portfolio that can be locked across all positions at once. Keeps dry powder; blocks new entries once breached."],
+    ["P&L floor (stop)", pct(r.pnl_floor),
+      "Circuit breaker. If cumulative P&L / portfolio value drops below this, the risk gate blocks all new trades until recovery — prevents a losing streak from compounding."],
+    ["Decision cadence", c.decision_cadence_secs+"s",
+      "How often every tracked market is re-scored, sized, and (if it passes) traded. 300s = every 5 minutes."],
+    ["Ingest interval", c.ingest_interval_secs+"s",
+      "How often fresh market data (prices, orderbooks) is pulled from Polymarket's public APIs. Lower = fresher data but more API load."],
+    ["Markets tracked", c.markets_tracked + " ("+c.arb_only_markets+" arb-only)",
+      "Total markets in the scan universe. Arb-only markets (sports) are never traded directionally — only risk-free YES+NO arbitrage. More markets = wider opportunity funnel (sizing/risk unchanged)."],
+    ["Autonomous execution", onoff(c.autonomous_paper_execution),
+      "When on, passing decisions automatically place Kelly-sized PAPER orders. When off, the system only evaluates and journals — no positions are opened."],
+    ["External signals", onoff(c.external_signals),
+      "When on, Yahoo Finance spot + news-headline sentiment feed the fusion engine as low-confidence advisory inputs (capped influence). When off, only market-internal signals are used."],
+    ["Real orders", '<span class="neg">disabled</span>',
+      "Real-money order dispatch. Structurally disabled in this build — only a fail-closed sender is wired, behind a proven + funded + operator-approved gate. Nothing is ever sent to the live exchange."],
   ];
-  el.innerHTML = `<div class="cards">${items.map(([l,v])=>
-    `<div class="card"><div class="label">${l}</div><div class="val" style="font-size:16px">${v}</div></div>`).join("")}</div>`;
+  el.innerHTML = `<div class="cards">${items.map(([l,v,desc])=>
+    `<div class="card" title="${(desc||'').replace(/"/g,'&quot;')}" style="cursor:help;max-width:230px;">
+       <div class="label">${l} <span style="opacity:.5">&#9432;</span></div>
+       <div class="val" style="font-size:16px">${v}</div>
+       <div class="t" style="margin-top:6px;line-height:1.35;color:#6e7681;">${desc||''}</div>
+     </div>`).join("")}</div>`;
 }
 
 // Executions feed with filtering (hide the rejection noise).
