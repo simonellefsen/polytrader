@@ -51,6 +51,13 @@ spec:
             # gates and place Kelly-sized PAPER orders (never real). Default off = evaluation only.
             - name: POLYTRADER_AUTONOMOUS_PAPER_EXECUTION
               value: "on"
+            # Risk gate tuning (paper-only; surfaced read-only in the /trades Parameters panel).
+            # MIN_NET_EDGE is the LIVE gate (2%); SHADOW_NET_EDGE (4%) is recorded-not-enforced so the
+            # /trades Gate Simulation can compare how a stricter gate would have done on the same run.
+            - name: POLYTRADER_MIN_NET_EDGE
+              value: "0.02"
+            - name: POLYTRADER_SHADOW_NET_EDGE
+              value: "0.04"
             # External advisory signals: Yahoo Finance spot (asset markets) + newsdata.io news
             # headline sentiment, fed into FusionEngine as low-confidence advisory inputs.
             - name: POLYTRADER_EXTERNAL_SIGNALS

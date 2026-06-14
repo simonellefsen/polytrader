@@ -42,8 +42,13 @@ pub struct RiskConfig {
     pub max_market_exposure_pct: Decimal,
     /// Max fraction of portfolio that can be locked simultaneously (e.g. 0.80 = 80 %).
     pub max_total_exposure_pct: Decimal,
-    /// Minimum net edge (after fees) to approve a trade (e.g. 0.04 = 4 %).
+    /// Minimum net edge (after fees) to approve a trade — the LIVE gate (e.g. 0.02 = 2 %).
     pub min_net_edge: Decimal,
+    /// A stricter comparison ("shadow") gate used only for A/B attribution, NOT enforcement.
+    /// Every executed fill is tagged with whether it also clears this threshold, so we can compare
+    /// how a stricter gate would have performed using the same live run (the stricter portfolio is a
+    /// subset of the lenient one). Default 0.04 = 4 %.
+    pub shadow_net_edge: Decimal,
     /// Stop trading if cumulative PnL / portfolio_value drops below this threshold.
     pub pnl_floor: Decimal,
 }
@@ -55,9 +60,54 @@ impl Default for RiskConfig {
             max_position_usdc: dec!(20),
             max_market_exposure_pct: dec!(0.20),
             max_total_exposure_pct: dec!(0.80),
-            min_net_edge: dec!(0.04),
+            min_net_edge: dec!(0.02),
+            shadow_net_edge: dec!(0.04),
             pnl_floor: dec!(-0.20),
         }
+    }
+}
+
+impl RiskConfig {
+    /// Build from environment, falling back to the conservative defaults. Lets the operator tune the
+    /// gate (e.g. the 2% live / 4% shadow split) and sizing without a code change; the same values are
+    /// surfaced read-only in the UI parameters panel.
+    pub fn from_env() -> Self {
+        fn dec_env(key: &str, default: Decimal) -> Decimal {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<Decimal>().ok())
+                .unwrap_or(default)
+        }
+        let d = RiskConfig::default();
+        RiskConfig {
+            kelly_fraction: dec_env("POLYTRADER_KELLY_FRACTION", d.kelly_fraction),
+            max_position_usdc: dec_env("POLYTRADER_MAX_POSITION_USDC", d.max_position_usdc),
+            max_market_exposure_pct: dec_env(
+                "POLYTRADER_MAX_MARKET_EXPOSURE_PCT",
+                d.max_market_exposure_pct,
+            ),
+            max_total_exposure_pct: dec_env(
+                "POLYTRADER_MAX_TOTAL_EXPOSURE_PCT",
+                d.max_total_exposure_pct,
+            ),
+            min_net_edge: dec_env("POLYTRADER_MIN_NET_EDGE", d.min_net_edge),
+            shadow_net_edge: dec_env("POLYTRADER_SHADOW_NET_EDGE", d.shadow_net_edge),
+            pnl_floor: dec_env("POLYTRADER_PNL_FLOOR", d.pnl_floor),
+        }
+    }
+
+    /// Read-only JSON view of the effective risk parameters for the UI parameters panel.
+    /// Decimals are emitted as strings to preserve exactness.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kelly_fraction": self.kelly_fraction.to_string(),
+            "max_position_usdc": self.max_position_usdc.to_string(),
+            "max_market_exposure_pct": self.max_market_exposure_pct.to_string(),
+            "max_total_exposure_pct": self.max_total_exposure_pct.to_string(),
+            "min_net_edge": self.min_net_edge.to_string(),
+            "shadow_net_edge": self.shadow_net_edge.to_string(),
+            "pnl_floor": self.pnl_floor.to_string(),
+        })
     }
 }
 
@@ -103,6 +153,11 @@ impl RiskManager {
 
     pub fn with_defaults() -> Self {
         Self::new(RiskConfig::default())
+    }
+
+    /// Construct from environment overrides (see RiskConfig::from_env).
+    pub fn from_env() -> Self {
+        Self::new(RiskConfig::from_env())
     }
 
     /// Compute Kelly-criterion position size for a binary prediction market.

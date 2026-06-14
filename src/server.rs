@@ -1399,11 +1399,162 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
         })
         .collect();
 
+    // === Effective parameters (read-only) for the UI parameters panel ===
+    let risk_cfg = crate::risk::RiskConfig::from_env();
+    let env_flag = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let bootstrap_count = env_flag("POLYTRADER_BOOTSTRAP_MARKETS")
+        .map(|v| v.split(',').filter(|s| !s.trim().is_empty()).count())
+        .unwrap_or(0);
+    let arb_only_count = env_flag("POLYTRADER_ARB_ONLY_MARKETS")
+        .map(|v| v.split(',').filter(|s| !s.trim().is_empty()).count())
+        .unwrap_or(0);
+    let config_json = serde_json::json!({
+        "risk": risk_cfg.to_json(),
+        "autonomous_paper_execution": env_flag("POLYTRADER_AUTONOMOUS_PAPER_EXECUTION")
+            .map(|v| v.to_lowercase() == "on").unwrap_or(false),
+        "external_signals": env_flag("POLYTRADER_EXTERNAL_SIGNALS")
+            .map(|v| v.to_lowercase() == "on").unwrap_or(false),
+        "ingest_interval_secs": env_flag("POLYTRADER_INGEST_INTERVAL_SECS").unwrap_or_else(|| "300".into()),
+        "decision_cadence_secs": "300",
+        "markets_tracked": bootstrap_count,
+        "arb_only_markets": arb_only_count,
+        "real_orders_enabled": false,
+    });
+
+    // === Dual-gate (A/B) simulation ===
+    // The live gate is min_net_edge (lenient). shadow_net_edge is stricter. Because the lenient set is
+    // a superset of the strict set, we can compare both from one live run: tag each entry fill by
+    // whether it clears the shadow gate, then aggregate count / notional / open-unrealized / settled
+    // realized P&L per band. "lenient" = all fills (current live gate); "strict" = the shadow subset.
+    // (market_id, outcome, net_edge, gross_notional, clears_shadow_gate)
+    type FillBandRow = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<bool>,
+    );
+    let fill_rows: Vec<FillBandRow> = sqlx::query_as(
+        "SELECT payload->>'market_id', payload->>'outcome', payload->>'net_edge',
+                    payload->>'gross_notional', (payload->>'clears_shadow_gate')::bool
+             FROM journal.events
+             WHERE event_type = 'autonomous_paper_execution' AND payload->>'action' = 'filled'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    // (market_id, outcome) -> clears_shadow, for joining settlements to their entry band.
+    let mut band_map: HashMap<(String, String), bool> = HashMap::new();
+    // Live unrealized per (market_id, outcome) from the open positions we already computed.
+    let unreal_map: HashMap<(String, String), Decimal> = positions
+        .iter()
+        .filter_map(|p| {
+            let m = p.get("market_id")?.as_str()?.to_string();
+            let o = p.get("outcome")?.as_str()?.to_string();
+            let u = p.get("unrealized_pnl")?.as_str()?.parse::<Decimal>().ok()?;
+            Some(((m, o), u))
+        })
+        .collect();
+    let shadow_threshold = risk_cfg.shadow_net_edge;
+    // (count, notional, open_unrealized) accumulators for lenient(all) and strict(shadow subset).
+    let (mut len_n, mut len_not, mut len_unr) = (0i64, Decimal::ZERO, Decimal::ZERO);
+    let (mut str_n, mut str_not, mut str_unr) = (0i64, Decimal::ZERO, Decimal::ZERO);
+    for (m, o, edge, notional, clears) in &fill_rows {
+        let (Some(m), Some(o)) = (m.clone(), o.clone()) else {
+            continue;
+        };
+        let edge_dec = edge
+            .as_deref()
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .unwrap_or(Decimal::ZERO);
+        // Fall back to recomputing the band for fills journaled before edge tagging existed.
+        let in_strict = clears.unwrap_or(edge_dec >= shadow_threshold);
+        let notion = notional
+            .as_deref()
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .unwrap_or(Decimal::ZERO);
+        let unreal = unreal_map
+            .get(&(m.clone(), o.clone()))
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        band_map.insert((m, o), in_strict);
+        len_n += 1;
+        len_not += notion;
+        len_unr += unreal;
+        if in_strict {
+            str_n += 1;
+            str_not += notion;
+            str_unr += unreal;
+        }
+    }
+    // Settled realized P&L per band (join each settlement to its entry band).
+    let (mut len_real, mut len_settled, mut len_wins) = (Decimal::ZERO, 0i64, 0i64);
+    let (mut str_real, mut str_settled, mut str_wins) = (Decimal::ZERO, 0i64, 0i64);
+    for (p, _) in &settle_rows {
+        let (Some(m), Some(o)) = (
+            p.get("market_id").and_then(|v| v.as_str()),
+            p.get("outcome").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let realized = p
+            .get("realized_pnl")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .unwrap_or(Decimal::ZERO);
+        let won = p.get("won").and_then(|v| v.as_bool()).unwrap_or(false);
+        let in_strict = band_map
+            .get(&(m.to_string(), o.to_string()))
+            .copied()
+            .unwrap_or(realized >= Decimal::ZERO);
+        len_real += realized;
+        len_settled += 1;
+        if won {
+            len_wins += 1;
+        }
+        if in_strict {
+            str_real += realized;
+            str_settled += 1;
+            if won {
+                str_wins += 1;
+            }
+        }
+    }
+    let band_json = |label: &str,
+                     edge_floor: String,
+                     n: i64,
+                     notional: Decimal,
+                     unreal: Decimal,
+                     real: Decimal,
+                     settled: i64,
+                     wins: i64| {
+        serde_json::json!({
+            "label": label,
+            "min_net_edge": edge_floor,
+            "fills": n,
+            "notional": notional.round_dp(2).to_string(),
+            "open_unrealized": unreal.round_dp(2).to_string(),
+            "settled_realized": real.round_dp(2).to_string(),
+            "settled": settled,
+            "wins": wins,
+            "total_pnl": (real + unreal).round_dp(2).to_string(),
+        })
+    };
+    let gate_simulation = serde_json::json!({
+        "note": "One live run, two gates. 'Lenient' is the active gate (all fills); 'Strict' is the \
+                 shadow subset that also clears the stricter edge — i.e. how a tighter gate would have \
+                 done on the same data.",
+        "lenient": band_json("Lenient (live)", risk_cfg.min_net_edge.to_string(), len_n, len_not, len_unr, len_real, len_settled, len_wins),
+        "strict": band_json("Strict (shadow)", shadow_threshold.to_string(), str_n, str_not, str_unr, str_real, str_settled, str_wins),
+    });
+
     Json(serde_json::json!({
         "paper_only": true,
         "real_orders_enabled": false,
         "portfolio": portfolio_json,
         "pnl_series": pnl_series,
+        "config": config_json,
+        "gate_simulation": gate_simulation,
         "open_positions": positions,
         "recent_executions": executions,
         "real_account": real_account,
@@ -1482,6 +1633,10 @@ fn render_trades_page(prefix: &str) -> String {
   <div class="cards" id="cards"></div>
   <h2>Profit &amp; Loss <span class="pill" id="pnl-now"></span></h2>
   <div id="pnl-chart" class="chartbox"><div class="empty">loading P&amp;L history…</div></div>
+  <h2>Gate Simulation <span class="pill dir" id="gatesim-edges"></span></h2>
+  <div id="gatesim"></div>
+  <h2>Parameters <span class="pill" id="params-mode">paper · read-only</span></h2>
+  <div id="params"></div>
   <h2>Open Positions</h2>
   <div id="positions"></div>
   <h2>Settlements <span class="pill dir" id="settle-summary"></span></h2>
@@ -1540,6 +1695,56 @@ function renderPnlChart(series){
   </svg>`;
 }
 
+// Dual-gate (A/B) simulation: live gate (lenient, all fills) vs the stricter shadow subset.
+function renderGateSim(gs){
+  const el = document.getElementById("gatesim");
+  const edEl = document.getElementById("gatesim-edges");
+  if (!gs || !gs.lenient) { el.innerHTML = `<div class="empty">No fills yet — the gate comparison populates once trades execute.</div>`; edEl.textContent=""; return; }
+  const pctEdge = (v)=>{ const n=parseFloat(v); return isNaN(n)?"—":(n*100).toFixed(1)+"%"; };
+  edEl.textContent = `live ≥ ${pctEdge(gs.lenient.min_net_edge)} · shadow ≥ ${pctEdge(gs.strict.min_net_edge)}`;
+  const row = (b, live) => `<tr>
+      <td>${b.label}${live?' <span class="pill dir">active</span>':''}</td>
+      <td>≥ ${pctEdge(b.min_net_edge)}</td>
+      <td>${b.fills}</td>
+      <td>$${b.notional}</td>
+      <td class="${cls(b.open_unrealized)}">${sign(b.open_unrealized)}</td>
+      <td class="${cls(b.settled_realized)}">${sign(b.settled_realized)} <span class="muted">(${b.settled}·${b.wins}w)</span></td>
+      <td class="${cls(b.total_pnl)}"><b>${sign(b.total_pnl)}</b></td>
+    </tr>`;
+  el.innerHTML = `<table>
+    <tr><th>Gate</th><th>Min edge</th><th>Fills</th><th>Notional</th><th>Unrealized</th><th>Settled P&amp;L</th><th>Total P&amp;L</th></tr>
+    ${row(gs.lenient, true)}
+    ${row(gs.strict, false)}
+  </table>
+  <div class="t" style="padding:8px 2px;">${gs.note||""}</div>`;
+}
+
+// Effective parameters (risk config + cadence + market counts), read-only.
+function renderParams(c){
+  const el = document.getElementById("params");
+  if (!c || !c.risk) { el.innerHTML = `<div class="empty">No config.</div>`; return; }
+  const r = c.risk;
+  const pct = (v)=>{ const n=parseFloat(v); return isNaN(n)?"—":(n*100).toFixed(n*100%1?1:0)+"%"; };
+  const onoff = (b)=> b ? '<span class="pos">on</span>' : '<span class="muted">off</span>';
+  const items = [
+    ["Live min net edge", pct(r.min_net_edge)],
+    ["Shadow (A/B) edge", pct(r.shadow_net_edge)],
+    ["Kelly fraction", r.kelly_fraction],
+    ["Max position", "$"+r.max_position_usdc],
+    ["Max market exposure", pct(r.max_market_exposure_pct)],
+    ["Max total exposure", pct(r.max_total_exposure_pct)],
+    ["P&L floor (stop)", pct(r.pnl_floor)],
+    ["Decision cadence", c.decision_cadence_secs+"s"],
+    ["Ingest interval", c.ingest_interval_secs+"s"],
+    ["Markets tracked", c.markets_tracked + " ("+c.arb_only_markets+" arb-only)"],
+    ["Autonomous execution", onoff(c.autonomous_paper_execution)],
+    ["External signals", onoff(c.external_signals)],
+    ["Real orders", '<span class="neg">disabled</span>'],
+  ];
+  el.innerHTML = `<div class="cards">${items.map(([l,v])=>
+    `<div class="card"><div class="label">${l}</div><div class="val" style="font-size:16px">${v}</div></div>`).join("")}</div>`;
+}
+
 // Executions feed with filtering (hide the rejection noise).
 let lastExec = [];
 let execFilter = "active"; // active = filled + no-fill (hides rejections); all/filled/rejected
@@ -1595,6 +1800,8 @@ async function load() {
   document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
 
   renderPnlChart(d.pnl_series);
+  renderGateSim(d.gate_simulation);
+  renderParams(d.config);
 
   const pos = d.open_positions || [];
   document.getElementById("positions").innerHTML = pos.length ? `<table>

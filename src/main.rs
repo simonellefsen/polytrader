@@ -472,7 +472,7 @@ async fn produce_5min_decision_report(
         let ctx = serde_json::json!({
             "paper_only": true,
             "tier": "5min_dr_cadence",
-            "min_net_edge_for_trade": "0.04",
+            "min_net_edge_for_trade": crate::risk::RiskConfig::from_env().min_net_edge.to_string(),
             "costing_notional": realistic_notional.to_string()
         });
         match engine.fuse_net(&snapshot, &ctx, Some(&fee_ctx), realistic_notional) {
@@ -489,7 +489,7 @@ async fn produce_5min_decision_report(
                 // RISK: this is a rough estimate; always apply fractional Kelly + caps.
                 let portfolio_usdc = current_portfolio_usdc(pool).await;
                 let win_prob = (target_mid + net).min(dec!(0.99)).max(dec!(0.01));
-                let risk_mgr = RiskManager::with_defaults();
+                let risk_mgr = RiskManager::from_env();
                 let sizing = risk_mgr.kelly_size(win_prob, target_mid, portfolio_usdc);
 
                 let payload = serde_json::json!({
@@ -610,7 +610,17 @@ async fn maybe_execute_opportunity(
     }
 
     // Risk gate (PRIMARY): min net edge + PnL floor + exposure + concentration. May trim the size.
-    let risk = RiskManager::with_defaults();
+    let risk = RiskManager::from_env();
+    // A/B gate attribution: does this trade also clear the stricter "shadow" threshold? The live gate
+    // is min_net_edge (e.g. 2%); shadow_net_edge (e.g. 4%) is recorded but NOT enforced, so we can
+    // compare how the stricter gate would have performed using the same live run.
+    let shadow_threshold = risk.config().shadow_net_edge;
+    let clears_shadow = net_edge >= shadow_threshold;
+    let edge_band = if clears_shadow {
+        "strict_ge_shadow"
+    } else {
+        "lenient_below_shadow"
+    };
     let check = risk
         .check_pre_trade(pool, gamma_id, net_edge, sizing.recommended_usdc)
         .await?;
@@ -708,6 +718,9 @@ async fn maybe_execute_opportunity(
                         "market_id": gamma_id,
                         "outcome": target_outcome,
                         "net_edge": net_edge.to_string(),
+                        "edge_band": edge_band,
+                        "clears_shadow_gate": clears_shadow,
+                        "shadow_net_edge": shadow_threshold.to_string(),
                         "approved_usdc": approved_usdc.to_string(),
                         "shares_submitted": shares.to_string(),
                         "filled_shares": filled.to_string(),
