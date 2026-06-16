@@ -1752,6 +1752,8 @@ function renderParams(c){
       "Hard dollar cap on any single position, regardless of what Kelly suggests. Caps the worst-case loss on one market."],
     ["Max market exposure", pct(r.max_market_exposure_pct),
       "Max share of the portfolio allowed in one market. Caps concentration so a single resolution can't sink the book. Positions are trimmed to fit rather than rejected."],
+    ["Max cluster exposure", pct(r.max_cluster_exposure_pct),
+      "Max share of the portfolio across all markets that resolve off the SAME underlying event (e.g. the ~15 Iran/Hormuz peace-deal markets). Each clears the per-market cap alone, but together they're one correlated bet whose YES winners and NO losers cancel. New entries are trimmed to fit; uncorrelated markets are exempt."],
     ["Max total exposure", pct(r.max_total_exposure_pct),
       "Max share of the portfolio that can be locked across all positions at once. Keeps dry powder; blocks new entries once breached."],
     ["P&L floor (stop)", pct(r.pnl_floor),

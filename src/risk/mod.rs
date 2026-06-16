@@ -40,6 +40,12 @@ pub struct RiskConfig {
     pub max_position_usdc: Decimal,
     /// Max fraction of total portfolio value in any one market (e.g. 0.20 = 20 %).
     pub max_market_exposure_pct: Decimal,
+    /// Max fraction of portfolio locked across any one CORRELATED CLUSTER of markets (e.g. 0.35).
+    /// Many Polymarket questions are near-duplicates of the same event (e.g. the ~15 Iran / Strait
+    /// of Hormuz peace-deal markets). Each clears the per-market cap individually, yet together they
+    /// are one giant correlated bet whose YES winners and NO losers cancel. This caps the aggregate
+    /// exposure to any one such cluster. Uncorrelated markets are exempt (each is its own cluster).
+    pub max_cluster_exposure_pct: Decimal,
     /// Max fraction of portfolio that can be locked simultaneously (e.g. 0.80 = 80 %).
     pub max_total_exposure_pct: Decimal,
     /// Minimum net edge (after fees) to approve a trade — the LIVE gate (e.g. 0.02 = 2 %).
@@ -59,6 +65,7 @@ impl Default for RiskConfig {
             kelly_fraction: dec!(0.25),
             max_position_usdc: dec!(20),
             max_market_exposure_pct: dec!(0.20),
+            max_cluster_exposure_pct: dec!(0.35),
             max_total_exposure_pct: dec!(0.80),
             min_net_edge: dec!(0.02),
             shadow_net_edge: dec!(0.04),
@@ -86,6 +93,10 @@ impl RiskConfig {
                 "POLYTRADER_MAX_MARKET_EXPOSURE_PCT",
                 d.max_market_exposure_pct,
             ),
+            max_cluster_exposure_pct: dec_env(
+                "POLYTRADER_MAX_CLUSTER_EXPOSURE_PCT",
+                d.max_cluster_exposure_pct,
+            ),
             max_total_exposure_pct: dec_env(
                 "POLYTRADER_MAX_TOTAL_EXPOSURE_PCT",
                 d.max_total_exposure_pct,
@@ -103,6 +114,7 @@ impl RiskConfig {
             "kelly_fraction": self.kelly_fraction.to_string(),
             "max_position_usdc": self.max_position_usdc.to_string(),
             "max_market_exposure_pct": self.max_market_exposure_pct.to_string(),
+            "max_cluster_exposure_pct": self.max_cluster_exposure_pct.to_string(),
             "max_total_exposure_pct": self.max_total_exposure_pct.to_string(),
             "min_net_edge": self.min_net_edge.to_string(),
             "shadow_net_edge": self.shadow_net_edge.to_string(),
@@ -133,6 +145,68 @@ pub struct RiskCheck {
     pub recommended_size: Option<Decimal>,
 }
 
+/// Classify a market slug into a CORRELATED CLUSTER key. Markets in the same cluster resolve off the
+/// same underlying event (or highly correlated events), so their outcomes are not independent. The
+/// `"uncorrelated"` bucket means "treat as its own cluster" (the cluster cap does not apply).
+///
+/// Slug-based and deliberately coarse: it errs toward grouping (a false grouping only tightens risk).
+/// Sports are checked first because World-Cup slugs embed country names (e.g. `...-france-win-...`).
+pub fn cluster_key(slug: &str) -> &'static str {
+    let s = slug.to_lowercase();
+    if s.contains("world-cup")
+        || s.contains("fifa")
+        || s.contains("nba")
+        || s.contains("knicks")
+        || s.contains("super-bowl")
+    {
+        return "sports";
+    }
+    // The big one: US x Iran peace deal / Strait of Hormuz / nuclear-enrichment markets.
+    if s.contains("iran")
+        || s.contains("hormuz")
+        || s.contains("uranium")
+        || s.contains("enrichment")
+    {
+        return "iran_geopolitics";
+    }
+    if s.contains("netanyahu") || s.contains("eizenkot") || s.contains("prime-minister-of-israel") {
+        return "israel_pm";
+    }
+    if s.contains("china") || s.contains("taiwan") {
+        return "china_taiwan";
+    }
+    if s.contains("bitcoin") || s.contains("ethereum") || s.contains("crypto") {
+        return "crypto";
+    }
+    if s.contains("fed-rate") || s.contains("rate-cut") || s.contains("rate-hike") {
+        return "fed_rates";
+    }
+    if s.contains("2028") {
+        return "us_2028";
+    }
+    if s.contains("midterm")
+        || s.contains("balance-of-power")
+        || s.contains("control-the-house")
+        || s.contains("control-the-senate")
+    {
+        return "us_2026_midterms";
+    }
+    if s.contains("brazil") || s.contains("lula") || s.contains("bolsonaro") {
+        return "brazil_2026";
+    }
+    if s.contains("french")
+        || s.contains("france")
+        || s.contains("bardella")
+        || s.contains("philippe")
+    {
+        return "france_2027";
+    }
+    if s.contains("makerfield") || s.contains("starmer") || s.contains("burnham") {
+        return "uk_politics";
+    }
+    "uncorrelated"
+}
+
 /// Portfolio state loaded from DB for risk calculations.
 #[derive(Debug, Clone)]
 struct PortfolioExposure {
@@ -140,6 +214,10 @@ struct PortfolioExposure {
     total_locked: Decimal,
     total_pnl: Decimal,
     market_locked: Decimal,
+    /// Correlated-cluster key of the candidate market ("uncorrelated" = cap N/A).
+    cluster_key: &'static str,
+    /// Total collateral already locked across ALL open positions in the candidate's cluster.
+    cluster_locked: Decimal,
 }
 
 pub struct RiskManager {
@@ -310,6 +388,45 @@ impl RiskManager {
             });
         }
 
+        // Gate 3.5: correlated-cluster concentration. Caps aggregate exposure across all markets that
+        // resolve off the same underlying event (e.g. the Iran/Hormuz peace-deal cluster), which each
+        // individually pass the per-market cap yet together form one giant correlated bet. Exempt for
+        // the "uncorrelated" bucket (there cluster_locked == market_locked and the per-market cap, being
+        // stricter, governs). Trims `proposed_usdc` down to the remaining cluster headroom, then lets
+        // the per-market gate below trim further if needed; rejects outright only at zero headroom.
+        let mut proposed_usdc = proposed_usdc;
+        let mut cluster_trim_note: Option<String> = None;
+        if exp.cluster_key != "uncorrelated"
+            && (exp.cluster_locked + proposed_usdc) / total_value
+                > self.config.max_cluster_exposure_pct
+        {
+            let headroom =
+                (total_value * self.config.max_cluster_exposure_pct) - exp.cluster_locked;
+            if headroom <= Decimal::ZERO {
+                return Ok(RiskCheck {
+                    approved: false,
+                    reason: format!(
+                        "correlated cluster '{}' already at {:.1}% exposure limit",
+                        exp.cluster_key,
+                        self.config.max_cluster_exposure_pct * dec!(100)
+                    ),
+                    recommended_size: None,
+                });
+            }
+            warn!(
+                cluster = exp.cluster_key,
+                trimmed_to = %headroom,
+                "position trimmed to respect correlated-cluster limit (paper-only)"
+            );
+            proposed_usdc = headroom.min(proposed_usdc);
+            cluster_trim_note = Some(format!(
+                "trimmed to {:.2} USDC (cluster '{}' limit {:.1}%)",
+                proposed_usdc,
+                exp.cluster_key,
+                self.config.max_cluster_exposure_pct * dec!(100)
+            ));
+        }
+
         // Gate 4: market concentration (trim rather than reject outright)
         let post_market = exp.market_locked + proposed_usdc;
         let market_pct = post_market / total_value;
@@ -344,11 +461,12 @@ impl RiskManager {
             market = %market_id,
             net_edge = %net_edge,
             proposed = %proposed_usdc,
+            cluster = exp.cluster_key,
             "pre-trade risk check passed (paper-only)"
         );
         Ok(RiskCheck {
             approved: true,
-            reason: "all gates passed".into(),
+            reason: cluster_trim_note.unwrap_or_else(|| "all gates passed".into()),
             recommended_size: Some(proposed_usdc),
         })
     }
@@ -379,11 +497,52 @@ impl RiskManager {
         .await
         .unwrap_or(Decimal::ZERO);
 
+        // Candidate market's slug → cluster key. If we can't resolve a slug, treat as uncorrelated
+        // (no cluster cap) rather than guessing.
+        let candidate_slug: Option<String> =
+            sqlx::query_scalar("SELECT slug FROM market_data.markets WHERE gamma_id = $1")
+                .bind(market_id)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        let cluster_key = candidate_slug
+            .as_deref()
+            .map(cluster_key)
+            .unwrap_or("uncorrelated");
+
+        // Sum collateral across every OPEN position whose market shares the candidate's cluster.
+        // Done in Rust (the classifier is slug-based) over the open-position rows.
+        let cluster_locked = if cluster_key == "uncorrelated" {
+            // No cross-market aggregation for the catch-all bucket; per-market cap still applies.
+            market_locked
+        } else {
+            let rows: Vec<(Option<String>, Decimal)> = sqlx::query_as(
+                "SELECT m.slug, p.collateral_locked
+                 FROM paper_trading.paper_positions p
+                 JOIN market_data.markets m ON m.gamma_id = p.market_id
+                 WHERE p.shares > 0",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            rows.into_iter()
+                .filter(|(slug, _)| {
+                    slug.as_deref()
+                        .map(|s| self::cluster_key(s) == cluster_key)
+                        .unwrap_or(false)
+                })
+                .map(|(_, c)| c)
+                .sum()
+        };
+
         Ok(PortfolioExposure {
             virtual_usdc,
             total_locked,
             total_pnl: unrealized_pnl + realized_pnl,
             market_locked,
+            cluster_key,
+            cluster_locked,
         })
     }
 }
