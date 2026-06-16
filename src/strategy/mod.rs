@@ -100,9 +100,45 @@ pub trait SignalProcessor: Send + Sync {
     ) -> Result<Signal>;
 }
 
-/// Stub 1: Orderbook / momentum processor (short-horizon from openclaw + BTC orderbook/tick_velocity).
-/// Minimal: derives simple imbalance from hypothetical snapshot (extend later with real OrderbookSnapshot).
-/// Risk: Momentum reverses at resolution; thin books produce noisy signals. Always combine with liquidity filter (see market-making-liquidity.md).
+/// Sum the `size` field across a jsonb orderbook level array (`[{"price","size"}, ...]`). Shared by
+/// the orderbook-aware processors. Missing/unparseable → 0 (treated as no depth on that side).
+fn level_depth(levels: Option<&Vec<serde_json::Value>>) -> Decimal {
+    levels
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l["size"].as_str()?.parse::<Decimal>().ok())
+                .fold(Decimal::ZERO, |acc, x| acc + x)
+        })
+        .unwrap_or(Decimal::ZERO)
+}
+
+/// (bid_depth, ask_depth) for the target token from the snapshot's `bids`/`asks` arrays.
+fn snapshot_book_depths(snapshot: &serde_json::Value) -> (Decimal, Decimal) {
+    (
+        level_depth(snapshot["bids"].as_array()),
+        level_depth(snapshot["asks"].as_array()),
+    )
+}
+
+/// A neutral (non-firing) signal: score 0 + confidence 0 so it contributes zero weight to fusion
+/// (doesn't dilute the weighted average) and reads as "not fired" in the signal scorecard.
+fn neutral_signal(name: &'static str, metadata: serde_json::Value) -> Signal {
+    Signal {
+        processor_name: name,
+        score: Decimal::ZERO,
+        confidence: Decimal::ZERO,
+        edge: Some(Decimal::ZERO),
+        metadata,
+    }
+}
+
+/// Orderbook imbalance / momentum. Reads the target token's resting depth (bids vs asks) and reads
+/// net buying/selling pressure: a bid-heavy book = demand to buy the target token = upward price
+/// pressure (score > 0, supports the long); ask-heavy = selling pressure (score < 0). Near-balanced
+/// books are ignored (noise gate). Score is in the shared frame "edge for buying the target outcome".
+///
+/// Risk: momentum reverses at resolution and thin books are noisy; confidence is therefore capped low
+/// (≤0.35) and scaled by total depth, so the net-edge gate + fractional Kelly still govern. Paper-only.
 pub struct OrderbookMomentumProcessor;
 
 impl SignalProcessor for OrderbookMomentumProcessor {
@@ -112,26 +148,71 @@ impl SignalProcessor for OrderbookMomentumProcessor {
 
     fn compute_signal(
         &self,
-        _snapshot: &serde_json::Value,
+        snapshot: &serde_json::Value,
         _ctx: &serde_json::Value,
     ) -> Result<Signal> {
-        // Placeholder logic (real: parse bids/asks jsonb from ingester, compute imbalance/velocity as Decimal).
-        // For skeleton: neutral with low confidence.
-        let score = Decimal::ZERO;
-        let confidence = Decimal::from(10) / Decimal::from(100); // 0.10 (magic per skeleton; extracted const attempt hit rust_decimal const / limitation under clippy -D; see fix round in review)
-        warn!(processor = %self.name(), "stub processor (paper-only; extend with real snapshot parsing + Decimal math)");
+        let (bid_depth, ask_depth) = snapshot_book_depths(snapshot);
+        let total = bid_depth + ask_depth;
+        if total <= Decimal::ZERO {
+            // Data-starved (no book in snapshot) — neutral, not an error. Distinct from the old stub.
+            return Ok(neutral_signal(
+                self.name(),
+                json!({"reason": "no_book_data"}),
+            ));
+        }
+
+        // Imbalance in [-1, 1]; > 0 = bid-heavy (upward pressure), < 0 = ask-heavy (downward).
+        let imbalance = (bid_depth - ask_depth) / total;
+        const NOISE_GATE: Decimal = dec!(0.20); // ignore near-balanced books (pure noise)
+        if imbalance.abs() < NOISE_GATE {
+            return Ok(neutral_signal(
+                self.name(),
+                json!({"reason": "balanced_book", "imbalance": imbalance.to_string()}),
+            ));
+        }
+
+        // Map imbalance beyond the gate to a modest edge (max |score| ≈ 0.12).
+        const MAX_SCORE: Decimal = dec!(0.12);
+        let effective = (imbalance.abs() - NOISE_GATE) / (Decimal::ONE - NOISE_GATE); // 0..1
+        let magnitude = effective * MAX_SCORE;
+        let score = if imbalance.is_sign_positive() {
+            magnitude
+        } else {
+            -magnitude
+        };
+
+        // Confidence: 0.15 base + up to 0.20 scaled by total depth (thin books → low confidence),
+        // capped at 0.35 (advisory only). 5000 shares ≈ "deep enough" soft cap.
+        let depth_conf = (total / dec!(5000)).min(Decimal::ONE) * dec!(0.20);
+        let confidence = (dec!(0.15) + depth_conf).min(dec!(0.35));
+
         Ok(Signal {
             processor_name: self.name(),
             score,
             confidence,
             edge: Some(score * confidence),
-            metadata: json!({"stub": true, "inspired_by": "openclaw/features + BTC orderbook_processor + tick_velocity"}),
+            metadata: json!({
+                "thesis": "orderbook_imbalance_momentum",
+                "bid_depth": bid_depth.to_string(),
+                "ask_depth": ask_depth.to_string(),
+                "imbalance": imbalance.to_string(),
+                "direction": if score.is_sign_positive() { "buy_pressure_supports_long" } else { "sell_pressure_opposes_long" },
+            }),
         })
     }
 }
 
-/// Stub 2: Simple spike / divergence (from BTC spike_detector + divergence_processor).
-/// Risk: Spikes can be news-driven or manipulation; false positives lead to over-trading in paper (still virtual loss of opportunity).
+/// Spike + divergence: fade a recent sharp price move ONLY when the orderbook now leans against it
+/// (a reversal setup). A spike down in the target token (it got cheaper fast) with a now bid-heavy
+/// book (buyers stepping in) → expect a bounce → score > 0 (buy the cheap target). A spike up with a
+/// now ask-heavy book → expect a pullback → score < 0. A spike with the book confirming its own
+/// direction is momentum, NOT divergence, and is suppressed (that's orderbook_momentum's job).
+///
+/// Distinct from overreaction_fade: that fires on absolute price *extremeness*; this fires on the
+/// *dynamics* (a recent spike + opposing book), independent of how extreme the level is.
+///
+/// Risk: spikes can be driven by real catalysts (the reversal never comes); confidence is capped low
+/// (≤0.40) and the net-edge gate + Kelly still govern. Paper-only.
 pub struct SpikeDivergenceProcessor;
 
 impl SignalProcessor for SpikeDivergenceProcessor {
@@ -141,18 +222,76 @@ impl SignalProcessor for SpikeDivergenceProcessor {
 
     fn compute_signal(
         &self,
-        _snapshot: &serde_json::Value,
+        snapshot: &serde_json::Value,
         _ctx: &serde_json::Value,
     ) -> Result<Signal> {
-        let score = Decimal::ZERO;
-        let confidence = Decimal::from(5) / Decimal::from(100); // 0.05 stub (magic per skeleton; extracted const attempt hit rust_decimal const / limitation under clippy -D; see fix round in review; added warn for consistency per review)
-        warn!(processor = %self.name(), "stub processor (paper-only; extend with real snapshot parsing + Decimal math)");
+        // Signed ~3h move of the target token (positive = rose, negative = fell). Supplied by the DR
+        // generator; absent (e.g. the observational server path) ⇒ no signal.
+        let move_signed = snapshot
+            .get("recent_move_signed")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .unwrap_or(Decimal::ZERO);
+
+        const SPIKE_THRESHOLD: Decimal = dec!(0.07); // same scale as the overreaction volatility guard
+        if move_signed.abs() < SPIKE_THRESHOLD {
+            return Ok(neutral_signal(
+                self.name(),
+                json!({"reason": "no_spike", "recent_move_signed": move_signed.to_string()}),
+            ));
+        }
+
+        let (bid_depth, ask_depth) = snapshot_book_depths(snapshot);
+        let total = bid_depth + ask_depth;
+        if total <= Decimal::ZERO {
+            return Ok(neutral_signal(
+                self.name(),
+                json!({"reason": "no_book_for_divergence", "recent_move_signed": move_signed.to_string()}),
+            ));
+        }
+        let imbalance = (bid_depth - ask_depth) / total;
+
+        // Divergence = book leans AGAINST the spike direction, with a minimum strength to confirm.
+        const CONFIRM: Decimal = dec!(0.15);
+        let spike_down_book_up = move_signed.is_sign_negative() && imbalance > CONFIRM;
+        let spike_up_book_down = move_signed.is_sign_positive() && imbalance < -CONFIRM;
+        if !spike_down_book_up && !spike_up_book_down {
+            return Ok(neutral_signal(
+                self.name(),
+                json!({
+                    "reason": "spike_without_divergence",
+                    "recent_move_signed": move_signed.to_string(),
+                    "imbalance": imbalance.to_string(),
+                }),
+            ));
+        }
+
+        // Score: fade the spike (reversal opposes the move). Magnitude scales with spike size beyond
+        // the threshold (cap ≈ 0.12). Reversal of a DOWN spike supports the long (score > 0).
+        const SPIKE_SPAN: Decimal = dec!(0.23); // 0.07..0.30 maps to 0..1
+        let spike_mag = ((move_signed.abs() - SPIKE_THRESHOLD) / SPIKE_SPAN).min(Decimal::ONE);
+        let magnitude = spike_mag * dec!(0.12);
+        let score = if move_signed.is_sign_negative() {
+            magnitude // price fell → expect bounce up → buy target
+        } else {
+            -magnitude // price rose → expect pullback → oppose long
+        };
+
+        // Confidence: 0.20 base + up to 0.15 from divergence strength, capped 0.40.
+        let confidence =
+            (dec!(0.20) + imbalance.abs().min(Decimal::ONE) * dec!(0.15)).min(dec!(0.40));
+
         Ok(Signal {
             processor_name: self.name(),
             score,
             confidence,
             edge: Some(score * confidence),
-            metadata: json!({"stub": true, "inspired_by": "BTC spike_detector + divergence_processor"}),
+            metadata: json!({
+                "thesis": "spike_with_orderbook_divergence_fade",
+                "recent_move_signed": move_signed.to_string(),
+                "imbalance": imbalance.to_string(),
+                "direction": if score.is_sign_positive() { "fade_down_spike_buy_target" } else { "fade_up_spike_oppose_long" },
+            }),
         })
     }
 }
@@ -350,4 +489,94 @@ pub fn example_fuse_usage_placeholder() {
     //     Err(e) => { /* log and degrade */ }
     // }
     tracing::debug!("FusionEngine skeleton ready (paper-only, Decimal, net edge after fees + DecisionReport for deliberate tier + Hermes)");
+}
+
+#[cfg(test)]
+mod processor_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn book(bid_size: &str, ask_size: &str) -> serde_json::Value {
+        json!({
+            "bids": [{"price": "0.40", "size": bid_size}],
+            "asks": [{"price": "0.41", "size": ask_size}],
+        })
+    }
+
+    #[test]
+    fn momentum_bid_heavy_book_supports_long() {
+        let sig = OrderbookMomentumProcessor
+            .compute_signal(&book("9000", "1000"), &json!({}))
+            .unwrap();
+        // Bid-heavy = upward pressure = positive score (supports buying the target).
+        assert!(sig.score > Decimal::ZERO, "score={}", sig.score);
+        assert!(sig.confidence > Decimal::ZERO);
+    }
+
+    #[test]
+    fn momentum_ask_heavy_book_opposes_long() {
+        let sig = OrderbookMomentumProcessor
+            .compute_signal(&book("1000", "9000"), &json!({}))
+            .unwrap();
+        assert!(sig.score < Decimal::ZERO, "score={}", sig.score);
+    }
+
+    #[test]
+    fn momentum_balanced_book_is_neutral() {
+        let sig = OrderbookMomentumProcessor
+            .compute_signal(&book("5000", "5000"), &json!({}))
+            .unwrap();
+        assert_eq!(sig.score, Decimal::ZERO);
+        assert_eq!(sig.confidence, Decimal::ZERO);
+    }
+
+    #[test]
+    fn momentum_no_book_is_neutral_not_error() {
+        let sig = OrderbookMomentumProcessor
+            .compute_signal(&json!({}), &json!({}))
+            .unwrap();
+        assert_eq!(sig.score, Decimal::ZERO);
+    }
+
+    #[test]
+    fn divergence_down_spike_with_buyers_supports_long() {
+        // Target fell sharply (move -0.10) but the book is now bid-heavy → expect a bounce → score > 0.
+        let mut snap = book("9000", "1000");
+        snap["recent_move_signed"] = json!("-0.10");
+        let sig = SpikeDivergenceProcessor
+            .compute_signal(&snap, &json!({}))
+            .unwrap();
+        assert!(sig.score > Decimal::ZERO, "score={}", sig.score);
+    }
+
+    #[test]
+    fn divergence_up_spike_with_sellers_opposes_long() {
+        let mut snap = book("1000", "9000");
+        snap["recent_move_signed"] = json!("0.10");
+        let sig = SpikeDivergenceProcessor
+            .compute_signal(&snap, &json!({}))
+            .unwrap();
+        assert!(sig.score < Decimal::ZERO, "score={}", sig.score);
+    }
+
+    #[test]
+    fn divergence_spike_without_opposing_book_is_neutral() {
+        // Spike down but book ALSO sell-heavy (confirms the move, not a reversal) → no signal.
+        let mut snap = book("1000", "9000");
+        snap["recent_move_signed"] = json!("-0.10");
+        let sig = SpikeDivergenceProcessor
+            .compute_signal(&snap, &json!({}))
+            .unwrap();
+        assert_eq!(sig.score, Decimal::ZERO);
+    }
+
+    #[test]
+    fn divergence_small_move_is_neutral() {
+        let mut snap = book("9000", "1000");
+        snap["recent_move_signed"] = json!("-0.02"); // below the spike threshold
+        let sig = SpikeDivergenceProcessor
+            .compute_signal(&snap, &json!({}))
+            .unwrap();
+        assert_eq!(sig.score, Decimal::ZERO);
+    }
 }

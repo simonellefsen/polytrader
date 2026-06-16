@@ -441,7 +441,12 @@ async fn produce_5min_decision_report(
         // Recent price move for this outcome (volatility guard input): compare current mid to the
         // oldest mid in the last ~3h of snapshots. A large move = the extreme price is NEW (genuine
         // overreaction to fade); a stable extreme is likely correctly priced (no overreaction).
-        let recent_move = compute_recent_move(pool, &gamma_id, target_outcome, target_mid).await;
+        let recent_move_signed =
+            compute_recent_move_signed(pool, &gamma_id, target_outcome, target_mid).await;
+        let recent_move = recent_move_signed.abs();
+        // Latest orderbook for the target token — feeds orderbook_momentum + spike_divergence (and the
+        // overreaction book-confirmation bonus), which were previously starved (snapshot carried no book).
+        let (book_bids, book_asks) = fetch_latest_book(pool, &gamma_id, target_outcome).await;
         // External advisory context: Yahoo spot (free, every cycle) + newsdata.io news (metered —
         // 200 credits/day, so cached per market with a daily budget cap). Best-effort.
         let mut external = serde_json::Map::new();
@@ -465,6 +470,9 @@ async fn produce_5min_decision_report(
             "target_outcome": target_outcome,
             "target_mid": target_mid.to_string(),
             "recent_move": recent_move.to_string(),
+            "recent_move_signed": recent_move_signed.to_string(),
+            "bids": book_bids,
+            "asks": book_asks,
             "external": external,
             "paper_only": true,
             "source": "5min_dr_generator"
@@ -1382,7 +1390,10 @@ async fn get_news_context_cached(
 /// Recent absolute price move for an outcome: |current_mid − oldest_mid| over the last ~3h of
 /// orderbook snapshots. Feeds the overreaction volatility guard (fade only NEW extremes, i.e. recent
 /// sharp moves, not long-standing correctly-priced extremes). Returns 0 when there's no history yet.
-async fn compute_recent_move(
+/// SIGNED price move over ~3h (current − oldest). Positive = price rose, negative = fell. Callers
+/// take `.abs()` for the overreaction volatility guard; the sign feeds spike_divergence (fade a spike
+/// only when the orderbook now leans against it). Returns 0 when there's no history yet.
+async fn compute_recent_move_signed(
     pool: &sqlx::PgPool,
     gamma_id: &str,
     outcome: &str,
@@ -1401,8 +1412,33 @@ async fn compute_recent_move(
     .ok()
     .flatten();
     match oldest {
-        Some(o) => (current_mid - o).abs(),
+        Some(o) => current_mid - o,
         None => dec!(0),
+    }
+}
+
+/// Latest stored orderbook (bids, asks) for a market's outcome token — the jsonb level arrays
+/// (`[{"price","size"}, ...]`). Feeds the orderbook_momentum + spike_divergence processors (and the
+/// overreaction book-confirmation bonus). Returns empty arrays when no snapshot exists.
+async fn fetch_latest_book(
+    pool: &sqlx::PgPool,
+    gamma_id: &str,
+    outcome: &str,
+) -> (serde_json::Value, serde_json::Value) {
+    let row: Option<(serde_json::Value, serde_json::Value)> = sqlx::query_as(
+        "SELECT bids, asks FROM market_data.orderbook_snapshots
+         WHERE market_id = $1 AND outcome = $2
+         ORDER BY fetched_at DESC LIMIT 1",
+    )
+    .bind(gamma_id)
+    .bind(outcome)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    match row {
+        Some((b, a)) => (b, a),
+        None => (serde_json::json!([]), serde_json::json!([])),
     }
 }
 
