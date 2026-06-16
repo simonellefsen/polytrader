@@ -339,19 +339,45 @@ async fn do_reflection(
     // Per-signal REALIZED P&L from settled positions (ground truth). Empty until markets resolve;
     // once present, it drives P&L-based weight boosting (net-winners >1.0) instead of trim-only.
     let (realized_pnl_summary, realized_pnl_map) = load_per_signal_realized_pnl(pool).await;
+    let settled_count = realized_pnl_summary
+        .get("settled_positions")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let min_settled_for_tuning: usize = std::env::var("HERMES_MIN_SETTLED_FOR_TUNING")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(MIN_SETTLED_FOR_TUNING);
+    let tuning_enabled = std::env::var("HERMES_AUTONOMOUS_WEIGHT_TUNING")
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase()
+        == "on";
 
     // Closed loop: turn measured attribution + realized P&L into actual FusionEngine weight changes
-    // (gated by HERMES_AUTONOMOUS_WEIGHT_TUNING=on). Writes a strategy_weights event the app loads.
+    // (gated by HERMES_AUTONOMOUS_WEIGHT_TUNING=on, AND >= MIN_SETTLED_FOR_TUNING settled positions
+    // so we tune on realized P&L not fire-rate noise). Writes a strategy_weights event the app loads.
     let processor_weight_tuning = match maybe_update_processor_weights(
         pool,
         &strategy_signal_attribution,
         &realized_pnl_map,
+        settled_count,
     )
     .await
     {
         Some(weights) => json!({"enabled": true, "applied_weights": weights}),
+        None if tuning_enabled && settled_count < min_settled_for_tuning => json!({
+            "enabled": true,
+            "paused": true,
+            "settled_positions": settled_count,
+            "required_settled": min_settled_for_tuning,
+            "note": format!(
+                "weight tuning PAUSED pending settlements ({}/{}); weights held neutral to avoid \
+                 adapting on the fire-rate heuristic / early noise during the learning phase.",
+                settled_count, min_settled_for_tuning
+            )
+        }),
         None => json!({
-            "enabled": std::env::var("HERMES_AUTONOMOUS_WEIGHT_TUNING").unwrap_or_default().trim().to_lowercase() == "on",
+            "enabled": tuning_enabled,
             "note": "no change this cycle (weights unchanged, no data, or tuning disabled). Set HERMES_AUTONOMOUS_WEIGHT_TUNING=on to enable closed-loop FusionEngine weight adjustment."
         }),
     };
@@ -1492,12 +1518,17 @@ async fn load_prev_weights(pool: &sqlx::PgPool) -> BTreeMap<String, Decimal> {
 /// Gated closed-loop weight update. Returns the new weights map (as JSON) if written.
 ///
 /// Gate: env HERMES_AUTONOMOUS_WEIGHT_TUNING=on (default off — neutral 1.0 weights, no behaviour
-/// change). When on, writes a `strategy_weights` event only if weights changed materially.
+/// change). When on, writes a `strategy_weights` event only if weights changed materially AND at
+/// least `MIN_SETTLED_FOR_TUNING` positions have settled (so tuning is driven by realized P&L, not
+/// the fire-rate heuristic / early noise). Threshold overridable via HERMES_MIN_SETTLED_FOR_TUNING.
 /// RISK: paper-only; weights clamped + gradual; affects only simulated fusion ranking. No order path.
+const MIN_SETTLED_FOR_TUNING: usize = 10;
+
 async fn maybe_update_processor_weights(
     pool: &sqlx::PgPool,
     attribution: &serde_json::Value,
     realized_pnl: &BTreeMap<String, Decimal>,
+    settled_count: usize,
 ) -> Option<serde_json::Value> {
     if std::env::var("HERMES_AUTONOMOUS_WEIGHT_TUNING")
         .unwrap_or_default()
@@ -1505,6 +1536,23 @@ async fn maybe_update_processor_weights(
         .to_lowercase()
         != "on"
     {
+        return None;
+    }
+
+    // Learning-phase gate: do NOT adapt weights on the fire-rate heuristic (noise) before enough
+    // positions have actually settled. Until realized P&L exists for >= MIN_SETTLED_FOR_TUNING
+    // positions, hold weights neutral/frozen instead of chasing which signals merely fired most.
+    // Override the threshold via HERMES_MIN_SETTLED_FOR_TUNING.
+    let min_settled: usize = std::env::var("HERMES_MIN_SETTLED_FOR_TUNING")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(MIN_SETTLED_FOR_TUNING);
+    if settled_count < min_settled {
+        info!(
+            settled = settled_count,
+            required = min_settled,
+            "weight tuning paused pending settlements; weights held neutral (no fire-rate adaptation)"
+        );
         return None;
     }
 

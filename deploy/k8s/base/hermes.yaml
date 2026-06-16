@@ -84,6 +84,10 @@ spec:
             # that the app loads to adjust per-processor weights. Paper-only; clamped + gradual.
             - name: HERMES_AUTONOMOUS_WEIGHT_TUNING
               value: "on"
+            # Learning-phase guard: hold weights neutral until at least this many positions have
+            # SETTLED (realized P&L exists), so tuning is driven by ground truth not fire-rate noise.
+            - name: HERMES_MIN_SETTLED_FOR_TUNING
+              value: "10"
             # LLM synthesis via OpenRouter (OpenAI-compatible). Health journaled as llm_health events
             # (status/cause) so the dashboards surface failures (out of credits, auth, rate-limit).
             - name: LLM_API_ENDPOINT
