@@ -1151,16 +1151,28 @@ async fn produce_arb_scan_journal(
     paper_engine: &Arc<PaperTradingEngine>,
 ) -> anyhow::Result<()> {
     let scanner = ArbitrageScanner::with_default_fees();
-    let opps = scanner.scan(pool).await?;
+    let (opps, diag) = scanner.scan_with_diagnostics(pool).await?;
     let best_net = opps.first().map(|o| o.net_profit_per_unit.to_string());
+    // Sanity-check log: distinguishes "efficient market, no arb" (usable_books healthy, best_total_cost
+    // > $1) from "scanner starved" (markets_scanned/usable_books ~0 → missing/stale snapshots).
+    tracing::info!(
+        markets_scanned = diag.markets_scanned,
+        usable_books = diag.usable_books,
+        sub_dollar = diag.sub_dollar_books,
+        near_miss = diag.near_miss_books,
+        net_arbs = diag.net_arb_books,
+        best_total_cost = ?diag.best_total_cost,
+        "arb scan diagnostics"
+    );
     let payload = serde_json::json!({
         "strategy": "arbitrage_missing_probability",
         "opportunity_count": opps.len(),
         "best_net_profit_per_unit": best_net,
         "top_opportunities": opps.iter().take(5).collect::<Vec<_>>(),
+        "diagnostics": diag,
         "paper_only": true,
         "real_orders_enabled": false,
-        "note": "Periodic arb scan (YES+NO best-ask sum < $1 after fees) journaled for Hermes closed-loop. Snapshot-based; this is the ONLY trade type allowed on sports markets."
+        "note": "Periodic arb scan (YES+NO best-ask sum < $1 after fees) journaled for Hermes closed-loop. Snapshot-based; this is the ONLY trade type allowed on sports markets. 'diagnostics' disambiguates a zero opportunity_count: low usable_books = scanner starved (snapshot gap); healthy usable_books with best_total_cost > $1 = efficient market (no arb)."
     });
     let id = journal
         .record_journal_event("arb_scan", "polytrader_arb_scanner", "info", payload)

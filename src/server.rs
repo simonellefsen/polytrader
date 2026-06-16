@@ -1540,6 +1540,97 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
             "total_pnl": (real + unreal).round_dp(2).to_string(),
         })
     };
+    // Per-signal scorecard: which of the 5 fusion processors are firing, how often, how hard, what
+    // Hermes currently weights them, and (once positions settle) the realized P&L attributed to each.
+    // Fire-rate/influence are available now; realized P&L stays empty until settlements exist — the
+    // same data-gate that pauses Hermes weight tuning.
+    const SIGNALS: [&str; 5] = [
+        "orderbook_momentum",
+        "spike_divergence",
+        "overreaction_fade",
+        "yahoo_finance",
+        "news_sentiment",
+    ];
+    let dr_attrs: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload->'report'->'attribution' FROM journal.events
+         WHERE event_type = 'decision_report' AND created_at > now() - interval '24 hours'
+         ORDER BY created_at DESC LIMIT 3000",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let reports_total = dr_attrs.len();
+    // Latest Hermes weights + per-signal realized P&L (if any).
+    let latest_weights: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload FROM journal.events WHERE event_type = 'strategy_weights'
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let weight_of = |name: &str| -> String {
+        latest_weights
+            .as_ref()
+            .and_then(|p| p.pointer(&format!("/weights/{name}")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("1.0")
+            .to_string()
+    };
+    let realized_of = |name: &str| -> Option<String> {
+        latest_weights
+            .as_ref()
+            .and_then(|p| p.pointer(&format!("/per_signal_realized_pnl/{name}")))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let signal_rows: Vec<serde_json::Value> = SIGNALS
+        .iter()
+        .map(|name| {
+            let mut fired = 0usize;
+            let mut abs_sum = Decimal::ZERO;
+            for attr in &dr_attrs {
+                if let Some(score) = attr
+                    .pointer(&format!("/{name}/score"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<Decimal>().ok())
+                {
+                    if !score.is_zero() {
+                        fired += 1;
+                        abs_sum += score.abs();
+                    }
+                }
+            }
+            let fire_rate = if reports_total > 0 {
+                (Decimal::from(fired) / Decimal::from(reports_total) * Decimal::from(100))
+                    .round_dp(1)
+            } else {
+                Decimal::ZERO
+            };
+            let avg_abs_score = if fired > 0 {
+                (abs_sum / Decimal::from(fired)).round_dp(3)
+            } else {
+                Decimal::ZERO
+            };
+            serde_json::json!({
+                "name": name,
+                "fired": fired,
+                "fire_rate_pct": fire_rate.to_string(),
+                "avg_abs_score": avg_abs_score.to_string(),
+                "weight": weight_of(name),
+                "realized_pnl": realized_of(name),
+            })
+        })
+        .collect();
+    let signals_json = serde_json::json!({
+        "reports_window_h": 24,
+        "reports_total": reports_total,
+        "rows": signal_rows,
+        "note": "Fire-rate = share of the last 24h decision reports where the signal contributed a \
+                 non-zero score. Weight is Hermes's current confidence multiplier. Realized P&L per \
+                 signal is empty until positions settle (same gate that pauses weight tuning).",
+    });
+
     let gate_simulation = serde_json::json!({
         "note": "One live run, two gates. 'Lenient' is the active gate (all fills); 'Strict' is the \
                  shadow subset that also clears the stricter edge — i.e. how a tighter gate would have \
@@ -1554,6 +1645,7 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
         "portfolio": portfolio_json,
         "pnl_series": pnl_series,
         "config": config_json,
+        "signals": signals_json,
         "gate_simulation": gate_simulation,
         "open_positions": positions,
         "recent_executions": executions,
@@ -1633,6 +1725,8 @@ fn render_trades_page(prefix: &str) -> String {
   <div class="cards" id="cards"></div>
   <h2>Profit &amp; Loss <span class="pill" id="pnl-now"></span></h2>
   <div id="pnl-chart" class="chartbox"><div class="empty">loading P&amp;L history…</div></div>
+  <h2>Signal Scorecard <span class="pill" id="signals-window"></span></h2>
+  <div id="signals"></div>
   <h2>Gate Simulation <span class="pill dir" id="gatesim-edges"></span></h2>
   <div id="gatesim"></div>
   <h2>Parameters <span class="pill" id="params-mode">paper · read-only</span></h2>
@@ -1731,6 +1825,32 @@ function renderGateSim(gs){
     ${row(gs.strict, false)}
   </table>
   <div class="t" style="padding:8px 2px;">${gs.note||""}</div>`;
+}
+
+// Per-signal scorecard: fire-rate + influence + current Hermes weight + (when settled) realized P&L.
+function renderSignals(s){
+  const el = document.getElementById("signals");
+  const winEl = document.getElementById("signals-window");
+  if (!s || !s.rows || !s.rows.length) { el.innerHTML = `<div class="empty">No decision reports in window yet.</div>`; if(winEl) winEl.textContent=""; return; }
+  if (winEl) winEl.textContent = `${s.reports_total} reports · last ${s.reports_window_h}h`;
+  const pretty = (n)=> n.replace(/_/g,' ');
+  const wcls = (w)=>{ const n=parseFloat(w); if(isNaN(n)||Math.abs(n-1)<0.001) return "muted"; return n>1?"pos":"neg"; };
+  const row = (r) => {
+    const rp = r.realized_pnl;
+    const rpCell = (rp===null||rp===undefined) ? '<span class="muted">— pending</span>' : `<span class="${cls(rp)}">${sign(rp)}</span>`;
+    return `<tr>
+      <td>${pretty(r.name)}</td>
+      <td>${r.fire_rate_pct}% <span class="muted">(${r.fired})</span></td>
+      <td>${r.avg_abs_score}</td>
+      <td class="${wcls(r.weight)}">${parseFloat(r.weight).toFixed(2)}×</td>
+      <td>${rpCell}</td>
+    </tr>`;
+  };
+  el.innerHTML = `<table>
+    <tr><th>Signal</th><th title="Share of recent decision reports where this signal contributed a non-zero score">Fire rate</th><th title="Average absolute contribution when it fires">Avg influence</th><th title="Hermes's current confidence multiplier (1.00× = neutral)">Weight</th><th title="Realized P&amp;L attributed to this signal; populates once positions settle">Settled P&amp;L</th></tr>
+    ${s.rows.map(row).join("")}
+  </table>
+  <div class="t" style="padding:8px 2px;">${s.note||""}</div>`;
 }
 
 // Effective parameters (risk config + cadence + market counts), read-only.
@@ -1834,6 +1954,7 @@ async function load() {
   document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
 
   renderPnlChart(d.pnl_series);
+  renderSignals(d.signals);
   renderGateSim(d.gate_simulation);
   renderParams(d.config);
 

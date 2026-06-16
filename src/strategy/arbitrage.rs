@@ -54,6 +54,37 @@ pub struct ArbitrageOpportunity {
     pub estimated_max_profit_usdc: Decimal,
 }
 
+/// How close a market's YES+NO sum can sit above $1.00 and still count as a "near miss" — a market
+/// the scanner correctly evaluated that was almost arbitrageable. Distinguishes "efficient market, no
+/// arb" from "scanner starved/broken" when the opportunity count is zero.
+const NEAR_MISS_BAND: Decimal = dec!(0.02); // total_cost in (1.00, 1.02]
+
+/// Observability for a scan pass. A zero opportunity count is ambiguous on its own — these counters
+/// disambiguate: `markets_scanned`/`usable_books` near zero means the scanner is starved (missing or
+/// stale orderbook snapshots), whereas a healthy `usable_books` with `best_total_cost` comfortably
+/// above $1.00 means the market is simply efficient (no arb to find). Journaled each pass.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ArbDiagnostics {
+    /// Markets that had a snapshot for BOTH legs (rows returned by the query).
+    pub markets_scanned: usize,
+    /// Of those, how many had a valid best ask in (0,1) on both legs.
+    pub usable_books: usize,
+    /// Skipped: a zero/empty ask on at least one leg (snapshot gap).
+    pub skipped_zero_ask: usize,
+    /// Skipped: an ask >= $1.00 on a leg (malformed/degenerate book).
+    pub skipped_malformed: usize,
+    /// Books where YES+NO < $1.00 (gross arb exists, before the fee/min-profit filter).
+    pub sub_dollar_books: usize,
+    /// Near misses: YES+NO in (1.00, 1.00 + NEAR_MISS_BAND] — almost arbitrageable.
+    pub near_miss_books: usize,
+    /// Opportunities that cleared the net-profit threshold (== returned Vec length).
+    pub net_arb_books: usize,
+    /// Lowest YES+NO sum seen across all usable books (closest approach to/under $1.00).
+    pub best_total_cost: Option<String>,
+    /// Market id holding `best_total_cost` (for a quick spot-check).
+    pub best_total_cost_market: Option<String>,
+}
+
 pub struct ArbitrageScanner {
     taker_bps: Decimal,
 }
@@ -77,6 +108,15 @@ impl ArbitrageScanner {
     /// RISK (paper-only): Snapshot delay means prices shown may no longer be
     /// achievable. Do not treat this as executable signal without live feeds.
     pub async fn scan(&self, pool: &PgPool) -> Result<Vec<ArbitrageOpportunity>> {
+        Ok(self.scan_with_diagnostics(pool).await?.0)
+    }
+
+    /// Same scan, but also returns [`ArbDiagnostics`] so callers can tell an efficient market apart
+    /// from a starved/broken scanner when no opportunities are found.
+    pub async fn scan_with_diagnostics(
+        &self,
+        pool: &PgPool,
+    ) -> Result<(Vec<ArbitrageOpportunity>, ArbDiagnostics)> {
         // Fetch the latest YES and NO snapshots for every active market in one query.
         // LATERAL ensures we get exactly the newest row per (market, outcome) pair.
         let rows: Vec<(String, String, serde_json::Value, serde_json::Value)> = sqlx::query_as(
@@ -109,6 +149,11 @@ impl ArbitrageScanner {
 
         let fee_rate = self.taker_bps / dec!(10000);
         let mut opportunities = Vec::new();
+        let mut diag = ArbDiagnostics {
+            markets_scanned: rows.len(),
+            ..Default::default()
+        };
+        let mut best_total_cost: Option<(Decimal, String)> = None;
 
         for (market_id, question, yes_asks, no_asks) in rows {
             let (ask_yes, depth_yes) = best_ask(&yes_asks);
@@ -116,17 +161,33 @@ impl ArbitrageScanner {
 
             if ask_yes <= Decimal::ZERO || ask_no <= Decimal::ZERO {
                 warn!(market = %market_id, "arb scan: zero ask on one leg; skipping");
+                diag.skipped_zero_ask += 1;
                 continue;
             }
             if ask_yes >= Decimal::ONE || ask_no >= Decimal::ONE {
+                diag.skipped_malformed += 1;
                 continue; // malformed
             }
+            diag.usable_books += 1;
 
             let total_cost = ask_yes + ask_no;
+            // Track the closest approach to $1.00 across all usable books.
+            if best_total_cost
+                .as_ref()
+                .is_none_or(|(c, _)| total_cost < *c)
+            {
+                best_total_cost = Some((total_cost, market_id.clone()));
+            }
             let gross_profit = Decimal::ONE - total_cost;
             if gross_profit <= Decimal::ZERO {
-                continue; // no raw arb (the normal, efficient-market case)
+                // No raw arb (the normal, efficient-market case). Tally near misses so a zero
+                // opportunity count is explainable rather than mysterious.
+                if total_cost <= Decimal::ONE + NEAR_MISS_BAND {
+                    diag.near_miss_books += 1;
+                }
+                continue;
             }
+            diag.sub_dollar_books += 1;
 
             // Fee: taker fill on each leg; fee base is the price paid per leg.
             let combined_fee = (ask_yes + ask_no) * fee_rate * dec!(2);
@@ -159,7 +220,13 @@ impl ArbitrageScanner {
         // Best opportunities first
         opportunities.sort_by_key(|o| std::cmp::Reverse(o.net_profit_per_unit));
 
-        Ok(opportunities)
+        diag.net_arb_books = opportunities.len();
+        if let Some((cost, market)) = best_total_cost {
+            diag.best_total_cost = Some(cost.round_dp(4).to_string());
+            diag.best_total_cost_market = Some(market);
+        }
+
+        Ok((opportunities, diag))
     }
 }
 
