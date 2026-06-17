@@ -1584,6 +1584,86 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     };
+
+    // Per-signal REALIZED HIT-RATE — computed directly from settled positions, independent of Hermes's
+    // weight-tuning gate (which only writes strategy_weights once >=10 settled). This surfaces "when a
+    // signal fired, did the market resolve in our favour?" as soon as ANY position settles. A settled
+    // MARKET is scored by its NET realized P&L (sum across both sides if we held them), so both-sides
+    // markets count once by their net outcome. A signal is credited a market if it fired (non-zero
+    // score) in ANY of that market's recent decision reports (not just the final one). Overlapping by
+    // design (each signal keeps its own record), so this is a count-based win-rate, not a P&L split
+    // (Hermes does the P&L split).
+    let settled_rows: Vec<(Option<String>, Option<Decimal>)> = sqlx::query_as(
+        "SELECT payload->>'market_id', (payload->>'realized_pnl')::numeric
+         FROM journal.events WHERE event_type = 'paper_position_settled'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    // Net realized P&L per settled market.
+    let mut net_by_market: std::collections::HashMap<String, Decimal> =
+        std::collections::HashMap::new();
+    for (m, pnl) in settled_rows.into_iter() {
+        if let (Some(m), Some(pnl)) = (m, pnl) {
+            *net_by_market.entry(m).or_insert(Decimal::ZERO) += pnl;
+        }
+    }
+    let settled_market_ids: Vec<String> = net_by_market.keys().cloned().collect();
+    // ALL recent decision-report attributions for the settled markets (not just the final one): a
+    // signal is credited a market if it fired at ANY point during the holding period. Using only the
+    // final DR would under-credit signals whose inputs vanish at resolution (e.g. orderbook_momentum:
+    // the book empties when a market closes, so it never fires in the post-resolution DR).
+    let market_attrs: Vec<(Option<String>, Option<serde_json::Value>)> =
+        if settled_market_ids.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_as(
+                "SELECT payload->>'market_id', payload->'report'->'attribution'
+                 FROM journal.events
+                 WHERE event_type = 'decision_report'
+                   AND payload->>'market_id' = ANY($1)
+                   AND created_at > now() - interval '7 days'",
+            )
+            .bind(&settled_market_ids)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default()
+        };
+    // market_id -> set of signal names that fired (non-zero score) in ANY of its decision reports.
+    let mut fired_by_market: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for (m, attr) in market_attrs.into_iter() {
+        let (Some(m), Some(attr)) = (m, attr) else {
+            continue;
+        };
+        let entry = fired_by_market.entry(m).or_default();
+        for name in SIGNALS.iter() {
+            let fired = attr
+                .pointer(&format!("/{name}/score"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<Decimal>().ok())
+                .map(|sc| !sc.is_zero())
+                .unwrap_or(false);
+            if fired {
+                entry.insert(name.to_string());
+            }
+        }
+    }
+    let settled_record_of = |name: &str| -> (usize, usize) {
+        // (wins, total) over settled markets where this signal fired at any point.
+        let mut wins = 0usize;
+        let mut total = 0usize;
+        for (mkt, fired) in &fired_by_market {
+            if fired.contains(name) {
+                total += 1;
+                if net_by_market.get(mkt).copied().unwrap_or(Decimal::ZERO) > Decimal::ZERO {
+                    wins += 1;
+                }
+            }
+        }
+        (wins, total)
+    };
+
     let signal_rows: Vec<serde_json::Value> = SIGNALS
         .iter()
         .map(|name| {
@@ -1612,6 +1692,14 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
             } else {
                 Decimal::ZERO
             };
+            let (settled_wins, settled_total) = settled_record_of(name);
+            let settled_winrate = if settled_total > 0 {
+                (Decimal::from(settled_wins) / Decimal::from(settled_total) * Decimal::from(100))
+                    .round_dp(0)
+                    .to_string()
+            } else {
+                String::new()
+            };
             serde_json::json!({
                 "name": name,
                 "fired": fired,
@@ -1619,16 +1707,22 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
                 "avg_abs_score": avg_abs_score.to_string(),
                 "weight": weight_of(name),
                 "realized_pnl": realized_of(name),
+                "settled_wins": settled_wins,
+                "settled_total": settled_total,
+                "settled_winrate_pct": settled_winrate,
             })
         })
         .collect();
     let signals_json = serde_json::json!({
         "reports_window_h": 24,
         "reports_total": reports_total,
+        "settled_markets": net_by_market.len(),
         "rows": signal_rows,
         "note": "Fire-rate = share of the last 24h decision reports where the signal contributed a \
-                 non-zero score. Weight is Hermes's current confidence multiplier. Realized P&L per \
-                 signal is empty until positions settle (same gate that pauses weight tuning).",
+                 non-zero score. Weight is Hermes's current confidence multiplier. Settled record = \
+                 win/loss of settled markets (by net realized P&L) where the signal fired in the final \
+                 decision report (count-based, overlapping). Realized P&L (Hermes's proportional split) \
+                 populates once weight tuning activates at 10 settled.",
     });
 
     let gate_simulation = serde_json::json!({
@@ -1832,9 +1926,18 @@ function renderSignals(s){
   const el = document.getElementById("signals");
   const winEl = document.getElementById("signals-window");
   if (!s || !s.rows || !s.rows.length) { el.innerHTML = `<div class="empty">No decision reports in window yet.</div>`; if(winEl) winEl.textContent=""; return; }
-  if (winEl) winEl.textContent = `${s.reports_total} reports · last ${s.reports_window_h}h`;
+  const sm = s.settled_markets || 0;
+  if (winEl) winEl.textContent = `${s.reports_total} reports · last ${s.reports_window_h}h · ${sm} settled`;
   const pretty = (n)=> n.replace(/_/g,' ');
   const wcls = (w)=>{ const n=parseFloat(w); if(isNaN(n)||Math.abs(n-1)<0.001) return "muted"; return n>1?"pos":"neg"; };
+  const recordCell = (r) => {
+    const t = r.settled_total || 0;
+    if (!t) return '<span class="muted">—</span>';
+    const w = r.settled_wins || 0;
+    const wr = parseFloat(r.settled_winrate_pct);
+    const cl = isNaN(wr) ? '' : (wr >= 50 ? 'pos' : 'neg');
+    return `<span class="${cl}">${w}-${t-w}</span> <span class="muted">(${r.settled_winrate_pct}%)</span>`;
+  };
   const row = (r) => {
     const rp = r.realized_pnl;
     const rpCell = (rp===null||rp===undefined) ? '<span class="muted">— pending</span>' : `<span class="${cls(rp)}">${sign(rp)}</span>`;
@@ -1843,11 +1946,12 @@ function renderSignals(s){
       <td>${r.fire_rate_pct}% <span class="muted">(${r.fired})</span></td>
       <td>${r.avg_abs_score}</td>
       <td class="${wcls(r.weight)}">${parseFloat(r.weight).toFixed(2)}×</td>
+      <td>${recordCell(r)}</td>
       <td>${rpCell}</td>
     </tr>`;
   };
   el.innerHTML = `<table>
-    <tr><th>Signal</th><th title="Share of recent decision reports where this signal contributed a non-zero score">Fire rate</th><th title="Average absolute contribution when it fires">Avg influence</th><th title="Hermes's current confidence multiplier (1.00× = neutral)">Weight</th><th title="Realized P&amp;L attributed to this signal; populates once positions settle">Settled P&amp;L</th></tr>
+    <tr><th>Signal</th><th title="Share of recent decision reports where this signal contributed a non-zero score">Fire rate</th><th title="Average absolute contribution when it fires">Avg influence</th><th title="Hermes's current confidence multiplier (1.00× = neutral)">Weight</th><th title="Win-loss record of settled markets (by net realized P&amp;L) where this signal fired in the final decision report. Available now, independent of Hermes.">Settled record</th><th title="Realized P&amp;L attributed to this signal (Hermes proportional split); populates at 10 settled">Settled P&amp;L</th></tr>
     ${s.rows.map(row).join("")}
   </table>
   <div class="t" style="padding:8px 2px;">${s.note||""}</div>`;
