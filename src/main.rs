@@ -601,19 +601,29 @@ async fn maybe_execute_opportunity(
         return Ok(());
     }
 
-    // No pyramiding: skip if we already hold this (market, outcome).
-    let existing: rust_decimal::Decimal = sqlx::query_scalar(
-        "SELECT COALESCE(shares, 0) FROM paper_trading.paper_positions WHERE market_id = $1 AND outcome = $2",
+    // One directional position per market: skip if we already hold ANY open position in this market,
+    // on EITHER outcome. This blocks two things:
+    //   (1) pyramiding the same side, and
+    //   (2) opening the OPPOSITE side — holding both Yes and No in a binary market is an economic wash
+    //       that only burns taker fees on both legs and locks collateral for ~zero net edge. (The
+    //       cheaper side flips between cycles as prices move, so without this guard we accumulate both;
+    //       the cluster cap bounds total exposure but does NOT prevent same-market hedging.)
+    // The risk-free YES+NO arbitrage path is a separate executor (execute_arb_opportunity) and is not
+    // affected by this directional guard.
+    let held_outcome: Option<String> = sqlx::query_scalar(
+        "SELECT outcome FROM paper_trading.paper_positions WHERE market_id = $1 AND shares > 0 LIMIT 1",
     )
     .bind(gamma_id)
-    .bind(target_outcome)
     .fetch_optional(pool)
     .await
     .ok()
-    .flatten()
-    .unwrap_or(dec!(0));
-    if existing > dec!(0) {
-        tracing::debug!(market = %gamma_id, outcome = %target_outcome, "already positioned; skipping autonomous entry");
+    .flatten();
+    if let Some(held) = held_outcome {
+        if held.eq_ignore_ascii_case(target_outcome) {
+            tracing::debug!(market = %gamma_id, outcome = %target_outcome, "already positioned (same side); skipping autonomous entry");
+        } else {
+            tracing::debug!(market = %gamma_id, target = %target_outcome, held = %held, "already hold opposite side; skipping to avoid a both-sides wash");
+        }
         return Ok(());
     }
 
