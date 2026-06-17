@@ -93,26 +93,50 @@ impl GammaClient {
     pub async fn fetch_markets_by_slugs(&self, slugs: &[String]) -> Result<Vec<Market>> {
         let mut out = Vec::new();
         for slug in slugs {
+            // Default Gamma /markets?slug=X returns the market ONLY while it is open — a RESOLVED
+            // market is dropped from this query. If we stop here, the moment a held market resolves
+            // we go blind to it: `closed`/resolved prices are never ingested, `resolved_outcome`
+            // stays NULL, and settle_resolved_positions never fires (collateral locked forever).
             let url = format!("{}/markets?slug={}", self.base, slug);
-            match self.http.get(&url).send().await {
-                Ok(resp) => match resp.json::<Vec<Value>>().await {
-                    Ok(items) => {
-                        if items.is_empty() {
-                            tracing::warn!(slug = %slug, "gamma returned no market for bootstrap slug (resolved/renamed?)");
-                        }
-                        out.extend(items.iter().map(Self::parse_market));
-                    }
-                    Err(e) => {
-                        tracing::warn!(slug = %slug, error = %e, "gamma slug response parse failed; skipping")
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(slug = %slug, error = %e, "gamma slug request failed; skipping")
+            let mut items = self.get_markets_json(&url, slug).await;
+
+            // Fallback: a slug missing from the open query is almost always resolved/closed. Re-query
+            // including closed markets so we capture the resolution (closed=true + final outcomePrices),
+            // which is exactly what the settlement path needs. This is the fix for "0 settlements
+            // despite markets resolving".
+            if items.is_empty() {
+                let closed_url = format!("{}/markets?slug={}&closed=true", self.base, slug);
+                items = self.get_markets_json(&closed_url, slug).await;
+                if !items.is_empty() {
+                    tracing::info!(slug = %slug, "gamma slug resolved/closed; ingested via closed=true fallback (will settle)");
                 }
             }
+
+            if items.is_empty() {
+                tracing::warn!(slug = %slug, "gamma returned no market for bootstrap slug even with closed=true (renamed/delisted?)");
+            }
+            out.extend(items.iter().map(Self::parse_market));
         }
         tracing::debug!(count = out.len(), "gamma fetched markets by slug");
         Ok(out)
+    }
+
+    /// GET a Gamma /markets URL and parse the JSON array, logging+swallowing errors (returns empty).
+    /// Keeps `fetch_markets_by_slugs` robust: one bad slug/response never aborts the tick.
+    async fn get_markets_json(&self, url: &str, slug: &str) -> Vec<Value> {
+        match self.http.get(url).send().await {
+            Ok(resp) => match resp.json::<Vec<Value>>().await {
+                Ok(items) => items,
+                Err(e) => {
+                    tracing::warn!(slug = %slug, error = %e, "gamma slug response parse failed; skipping");
+                    Vec::new()
+                }
+            },
+            Err(e) => {
+                tracing::warn!(slug = %slug, error = %e, "gamma slug request failed; skipping");
+                Vec::new()
+            }
+        }
     }
 
     /// List active markets (public Gamma /markets, up to limit).
