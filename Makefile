@@ -252,8 +252,9 @@ k8s-set-l2-key: k8s-check-namespace
 # shared RustFS container. Kept OUT of the kustomize base on purpose: a CHANGE_ME placeholder in the
 # applied manifest would be re-applied by every `make k8s-deploy` and silently reset the live creds,
 # breaking WAL archiving + retention with InvalidAccessKeyId (regression seen 2026-06-18). Values are
-# read from the container env and never printed. CNPG reloads the secret + retries archiving on its
-# own (no DB restart needed). Run once after first deploy and any time RustFS creds rotate.
+# read from the container env and never printed. IMPORTANT: CNPG does NOT hot-reload barman creds —
+# the instance manager caches them at pod startup, so a rolling restart is required for a creds change
+# to take effect (this target does it). Run once after first deploy and any time RustFS creds rotate.
 k8s-set-backup-creds: k8s-check-namespace
 	@AK=$$(docker inspect daytrader_rustfs --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^RUSTFS_ACCESS_KEY=//p'); \
 	SK=$$(docker inspect daytrader_rustfs --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^RUSTFS_SECRET_KEY=//p'); \
@@ -266,7 +267,15 @@ k8s-set-backup-creds: k8s-check-namespace
 		--from-literal=ACCESS_SECRET_KEY="$$SK" \
 		--dry-run=client -o yaml | kubectl apply -f - -n $(NAMESPACE) >/dev/null; \
 	echo "✓ polytrader-minio-backup secret set from daytrader_rustfs (values never printed)"; \
-	echo "  CNPG will reload + resume WAL archiving within ~1-2 min; verify with:"; \
+	echo "→ rolling-restarting the CNPG cluster so the instances pick up the new creds..."; \
+	if kubectl cnpg restart polytrader-postgres -n $(NAMESPACE) >/dev/null 2>&1; then \
+		echo "✓ cnpg rolling restart triggered"; \
+	else \
+		echo "  (cnpg plugin not found; restarting instance pods directly)"; \
+		kubectl delete pod -n $(NAMESPACE) -l cnpg.io/cluster=polytrader-postgres >/dev/null 2>&1 || true; \
+		echo "✓ instance pods deleted (CNPG will recreate them)"; \
+	fi; \
+	echo "  WAL archiving should go green within ~1-2 min; verify with:"; \
 	echo "  kubectl get cluster polytrader-postgres -n $(NAMESPACE) -o jsonpath='{.status.conditions[?(@.type==\"ContinuousArchiving\")].status}'"
 
 clean:
