@@ -248,6 +248,27 @@ k8s-set-l2-key: k8s-check-namespace
 	kubectl rollout restart deployment/polytrader -n $(NAMESPACE) || true; \
 	echo "✓ polytrader deployment restarted to pick up the new key"
 
+# Create/rotate the CNPG backup object-store secret (polytrader-minio-backup) from the running
+# shared RustFS container. Kept OUT of the kustomize base on purpose: a CHANGE_ME placeholder in the
+# applied manifest would be re-applied by every `make k8s-deploy` and silently reset the live creds,
+# breaking WAL archiving + retention with InvalidAccessKeyId (regression seen 2026-06-18). Values are
+# read from the container env and never printed. CNPG reloads the secret + retries archiving on its
+# own (no DB restart needed). Run once after first deploy and any time RustFS creds rotate.
+k8s-set-backup-creds: k8s-check-namespace
+	@AK=$$(docker inspect daytrader_rustfs --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^RUSTFS_ACCESS_KEY=//p'); \
+	SK=$$(docker inspect daytrader_rustfs --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^RUSTFS_SECRET_KEY=//p'); \
+	if [ -z "$$AK" ] || [ -z "$$SK" ]; then \
+		echo "ERROR: could not read RUSTFS_ACCESS_KEY/SECRET from the daytrader_rustfs container (is it running?)"; \
+		exit 1; \
+	fi; \
+	kubectl create secret generic polytrader-minio-backup \
+		--from-literal=ACCESS_KEY_ID="$$AK" \
+		--from-literal=ACCESS_SECRET_KEY="$$SK" \
+		--dry-run=client -o yaml | kubectl apply -f - -n $(NAMESPACE) >/dev/null; \
+	echo "✓ polytrader-minio-backup secret set from daytrader_rustfs (values never printed)"; \
+	echo "  CNPG will reload + resume WAL archiving within ~1-2 min; verify with:"; \
+	echo "  kubectl get cluster polytrader-postgres -n $(NAMESPACE) -o jsonpath='{.status.conditions[?(@.type==\"ContinuousArchiving\")].status}'"
+
 clean:
 	cargo clean
 	@echo "Cargo clean done."

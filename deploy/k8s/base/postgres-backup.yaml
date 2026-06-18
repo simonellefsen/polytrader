@@ -1,26 +1,12 @@
-# Object-store credentials for CNPG barman backups + the retention CronJob.
-# Both the WAL archiver (postgres/cluster.yaml) and the retention job below read THIS secret.
+# Backup infra for CNPG barman backups + the retention CronJob.
 #
-# SETUP (required before first deploy — do NOT leave CHANGE_ME, or WAL archiving AND retention fail
-# with "InvalidAccessKeyId" and backups silently never happen):
-#   The store is the shared S3-compatible RustFS on the host at host.docker.internal:9000 (the same
-#   instance the sibling daytrader/danske-spil clusters use). Two steps:
-#   1. Put the RustFS access key/secret here (or patch the live secret) — these must match the
-#      RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY of the running `daytrader_rustfs` container.
-#   2. Create this cluster's bucket once:  aws --endpoint-url http://host.docker.internal:9000 \
-#      s3 mb s3://polytrader-cnpg   (or the boto3 one-liner in deploy notes).
-# Verify:  kubectl get cluster polytrader-postgres -n polytrader \
-#            -o jsonpath='{.status.conditions[?(@.type=="ContinuousArchiving")].status}'  → "True".
-# Real values live only in the cluster secret (gitignored); keep CHANGE_ME here in git.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: polytrader-minio-backup
-type: Opaque
-stringData:
-  ACCESS_KEY_ID: "CHANGE_ME"
-  ACCESS_SECRET_KEY: "CHANGE_ME"
----
+# NOTE: the `polytrader-minio-backup` Secret (object-store creds) is INTENTIONALLY NOT in this file
+# / the kustomization. It is created out-of-band via `make k8s-set-backup-creds` (mirrors the other
+# real secrets like polytrader-l2-auth). This is deliberate: a Secret carrying a `CHANGE_ME`
+# placeholder in the kustomize base would be re-applied by every `make k8s-deploy`, silently
+# resetting the live creds to CHANGE_ME and breaking WAL archiving + retention with
+# "InvalidAccessKeyId". (That regression happened 2026-06-18.) See postgres-backup-secret.example.yaml
+# for the shape + setup, and the WAL archiver config in postgres/cluster.yaml.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
