@@ -1355,14 +1355,28 @@ fn clamp_weight(w: Decimal) -> Decimal {
 ///   2. Fire-rate heuristic fallback (no realized P&L yet — markets unresolved):
 ///      present-but-never-fired → 0.5 (trim dilution); fired → 1.0 (neutral); absent → hold.
 ///
-/// New weight moves toward target by STEP (gradual; avoids oscillation), clamped to [MIN, MAX].
+/// New weight moves toward target by an EFFECTIVE step (gradual; avoids oscillation), clamped to
+/// [MIN, MAX]. The effective step is damped by sample size: with few settled outcomes the per-signal
+/// realized-P&L attribution is noisy and flips cycle-to-cycle (it made the weights whipsaw — e.g.
+/// overreaction_fade swung 1.94→1.71→0.77 across days on only ~12 settled markets), so we move only a
+/// fraction of STEP until the settled sample reaches FULL_CONFIDENCE_SETTLED, then ramp to the full
+/// step. This ties the learning rate to how much evidence we actually have.
 fn compute_weight_adjustments(
     prev: &BTreeMap<String, Decimal>,
     attribution: &serde_json::Value,
     realized_pnl: &BTreeMap<String, Decimal>,
+    settled_count: usize,
 ) -> BTreeMap<String, Decimal> {
     const STEP: Decimal = dec!(0.34);
     const PNL_SCALE: Decimal = dec!(40); // $40 cumulative realized → full boost (2.0) / trim (0.25)
+    const FULL_CONFIDENCE_SETTLED: usize = 40; // settled markets at which the full step is trusted
+                                               // Sample-size confidence in [0,1]: linearly ramps the learning rate from ~0 to STEP as settled
+                                               // outcomes accumulate. At the current ~12 settled this is ~0.3 → step ~0.10 (was 0.34), so the
+                                               // weights drift instead of lurching on a thin, flipping target.
+    let confidence = (Decimal::from(settled_count.min(FULL_CONFIDENCE_SETTLED))
+        / Decimal::from(FULL_CONFIDENCE_SETTLED))
+    .min(dec!(1.0));
+    let eff_step = STEP * confidence;
     let mut out = BTreeMap::new();
     if let Some(per) = attribution.get("per_processor").and_then(|p| p.as_object()) {
         for (name, stats) in per {
@@ -1385,7 +1399,7 @@ fn compute_weight_adjustments(
             } else {
                 dec!(1.0)
             };
-            let next = clamp_weight(current + STEP * (target - current)).round_dp(3);
+            let next = clamp_weight(current + eff_step * (target - current)).round_dp(3);
             out.insert(name.clone(), next);
         }
     }
@@ -1557,7 +1571,7 @@ async fn maybe_update_processor_weights(
     }
 
     let prev = load_prev_weights(pool).await;
-    let next = compute_weight_adjustments(&prev, attribution, realized_pnl);
+    let next = compute_weight_adjustments(&prev, attribution, realized_pnl, settled_count);
     if next.is_empty() {
         return None;
     }
@@ -1875,14 +1889,14 @@ mod tests {
         });
         let prev: BTreeMap<String, Decimal> = BTreeMap::new(); // all default 1.0
         let no_pnl: BTreeMap<String, Decimal> = BTreeMap::new();
-        let next = compute_weight_adjustments(&prev, &attribution, &no_pnl);
+        let next = compute_weight_adjustments(&prev, &attribution, &no_pnl, 40);
 
         // active processor held at 1.0 (target 1.0, already there)
         assert_eq!(next.get("overreaction_fade").copied().unwrap(), dec!(1.0));
         // dead stub trimmed: 1.0 + 0.34*(0.5-1.0) = 0.83
         assert_eq!(next.get("orderbook_momentum").copied().unwrap(), dec!(0.83));
         // a second cycle keeps trimming toward 0.5 (gradual)
-        let next2 = compute_weight_adjustments(&next, &attribution, &no_pnl);
+        let next2 = compute_weight_adjustments(&next, &attribution, &no_pnl, 40);
         assert!(next2.get("orderbook_momentum").copied().unwrap() < dec!(0.83));
         assert!(next2.get("orderbook_momentum").copied().unwrap() >= dec!(0.25));
         // never below floor
@@ -1899,7 +1913,7 @@ mod tests {
         let mut prev = BTreeMap::new();
         prev.insert("spike_divergence".to_string(), dec!(0.26));
         let no_pnl: BTreeMap<String, Decimal> = BTreeMap::new();
-        let next = compute_weight_adjustments(&prev, &attribution, &no_pnl);
+        let next = compute_weight_adjustments(&prev, &attribution, &no_pnl, 40);
         assert!(next.get("spike_divergence").copied().unwrap() >= dec!(0.25));
     }
 
@@ -1933,11 +1947,32 @@ mod tests {
         let mut realized = BTreeMap::new();
         realized.insert("overreaction_fade".to_string(), dec!(-20)); // loser
         realized.insert("news_sentiment".to_string(), dec!(40)); // winner
-        let next = compute_weight_adjustments(&prev, &attribution, &realized);
+                                                                 // settled_count = 40 (full confidence) so the step is the full 0.34 used in these assertions.
+        let next = compute_weight_adjustments(&prev, &attribution, &realized, 40);
         // loser target = 1 + (-20/40) = 0.5 → 1.0 + 0.34*(0.5-1.0) = 0.83
         assert_eq!(next.get("overreaction_fade").copied().unwrap(), dec!(0.83));
         // winner target = 1 + (40/40) = 2.0 → 1.0 + 0.34*(2.0-1.0) = 1.34 (boosted ABOVE 1.0)
         assert_eq!(next.get("news_sentiment").copied().unwrap(), dec!(1.34));
+
+        // SAME inputs but a THIN settled sample (10) → the step is damped (10/40 * 0.34 = 0.085), so
+        // the moves are much smaller and the weights drift instead of lurching.
+        let damped = compute_weight_adjustments(&prev, &attribution, &realized, 10);
+        // loser: 1.0 + 0.085*(0.5-1.0) = 0.9575 → 0.958 (vs 0.83 at full confidence)
+        assert_eq!(
+            damped.get("overreaction_fade").copied().unwrap(),
+            dec!(0.958)
+        );
+        // winner: 1.0 + 0.085*(2.0-1.0) = 1.085 (vs 1.34 at full confidence)
+        assert_eq!(damped.get("news_sentiment").copied().unwrap(), dec!(1.085));
+        // and strictly gentler than the full-confidence move in both directions
+        assert!(
+            damped.get("overreaction_fade").copied().unwrap()
+                > next.get("overreaction_fade").copied().unwrap()
+        );
+        assert!(
+            damped.get("news_sentiment").copied().unwrap()
+                < next.get("news_sentiment").copied().unwrap()
+        );
     }
 
     #[test]
