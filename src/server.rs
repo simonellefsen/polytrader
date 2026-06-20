@@ -1905,8 +1905,9 @@ const num = (v) => { const n = parseFloat(v); return isNaN(n) ? "—" : n; };
 const cls = (v) => { const n = parseFloat(v); return n>0?"pos":(n<0?"neg":"muted"); };
 const sign = (v) => { const n = parseFloat(v); return (n>0?"+":"") + (isNaN(n)?"—":n.toFixed(2)); };
 
-// Live P&L area chart: green when the latest total P&L is >= 0, red when underwater. Plots the
-// running realized+unrealized series. Pure inline SVG (no chart lib) so it stays self-contained.
+// Live P&L area chart: per-segment coloring — green above the zero line, red below (so an early
+// underwater dip reads red even when the latest value is positive). Plots the running
+// realized+unrealized series. Pure inline SVG (no chart lib) so it stays self-contained.
 function renderPnlChart(series, meta){
   const box = document.getElementById("pnl-chart");
   const pts = (series||[]).map(s => ({t: s.t, v: parseFloat(s.pnl)})).filter(p => !isNaN(p.v));
@@ -1914,8 +1915,8 @@ function renderPnlChart(series, meta){
   if (pts.length < 2) { box.innerHTML = `<div class="empty">Not enough P&L history yet for this range — try a wider interval or wait for more snapshots.</div>`; nowEl.textContent=""; return; }
   const last = pts[pts.length-1].v;
   const up = last >= 0;
-  const stroke = up ? "#3fb950" : "#f85149";
-  const fill   = up ? "rgba(63,185,80,0.16)" : "rgba(248,81,73,0.16)";
+  const G_STROKE="#3fb950", R_STROKE="#f85149", G_FILL="rgba(63,185,80,0.16)", R_FILL="rgba(248,81,73,0.16)";
+  const stroke = up ? G_STROKE : R_STROKE; // for the "now" pill + end dot (latest value)
   nowEl.textContent = (last>=0?"+":"") + last.toFixed(2);
   nowEl.style.color = stroke; nowEl.style.borderColor = stroke+"55";
   const W=1000, H=220, padL=46, padR=12, padT=14, padB=22;
@@ -1932,14 +1933,24 @@ function renderPnlChart(series, meta){
                ` L${sx(pts[pts.length-1].t).toFixed(1)},${sy(minV<0?0:minV).toFixed(1)} Z`;
   const zeroY = sy(0);
   const fmtAxis=(v)=> (v>=0?"+":"")+v.toFixed(0);
+  // Split coloring at the zero line: the portion above 0 is green, below 0 is red (so an early dip
+  // underwater shows red even if the latest value is positive). Done with two clip rectangles split
+  // at zeroY, each clipping a green/red copy of the same area + line paths.
+  const posH = Math.max(0, zeroY - padT), negH = Math.max(0, (H-padB) - zeroY);
   box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Profit and loss over time">
+    <defs>
+      <clipPath id="pnlPos"><rect x="0" y="${padT}" width="${W}" height="${posH.toFixed(1)}"/></clipPath>
+      <clipPath id="pnlNeg"><rect x="0" y="${zeroY.toFixed(1)}" width="${W}" height="${negH.toFixed(1)}"/></clipPath>
+    </defs>
     <line x1="${padL}" y1="${padT}" x2="${padL}" y2="${H-padB}" stroke="#30363d" stroke-width="1"/>
     <line x1="${padL}" y1="${zeroY.toFixed(1)}" x2="${W-padR}" y2="${zeroY.toFixed(1)}" stroke="#484f58" stroke-width="1" stroke-dasharray="4 4"/>
     <text x="6" y="${(padT+8).toFixed(0)}" fill="#8b949e" font-size="12">${fmtAxis(maxV)}</text>
     <text x="6" y="${(zeroY+4).toFixed(0)}" fill="#8b949e" font-size="12">0</text>
     <text x="6" y="${(H-padB).toFixed(0)}" fill="#8b949e" font-size="12">${fmtAxis(minV)}</text>
-    <path d="${area}" fill="${fill}" stroke="none"/>
-    <path d="${line}" fill="none" stroke="${stroke}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+    <path d="${area}" fill="${G_FILL}" stroke="none" clip-path="url(#pnlPos)"/>
+    <path d="${area}" fill="${R_FILL}" stroke="none" clip-path="url(#pnlNeg)"/>
+    <path d="${line}" fill="none" stroke="${G_STROKE}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" clip-path="url(#pnlPos)"/>
+    <path d="${line}" fill="none" stroke="${R_STROKE}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" clip-path="url(#pnlNeg)"/>
     <circle cx="${sx(pts[pts.length-1].t).toFixed(1)}" cy="${sy(last).toFixed(1)}" r="3.5" fill="${stroke}"/>
   </svg>`;
   // X axis = time (snapshot timestamp). Labels + caption rendered as HTML below the SVG so they are
