@@ -292,6 +292,7 @@ pub async fn start_server(
         .route("/strategy/arb", get(strategy_arb_handler))
         .route("/trades", get(trades_page_handler))
         .route("/trades/data", get(trades_data_handler))
+        .route("/trades/pnl", get(trades_pnl_handler))
         .route("/board", get(board_page_handler))
         .route("/board/data", get(board_data_handler))
         .route("/paper/portfolio", get(portfolio_handler))
@@ -1759,6 +1760,64 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     .into_response()
 }
 
+/// P&L time series for the chart's interval selector. `?range=` is one of 1d/1w/1m/1y/all (default
+/// 1d). Each range pairs a look-back window with a downsample bucket so the payload stays ~300-400
+/// points regardless of horizon: the running total P&L (realized + unrealized) of the LAST snapshot in
+/// each bucket. The default /trades/data still ships the 1d series so the page paints without a second
+/// round-trip; this endpoint backs the other ranges.
+async fn trades_pnl_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let pool = &state.pool;
+    let range = query
+        .get("range")
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_else(|| "1d".to_string());
+    // (window_secs, bucket_secs) per range. window 0 = no lower bound ("all"). Buckets chosen to keep
+    // ~300-360 points: 5-min (1d), 30-min (1w), 2-h (1m), 1-day (1y/all).
+    let (window_secs, bucket_secs): (i64, i64) = match range.as_str() {
+        "1w" => (7 * 86400, 1800),
+        "1m" => (30 * 86400, 7200),
+        "1y" => (365 * 86400, 86400),
+        "all" => (0, 86400),
+        _ => (86400, 300), // 1d default
+    };
+    // Last snapshot per time bucket within the window (DISTINCT ON bucket, newest first), re-sorted
+    // ascending for a left-to-right plot.
+    let rows: Vec<(chrono::DateTime<chrono::Utc>, Decimal, Decimal)> = sqlx::query_as(
+        "SELECT bucket_ts, realized_pnl, unrealized_pnl FROM (
+             SELECT DISTINCT ON (b)
+                 to_timestamp(floor(extract(epoch FROM as_of) / $1::bigint) * $1::bigint) AS bucket_ts,
+                 floor(extract(epoch FROM as_of) / $1::bigint) AS b,
+                 realized_pnl, unrealized_pnl, as_of
+             FROM paper_trading.virtual_portfolio_snapshots
+             WHERE ($2::bigint = 0 OR as_of >= now() - ($2::bigint * interval '1 second'))
+             ORDER BY b, as_of DESC
+         ) x ORDER BY bucket_ts ASC",
+    )
+    .bind(bucket_secs)
+    .bind(window_secs)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let points: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(at, realized, unreal)| {
+            serde_json::json!({
+                "t": at.timestamp(),
+                "pnl": (realized + unreal).round_dp(2).to_string(),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "range": range,
+        "bucket_secs": bucket_secs,
+        "points": points,
+    }))
+    .into_response()
+}
+
 /// Self-contained HTML page that visualizes paper trades (polls /trades/data). Kept separate from
 /// the Dioxus dashboard to stay low-risk; linked by URL. Paper-only, read-only.
 async fn trades_page_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1817,7 +1876,9 @@ fn render_trades_page(prefix: &str) -> String {
 </header>
 <main>
   <div class="cards" id="cards"></div>
-  <h2>Profit &amp; Loss <span class="pill" id="pnl-now"></span></h2>
+  <h2>Profit &amp; Loss <span class="pill" id="pnl-now"></span>
+    <span id="pnl-ranges" style="float:right;display:inline-flex;gap:4px;font-size:12px;font-weight:400;"></span>
+  </h2>
   <div id="pnl-chart" class="chartbox"><div class="empty">loading P&amp;L history…</div></div>
   <h2>Signal Scorecard <span class="pill" id="signals-window"></span></h2>
   <div id="signals"></div>
@@ -1846,11 +1907,11 @@ const sign = (v) => { const n = parseFloat(v); return (n>0?"+":"") + (isNaN(n)?"
 
 // Live P&L area chart: green when the latest total P&L is >= 0, red when underwater. Plots the
 // running realized+unrealized series. Pure inline SVG (no chart lib) so it stays self-contained.
-function renderPnlChart(series){
+function renderPnlChart(series, meta){
   const box = document.getElementById("pnl-chart");
   const pts = (series||[]).map(s => ({t: s.t, v: parseFloat(s.pnl)})).filter(p => !isNaN(p.v));
   const nowEl = document.getElementById("pnl-now");
-  if (pts.length < 2) { box.innerHTML = `<div class="empty">Not enough P&L history yet — the chart appears once a few snapshots accrue.</div>`; nowEl.textContent=""; return; }
+  if (pts.length < 2) { box.innerHTML = `<div class="empty">Not enough P&L history yet for this range — try a wider interval or wait for more snapshots.</div>`; nowEl.textContent=""; return; }
   const last = pts[pts.length-1].v;
   const up = last >= 0;
   const stroke = up ? "#3fb950" : "#f85149";
@@ -1892,9 +1953,42 @@ function renderPnlChart(series){
        <span>${tLabel(minT)}</span><span>${tLabel(midT)}</span><span>${tLabel(maxT)}</span>
      </div>
      <div class="t" style="padding:4px 12px 0 46px;color:#6e7681;">
-       X axis: time · ${pts.length} points over ~${spanTxt} · ~1 point / 5-min decision cycle (last 300 snapshots) ·
+       X axis: time · ${pts.length} points over ~${spanTxt}${meta&&meta.bucketTxt?` · ~1 point / ${meta.bucketTxt}`:''} ·
        Y axis: running total P&amp;L = realized + unrealized
      </div>`);
+}
+
+// P&L interval selector. 1d is served inline by /trades/data (pnl_series); wider ranges fetch the
+// downsampled /trades/pnl endpoint. Selection is remembered and re-applied on each 15s poll.
+const PNL_RANGES = [["1d","1D","5-min cycle"],["1w","1W","30-min bucket"],["1m","1M","2-hour bucket"],["1y","1Y","1-day bucket"],["all","ALL","1-day bucket"]];
+let pnlRange = "1d";
+function renderPnlRangeButtons(){
+  const host = document.getElementById("pnl-ranges");
+  if (!host || host.childElementCount) return;
+  host.innerHTML = PNL_RANGES.map(([r,label])=>
+    `<button data-r="${r}" onclick="setPnlRange('${r}')" style="cursor:pointer;border:1px solid #30363d;background:#161b22;color:#8b949e;border-radius:6px;padding:2px 9px;">${label}</button>`
+  ).join("");
+  updatePnlRangeStyles();
+}
+function updatePnlRangeStyles(){
+  document.querySelectorAll("#pnl-ranges button").forEach(b=>{
+    const on = b.dataset.r===pnlRange;
+    b.style.background = on ? "#1f6feb22" : "#161b22";
+    b.style.color = on ? "#58a6ff" : "#8b949e";
+    b.style.borderColor = on ? "#1f6feb55" : "#30363d";
+  });
+}
+function bucketTxtFor(r){ const m=PNL_RANGES.find(x=>x[0]===r); return m?m[2]:""; }
+async function loadPnl(){
+  try {
+    const r = await (await fetch(PREFIX + "/trades/pnl?range=" + encodeURIComponent(pnlRange), {cache:"no-store"})).json();
+    renderPnlChart(r.points, {bucketTxt: bucketTxtFor(pnlRange)});
+  } catch(e){ /* keep last chart */ }
+}
+function setPnlRange(r){
+  pnlRange = r; updatePnlRangeStyles();
+  if (r === "1d" && window.__lastTrades) renderPnlChart(window.__lastTrades.pnl_series, {bucketTxt: bucketTxtFor("1d")});
+  else loadPnl();
 }
 
 // Dual-gate (A/B) simulation: live gate (lenient, all fills) vs the stricter shadow subset.
@@ -2057,7 +2151,11 @@ async function load() {
     .map(([l,v]) => `<div class="card"><div class="label">${l}</div><div class="val">${v}</div></div>`).join("");
   document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
 
-  renderPnlChart(d.pnl_series);
+  window.__lastTrades = d;
+  renderPnlRangeButtons();
+  // 1d range is already in the polled payload (no extra fetch); wider ranges hit /trades/pnl.
+  if (pnlRange === "1d") renderPnlChart(d.pnl_series, {bucketTxt: bucketTxtFor("1d")});
+  else loadPnl();
   renderSignals(d.signals);
   renderGateSim(d.gate_simulation);
   renderParams(d.config);
