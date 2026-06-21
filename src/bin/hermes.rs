@@ -1407,7 +1407,9 @@ fn compute_weight_adjustments(
 }
 
 /// Pure: attribute each settled position's realized P&L to the signals that drove its market, using
-/// the decision-report attribution as influence weights (|score × effective_weight| per signal).
+/// the decision-report attribution as influence weights (|score × confidence| per signal — the
+/// signal's intrinsic strength, deliberately NOT the learned weight; see the inline note on the
+/// feedback loop this avoids).
 /// `settled`: (market_id, realized_pnl). `dr_attr_by_market`: market_id → that market's
 /// `report.attribution` objects. Returns (per-signal realized P&L, unattributed P&L).
 fn attribute_pnl_to_signals(
@@ -1429,8 +1431,17 @@ fn attribute_pnl_to_signals(
             for attr in attrs {
                 for name in PROCESSORS {
                     if let Some(sig) = attr.get(name) {
+                        // Influence = the signal's INTRINSIC strength (|score| × |confidence|), NOT
+                        // |score| × |effective_weight|. effective_weight = confidence × learned_weight,
+                        // and learned_weight is exactly what Hermes is tuning — using it here creates a
+                        // positive-feedback loop (a signal's own boosted weight inflates its future P&L
+                        // attribution, which boosts it further). Using intrinsic confidence breaks the
+                        // loop, so credit reflects the signal's actual output, not Hermes's current
+                        // trust in it. (This also stops a weak-but-ubiquitous signal — e.g. momentum,
+                        // which fires ~89% of the time with tiny ~0.06 scores — from harvesting credit
+                        // purely via an inflated learned_weight.)
                         let inf = dec_from_json(&sig["score"]).abs()
-                            * dec_from_json(&sig["effective_weight"]).abs();
+                            * dec_from_json(&sig["confidence"]).abs();
                         if inf > Decimal::ZERO {
                             *influence.entry(name.to_string()).or_insert(Decimal::ZERO) += inf;
                         }
@@ -1920,14 +1931,14 @@ mod tests {
     #[test]
     fn realized_pnl_boosts_winners_and_trims_losers() {
         use super::attribute_pnl_to_signals;
-        // overreaction_fade fired strongly (score 0.4, effective_weight 0.5) on a market that
-        // settled at −$20 → it should get attributed the loss and be trimmed below 1.0.
+        // overreaction_fade fired strongly (score 0.4, confidence 0.5) on a market that settled at
+        // −$20 → it should get attributed the loss and be trimmed below 1.0.
         let mut dr_by_market = BTreeMap::new();
         dr_by_market.insert(
             "M1".to_string(),
             vec![json!({
-                "overreaction_fade": {"score": "0.4", "effective_weight": "0.5"},
-                "news_sentiment": {"score": "0", "effective_weight": "0.1"},
+                "overreaction_fade": {"score": "0.4", "confidence": "0.5"},
+                "news_sentiment": {"score": "0", "confidence": "0.1"},
             })],
         );
         let (per_signal, unattributed) =
@@ -1973,6 +1984,33 @@ mod tests {
             damped.get("news_sentiment").copied().unwrap()
                 < next.get("news_sentiment").copied().unwrap()
         );
+    }
+
+    #[test]
+    fn attribution_ignores_learned_weight_no_feedback_loop() {
+        use super::attribute_pnl_to_signals;
+        // Two signals fire with EQUAL intrinsic strength (score×confidence) but very different
+        // effective_weights (one has been boosted by Hermes, the other trimmed). Attribution must
+        // split the P&L EQUALLY — it keys on intrinsic confidence, not the learned/effective weight —
+        // so a signal's own prior boost can't inflate its future credit (the feedback loop we removed).
+        let mut dr_by_market = BTreeMap::new();
+        dr_by_market.insert(
+            "M1".to_string(),
+            vec![json!({
+                // same score (0.2) and same confidence (0.3) → equal intrinsic influence...
+                "orderbook_momentum": {"score": "0.2", "confidence": "0.3", "effective_weight": "9.0"},
+                "news_sentiment":     {"score": "0.2", "confidence": "0.3", "effective_weight": "0.1"},
+            })],
+        );
+        let (per_signal, unattributed) =
+            attribute_pnl_to_signals(&[("M1".to_string(), dec!(10))], &dr_by_market);
+        // ...so each gets exactly half of the +$10 despite the 90x effective_weight gap.
+        assert_eq!(
+            per_signal.get("orderbook_momentum").copied().unwrap(),
+            dec!(5)
+        );
+        assert_eq!(per_signal.get("news_sentiment").copied().unwrap(), dec!(5));
+        assert_eq!(unattributed, dec!(0));
     }
 
     #[test]
