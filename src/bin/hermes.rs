@@ -1368,7 +1368,11 @@ fn compute_weight_adjustments(
     settled_count: usize,
 ) -> BTreeMap<String, Decimal> {
     const STEP: Decimal = dec!(0.34);
-    const PNL_SCALE: Decimal = dec!(40); // $40 cumulative realized → full boost (2.0) / trim (0.25)
+    // realized_pnl is now the AVERAGE attributed P&L per market the signal drove (not a cumulative
+    // sum), so the scale is per-market: ±$20 avg (≈ one full max position) → full boost (2.0) / trim
+    // (0.25). This makes the boost reflect per-market quality and is immune to how many markets a
+    // signal merely participated in.
+    const PNL_SCALE: Decimal = dec!(20);
     const FULL_CONFIDENCE_SETTLED: usize = 40; // settled markets at which the full step is trusted
                                                // Sample-size confidence in [0,1]: linearly ramps the learning rate from ~0 to STEP as settled
                                                // outcomes accumulate. At the current ~12 settled this is ~0.3 → step ~0.10 (was 0.34), so the
@@ -1411,11 +1415,14 @@ fn compute_weight_adjustments(
 /// signal's intrinsic strength, deliberately NOT the learned weight; see the inline note on the
 /// feedback loop this avoids).
 /// `settled`: (market_id, realized_pnl). `dr_attr_by_market`: market_id → that market's
-/// `report.attribution` objects. Returns (per-signal realized P&L, unattributed P&L).
+/// `report.attribution` objects. Returns (per-signal CUMULATIVE realized P&L, per-signal
+/// participation = #settled markets it drove, unattributed P&L). The participation counts let the
+/// caller normalize cumulative P&L into an AVERAGE per market (so a ubiquitous signal isn't credited
+/// more just by being present everywhere).
 fn attribute_pnl_to_signals(
     settled: &[(String, Decimal)],
     dr_attr_by_market: &BTreeMap<String, Vec<serde_json::Value>>,
-) -> (BTreeMap<String, Decimal>, Decimal) {
+) -> (BTreeMap<String, Decimal>, BTreeMap<String, u32>, Decimal) {
     const PROCESSORS: [&str; 5] = [
         "orderbook_momentum",
         "spike_divergence",
@@ -1424,6 +1431,8 @@ fn attribute_pnl_to_signals(
         "news_sentiment",
     ];
     let mut per_signal: BTreeMap<String, Decimal> = BTreeMap::new();
+    // #settled markets each signal participated in (fired with >0 influence) — for averaging.
+    let mut participation: BTreeMap<String, u32> = BTreeMap::new();
     let mut unattributed = Decimal::ZERO;
     for (market, pnl) in settled {
         let mut influence: BTreeMap<String, Decimal> = BTreeMap::new();
@@ -1455,12 +1464,32 @@ fn attribute_pnl_to_signals(
                 let share = inf / total;
                 *per_signal.entry(name.clone()).or_insert(Decimal::ZERO) +=
                     (share * pnl).round_dp(4);
+                *participation.entry(name.clone()).or_insert(0) += 1;
             }
         } else {
             unattributed += *pnl;
         }
     }
-    (per_signal, unattributed)
+    (per_signal, participation, unattributed)
+}
+
+/// Convert cumulative per-signal P&L + participation counts into AVERAGE realized P&L per market the
+/// signal drove. This is what feeds weight tuning: judging a signal on its per-market quality (not its
+/// raw accumulated total) stops a signal that merely fires on every market from out-accumulating a
+/// selective one. Signals with zero participation are omitted (no evidence to tune on).
+fn average_pnl_per_market(
+    cumulative: &BTreeMap<String, Decimal>,
+    participation: &BTreeMap<String, u32>,
+) -> BTreeMap<String, Decimal> {
+    let mut avg = BTreeMap::new();
+    for (name, total) in cumulative {
+        if let Some(&n) = participation.get(name) {
+            if n > 0 {
+                avg.insert(name.clone(), (*total / Decimal::from(n)).round_dp(4));
+            }
+        }
+    }
+    avg
 }
 
 /// Load settled positions + their markets' decision-report attribution and compute per-signal
@@ -1497,20 +1526,34 @@ async fn load_per_signal_realized_pnl(
         dr_by_market.insert(m.clone(), attrs);
     }
 
-    let (per_signal, unattributed) = attribute_pnl_to_signals(&settled, &dr_by_market);
+    let (per_signal, participation, unattributed) =
+        attribute_pnl_to_signals(&settled, &dr_by_market);
+    // Average per market the signal drove — this (not the cumulative sum) is what tunes weights, so a
+    // ubiquitous signal isn't credited more just for being present on every market.
+    let avg_per_signal = average_pnl_per_market(&per_signal, &participation);
     let total_realized: Decimal = settled.iter().map(|(_, p)| *p).sum();
     let per_signal_json: serde_json::Map<String, serde_json::Value> = per_signal
         .iter()
         .map(|(k, v)| (k.clone(), json!(v.to_string())))
         .collect();
+    let avg_json: serde_json::Map<String, serde_json::Value> = avg_per_signal
+        .iter()
+        .map(|(k, v)| (k.clone(), json!(v.to_string())))
+        .collect();
+    let participation_json: serde_json::Map<String, serde_json::Value> = participation
+        .iter()
+        .map(|(k, v)| (k.clone(), json!(v)))
+        .collect();
     let summary = json!({
         "settled_positions": settled.len(),
         "total_realized_pnl": total_realized.to_string(),
         "per_signal": per_signal_json,
+        "per_signal_avg_per_market": avg_json,
+        "per_signal_participation": participation_json,
         "unattributed_pnl": unattributed.to_string(),
-        "note": "Realized P&L attributed to signals by decision-report influence (|score×effective_weight|). When present, drives P&L-based weight BOOSTING (net-winners >1.0); else weights fall back to the fire-rate heuristic. Empty until positions resolve.",
+        "note": "Realized P&L attributed to signals by decision-report influence (|score×confidence| — intrinsic, no learned-weight feedback). Weight tuning uses the AVERAGE per market driven (per_signal_avg_per_market), not the cumulative sum, so ubiquitous signals aren't over-credited. Empty until positions resolve.",
     });
-    (summary, per_signal)
+    (summary, avg_per_signal)
 }
 
 /// Load the most recent Hermes-written processor weights (for incremental adjustment).
@@ -1941,28 +1984,30 @@ mod tests {
                 "news_sentiment": {"score": "0", "confidence": "0.1"},
             })],
         );
-        let (per_signal, unattributed) =
+        let (per_signal, participation, unattributed) =
             attribute_pnl_to_signals(&[("M1".to_string(), dec!(-20))], &dr_by_market);
         assert_eq!(
             per_signal.get("overreaction_fade").copied().unwrap(),
             dec!(-20)
         );
+        assert_eq!(participation.get("overreaction_fade").copied().unwrap(), 1);
         assert_eq!(unattributed, dec!(0));
 
-        // Now feed that realized loss into weight tuning → overreaction trimmed; a +$40 winner → boosted.
+        // Weight tuning now consumes the AVERAGE per market (scale $20): a −$10 avg → trimmed, a +$20
+        // avg → boosted to the cap.
         let attribution = json!({"per_processor": {
             "overreaction_fade": {"present_in_reports": 3, "fired_nonzero_score": 3},
             "news_sentiment": {"present_in_reports": 3, "fired_nonzero_score": 3},
         }});
         let prev: BTreeMap<String, Decimal> = BTreeMap::new();
         let mut realized = BTreeMap::new();
-        realized.insert("overreaction_fade".to_string(), dec!(-20)); // loser
-        realized.insert("news_sentiment".to_string(), dec!(40)); // winner
+        realized.insert("overreaction_fade".to_string(), dec!(-10)); // loser, −$10 avg/market
+        realized.insert("news_sentiment".to_string(), dec!(20)); // winner, +$20 avg/market
                                                                  // settled_count = 40 (full confidence) so the step is the full 0.34 used in these assertions.
         let next = compute_weight_adjustments(&prev, &attribution, &realized, 40);
-        // loser target = 1 + (-20/40) = 0.5 → 1.0 + 0.34*(0.5-1.0) = 0.83
+        // loser target = 1 + (-10/20) = 0.5 → 1.0 + 0.34*(0.5-1.0) = 0.83
         assert_eq!(next.get("overreaction_fade").copied().unwrap(), dec!(0.83));
-        // winner target = 1 + (40/40) = 2.0 → 1.0 + 0.34*(2.0-1.0) = 1.34 (boosted ABOVE 1.0)
+        // winner target = 1 + (20/20) = 2.0 → 1.0 + 0.34*(2.0-1.0) = 1.34 (boosted ABOVE 1.0)
         assert_eq!(next.get("news_sentiment").copied().unwrap(), dec!(1.34));
 
         // SAME inputs but a THIN settled sample (10) → the step is damped (10/40 * 0.34 = 0.085), so
@@ -2002,7 +2047,7 @@ mod tests {
                 "news_sentiment":     {"score": "0.2", "confidence": "0.3", "effective_weight": "0.1"},
             })],
         );
-        let (per_signal, unattributed) =
+        let (per_signal, _participation, unattributed) =
             attribute_pnl_to_signals(&[("M1".to_string(), dec!(10))], &dr_by_market);
         // ...so each gets exactly half of the +$10 despite the 90x effective_weight gap.
         assert_eq!(
@@ -2011,6 +2056,47 @@ mod tests {
         );
         assert_eq!(per_signal.get("news_sentiment").copied().unwrap(), dec!(5));
         assert_eq!(unattributed, dec!(0));
+    }
+
+    #[test]
+    fn participation_normalization_levels_ubiquitous_vs_selective() {
+        use super::{attribute_pnl_to_signals, average_pnl_per_market};
+        // A ubiquitous signal that drove 4 markets at +$10 each (cumulative +$40) and a selective one
+        // that drove 1 market at +$40 (cumulative +$40) have the SAME cumulative credit — but very
+        // different per-market quality. Averaging by participation surfaces that: the selective signal
+        // averages +$40/market, the ubiquitous one +$10/market, so the ubiquitous one is no longer
+        // over-credited just for being present on more markets.
+        let mut dr = BTreeMap::new();
+        for m in ["A", "B", "C", "D"] {
+            dr.insert(
+                m.to_string(),
+                vec![json!({"orderbook_momentum": {"score": "0.2", "confidence": "0.5"}})],
+            );
+        }
+        dr.insert(
+            "E".to_string(),
+            vec![json!({"news_sentiment": {"score": "0.2", "confidence": "0.5"}})],
+        );
+        let settled = vec![
+            ("A".to_string(), dec!(10)),
+            ("B".to_string(), dec!(10)),
+            ("C".to_string(), dec!(10)),
+            ("D".to_string(), dec!(10)),
+            ("E".to_string(), dec!(40)),
+        ];
+        let (cumulative, participation, _) = attribute_pnl_to_signals(&settled, &dr);
+        // identical cumulative...
+        assert_eq!(
+            cumulative.get("orderbook_momentum").copied().unwrap(),
+            dec!(40)
+        );
+        assert_eq!(cumulative.get("news_sentiment").copied().unwrap(), dec!(40));
+        assert_eq!(participation.get("orderbook_momentum").copied().unwrap(), 4);
+        assert_eq!(participation.get("news_sentiment").copied().unwrap(), 1);
+        // ...but the average per market (what tunes weights) separates them.
+        let avg = average_pnl_per_market(&cumulative, &participation);
+        assert_eq!(avg.get("orderbook_momentum").copied().unwrap(), dec!(10));
+        assert_eq!(avg.get("news_sentiment").copied().unwrap(), dec!(40));
     }
 
     #[test]
