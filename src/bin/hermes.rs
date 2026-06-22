@@ -1352,8 +1352,12 @@ fn clamp_weight(w: Decimal) -> Decimal {
 ///   1. REALIZED-P&L-BASED (when the signal has attributed realized P&L from settled positions):
 ///      target = 1.0 + realized_pnl / PNL_SCALE, clamped [MIN, MAX]. Net-winners get BOOSTED above
 ///      1.0; net-losers get trimmed below. This is real outcome-driven learning.
-///   2. Fire-rate heuristic fallback (no realized P&L yet — markets unresolved):
-///      present-but-never-fired → 0.5 (trim dilution); fired → 1.0 (neutral); absent → hold.
+///   2. Neutral fallback (no realized P&L yet — markets unresolved): every present signal targets 1.0,
+///      absent → hold. A present-but-never-fired signal returns only score-0 entries, which can't
+///      dilute the weighted-average fusion, so it is NOT trimmed for staying silent (that would bench a
+///      volatility-gated signal at the floor and then apply it at half-trust the moment a real spike
+///      fires it). Trimming is left entirely to the realized-P&L branch, once a signal actually
+///      contributes to a settled market.
 ///
 /// New weight moves toward target by an EFFECTIVE step (gradual; avoids oscillation), clamped to
 /// [MIN, MAX]. The effective step is damped by sample size: with few settled outcomes the per-signal
@@ -1388,19 +1392,22 @@ fn compute_weight_adjustments(
                 .get("present_in_reports")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            let fired = stats
-                .get("fired_nonzero_score")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
             let current = prev.get(name).copied().unwrap_or(dec!(1.0));
             let target = if let Some(pnl) = realized_pnl.get(name) {
                 // Realized-P&L-based (the real learning signal).
                 clamp_weight(dec!(1.0) + (*pnl / PNL_SCALE))
             } else if present == 0 {
+                // Entirely absent from reports this window (e.g. not wired) → leave its weight alone.
                 current
-            } else if fired == 0 {
-                dec!(0.5)
             } else {
+                // Present but no realized P&L yet. A signal that only ever returned a neutral (score-0)
+                // entry — `fired_nonzero_score == 0` — does NOT dilute the weighted-average fusion, so it
+                // must NOT be trimmed for staying correctly silent. A volatility-gated signal
+                // (spike_divergence / overreaction_fade) is dormant by design in a calm regime; trimming
+                // it to the floor is a no-op while silent but then applies it at half-trust the moment a
+                // real spike finally fires it. Hold every present signal at neutral 1.0 (this also
+                // recovers any previously-floored weight), and let the realized-P&L branch above do the
+                // only legitimate trimming, once the signal actually contributes to a settled market.
                 dec!(1.0)
             };
             let next = clamp_weight(current + eff_step * (target - current)).round_dp(3);
@@ -1932,42 +1939,50 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn weight_tuning_trims_dead_processor_holds_active() {
-        // overreaction_fade fired (active) → stays ~1.0; orderbook_momentum present but never
-        // fired (dead stub) → trimmed toward 0.5; absent processor → untouched.
+    fn weight_tuning_holds_silent_signal_and_recovers_floored_one() {
+        // A volatility-gated signal that's present every report but only ever returns a neutral
+        // (score-0) entry must NOT be trimmed for staying silent — a score-0 signal doesn't dilute the
+        // weighted-average fusion. It's held at neutral, and a previously-floored weight RECOVERS toward
+        // 1.0 so it's at full trust the moment a real spike finally fires it.
         let attribution = json!({
             "per_processor": {
                 "overreaction_fade": {"present_in_reports": 3, "fired_nonzero_score": 3},
-                "orderbook_momentum": {"present_in_reports": 3, "fired_nonzero_score": 0},
+                "spike_divergence": {"present_in_reports": 3, "fired_nonzero_score": 0},
             }
         });
-        let prev: BTreeMap<String, Decimal> = BTreeMap::new(); // all default 1.0
+        let mut prev: BTreeMap<String, Decimal> = BTreeMap::new();
+        prev.insert("spike_divergence".to_string(), dec!(0.501)); // benched at the floor by the old bug
         let no_pnl: BTreeMap<String, Decimal> = BTreeMap::new();
         let next = compute_weight_adjustments(&prev, &attribution, &no_pnl, 40);
 
-        // active processor held at 1.0 (target 1.0, already there)
+        // active processor held at neutral (target 1.0, already there)
         assert_eq!(next.get("overreaction_fade").copied().unwrap(), dec!(1.0));
-        // dead stub trimmed: 1.0 + 0.34*(0.5-1.0) = 0.83
-        assert_eq!(next.get("orderbook_momentum").copied().unwrap(), dec!(0.83));
-        // a second cycle keeps trimming toward 0.5 (gradual)
+        // silent-but-present signal is NOT trimmed; it climbs back toward 1.0: 0.501 + 0.34*(1-0.501)
+        let sd = next.get("spike_divergence").copied().unwrap();
+        assert!(
+            sd > dec!(0.501),
+            "floored silent signal must recover, got {sd}"
+        );
+        assert!(sd <= dec!(1.0));
+        // a second cycle keeps recovering toward neutral (gradual)
         let next2 = compute_weight_adjustments(&next, &attribution, &no_pnl, 40);
-        assert!(next2.get("orderbook_momentum").copied().unwrap() < dec!(0.83));
-        assert!(next2.get("orderbook_momentum").copied().unwrap() >= dec!(0.25));
-        // never below floor
+        assert!(next2.get("spike_divergence").copied().unwrap() > sd);
     }
 
     #[test]
-    fn weight_tuning_respects_floor_and_holds_absent_processors() {
+    fn weight_tuning_holds_absent_processor_and_respects_clamp() {
+        // An ABSENT processor (not present in any report) is left exactly where it is — no drift.
         let attribution = json!({
             "per_processor": {
-                "spike_divergence": {"present_in_reports": 5, "fired_nonzero_score": 0},
+                "spike_divergence": {"present_in_reports": 0, "fired_nonzero_score": 0},
             }
         });
-        // Start already near the floor; must not go below MIN_WEIGHT (0.25)
         let mut prev = BTreeMap::new();
         prev.insert("spike_divergence".to_string(), dec!(0.26));
         let no_pnl: BTreeMap<String, Decimal> = BTreeMap::new();
         let next = compute_weight_adjustments(&prev, &attribution, &no_pnl, 40);
+        // absent → hold at the prior weight, and never below the floor
+        assert_eq!(next.get("spike_divergence").copied().unwrap(), dec!(0.26));
         assert!(next.get("spike_divergence").copied().unwrap() >= dec!(0.25));
     }
 
