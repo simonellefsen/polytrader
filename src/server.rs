@@ -1610,20 +1610,27 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
         }
     }
     let settled_market_ids: Vec<String> = net_by_market.keys().cloned().collect();
-    // ALL recent decision-report attributions for the settled markets (not just the final one): a
-    // signal is credited a market if it fired at ANY point during the holding period. Using only the
-    // final DR would under-credit signals whose inputs vanish at resolution (e.g. orderbook_momentum:
-    // the book empties when a market closes, so it never fires in the post-resolution DR).
+    // Decision-report attributions for the settled markets — the 20 MOST RECENT per market (mirrors
+    // Hermes's own attribution lookup), NOT a time window. A signal is credited a market if it fired
+    // at any point in that window. (A fixed time window like "last 7 days" wrongly shrinks the record
+    // as settled markets age past it — their decision history is mostly older than a few days.) Using
+    // the most-recent reports per market also avoids under-crediting signals whose inputs vanish at
+    // resolution (e.g. orderbook_momentum: the book empties when a market closes).
     let market_attrs: Vec<(Option<String>, Option<serde_json::Value>)> =
         if settled_market_ids.is_empty() {
             Vec::new()
         } else {
             sqlx::query_as(
-                "SELECT payload->>'market_id', payload->'report'->'attribution'
-                 FROM journal.events
-                 WHERE event_type = 'decision_report'
-                   AND payload->>'market_id' = ANY($1)
-                   AND created_at > now() - interval '7 days'",
+                "SELECT market_id, attribution FROM (
+                     SELECT payload->>'market_id' AS market_id,
+                            payload->'report'->'attribution' AS attribution,
+                            row_number() OVER (
+                                PARTITION BY payload->>'market_id' ORDER BY created_at DESC
+                            ) AS rn
+                     FROM journal.events
+                     WHERE event_type = 'decision_report'
+                       AND payload->>'market_id' = ANY($1)
+                 ) s WHERE rn <= 20",
             )
             .bind(&settled_market_ids)
             .fetch_all(pool)
