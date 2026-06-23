@@ -91,6 +91,14 @@ rate-limited.** That framing drives the tier ordering below.
 Drawdown circuit-breaker (auto-pause execution on equity drop), push-alerts for anomalies currently
 caught by hand (WAL archiving flip, LLM health, signal drift), calibration dashboard.
 
+- **Signal-health monitor — longer baseline window** (follow-up to commit 34b0a47). The current
+  3h-vs-24h comparison catches *sudden* fire-rate shifts but is blind to *multi-day gradual decay* (the
+  24h baseline erodes along with the signal — exactly what masked `news_sentiment`'s slow slide from
+  ~20% to ~1.8% over 2026-06-23, which reads `ok`). Add a long baseline (e.g. recent-24h vs a 7-day
+  baseline) so slow erosion is flagged too. Watch the row-count/memory (use a slim projection like the
+  scorecard already does). Optionally push the alert (journal a `signal_health_alert` event) rather than
+  only surfacing it in the pull-based scorecard.
+
 ---
 
 ## First thread: Backtest / Replay Harness — plan
