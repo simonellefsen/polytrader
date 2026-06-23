@@ -110,7 +110,15 @@ impl Config {
     pub fn load() -> Self {
         dotenvy::from_filename(".env.local").ok();
         dotenvy::dotenv().ok();
-        let mut cfg = Self::parse();
+        // The `backtest` subcommand carries its own flags (--min-net-edge, --weights, --since) that the
+        // main clap parser doesn't know about. Strip everything from `backtest` onward before parsing so
+        // `polytrader backtest ...` doesn't error here; main() reads the subcommand from the raw args.
+        let raw: Vec<String> = std::env::args().collect();
+        let argv: Vec<String> = match raw.iter().position(|a| a == "backtest") {
+            Some(pos) => raw[..pos].to_vec(),
+            None => raw,
+        };
+        let mut cfg = Self::parse_from(argv);
 
         // Robust credential loading (best practice for Kubernetes + CNPG)
         if cfg.database_url.is_empty() {
