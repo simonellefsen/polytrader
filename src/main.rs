@@ -42,10 +42,17 @@ async fn main() -> Result<()> {
     // Very early fallback logging (in case tracing doesn't flush before fast exit)
     eprintln!("=== POLYTRADER MAIN ENTERED (pre-tracing) ===");
 
-    // Structured logging (json for easy parsing by Hermes later)
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info,polytrader=debug,sqlx=warn,axum=info,tower_http=debug")
-    });
+    // Structured logging (json for easy parsing by Hermes later). The `backtest` subcommand prints its
+    // own plain report to stdout and replays tens of thousands of decisions, so run it quiet (errors
+    // only) — otherwise the per-trade gate logs + the bootstrap dump bury the report.
+    let is_backtest = std::env::args().any(|a| a == "backtest");
+    let env_filter = if is_backtest {
+        EnvFilter::new("error,polytrader=error,sqlx=error")
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("info,polytrader=debug,sqlx=warn,axum=info,tower_http=debug")
+        })
+    };
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().json())
