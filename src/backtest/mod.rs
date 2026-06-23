@@ -447,7 +447,9 @@ pub async fn run(pool: &sqlx::PgPool, args: &[String]) -> anyhow::Result<()> {
     let min_net_edge = flag_value(args, "--min-net-edge").and_then(|s| s.parse::<Decimal>().ok());
     let weights_override = flag_value(args, "--weights").map(parse_weights);
 
-    let settlements = load_settlements(pool, since.as_deref()).await?;
+    // The anchor validates accounting against the live CUMULATIVE realized, so it always loads the full
+    // settlement history — `--since` only bounds the counterfactual's report replay, never the anchor.
+    let settlements = load_settlements(pool).await?;
     let reports = load_reports(pool, since.as_deref()).await?;
     let resolutions = load_resolutions(pool).await?;
     let slug_of = load_slug_map(pool).await?;
@@ -524,18 +526,13 @@ type ReportQueryRow = (
     Option<serde_json::Value>,
 );
 
-async fn load_settlements(
-    pool: &sqlx::PgPool,
-    since: Option<&str>,
-) -> anyhow::Result<Vec<SettlementRow>> {
+async fn load_settlements(pool: &sqlx::PgPool) -> anyhow::Result<Vec<SettlementRow>> {
     let rows: Vec<SettlementQueryRow> = sqlx::query_as(
         "SELECT payload->>'won', payload->>'shares', payload->>'cost_basis', payload->>'realized_pnl'
          FROM journal.events
          WHERE event_type = 'paper_position_settled'
-           AND ($1::timestamptz IS NULL OR created_at >= $1::timestamptz)
          ORDER BY created_at ASC",
     )
-    .bind(since)
     .fetch_all(pool)
     .await?;
     Ok(rows
