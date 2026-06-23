@@ -21,6 +21,7 @@ mod ui; // Dioxus UI (Phase 2: rsx App now SSR-rendered source + client fetch re
 // Phase 3.2 smallest skeleton (wiki-first per plan/AGENTS; after all docs/decisions/log prepend).
 // mod strategy declares the new artifact (FusionEngine + processors using exact existing patterns: rust_decimal, anyhow, tracing, journal attribution hooks, heavy risk comments, paper-only).
 // No behavior change to any existing path; unused in this increment (full wiring in follow-ups). #[allow] inside strategy/mod.rs for clean clippy.
+mod backtest; // offline replay harness (read-only; `polytrader backtest` subcommand) — reuses risk+strategy pure cores
 mod clob; // gated real/authenticated CLOB client (foundation for future order placement using derived L2 creds)
 mod risk;
 mod strategy;
@@ -110,6 +111,16 @@ async fn main() -> Result<()> {
     // === DB + MIGRATIONS (embedded sqlx) ===
     let pool = create_pool(&cfg.database_url).await?;
     info!("Postgres pool ready (migrations applied, paper_trading + journal schemas present)");
+
+    // Backtest subcommand: `polytrader backtest [--min-net-edge X] [--weights n=v,..] [--since RFC3339]`.
+    // One-shot, READ-ONLY — runs the offline replay harness against the live journal and exits before
+    // any server, ingester, or executor loop starts. Reuses the pure Phase-0 cores (no duplicated
+    // decision logic). Safe to run against the live DB (it only reads).
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "backtest") {
+        backtest::run(&pool, &args).await?;
+        return Ok(());
+    }
 
     // Seed initial paper portfolio snapshot if none exists (uses config initial)
     seed_initial_portfolio_if_needed(&pool, cfg.initial_paper_usdc).await?;

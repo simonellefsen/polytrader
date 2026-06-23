@@ -28,7 +28,7 @@ K8S_BASE  := deploy/k8s/base
 # Strict namespace guard for polytrader project.
 # We ONLY ever touch the $(NAMESPACE) namespace, except for the explicit
 # one-time ngrok policy update in the shared tunnel (saxo-rust ns).
-.PHONY: help build check test run dev docker-build \
+.PHONY: help build check test run dev docker-build backtest \
         k8s-check-namespace k8s-apply k8s-deploy k8s-status \
         k8s-logs k8s-port-forward k8s-verify k8s-ngrok-reminder k8s-ngrok-update-policy \
         k8s-delete clean wasm-prep
@@ -122,6 +122,13 @@ test:
 
 run:
 	POLYTRADER_MODE=paper cargo run
+
+# Offline backtest / replay harness. Runs READ-ONLY inside the live pod (reuses its DATABASE_URL +
+# the already-deployed binary), prints the fidelity anchor + a counterfactual. Pass flags via ARGS,
+# e.g.  make backtest ARGS="--min-net-edge 0.04"  or  ARGS="--weights news_sentiment=1.2,orderbook_momentum=0.9".
+# Deploy first (make k8s-deploy) so the pod runs a binary that has the subcommand.
+backtest: k8s-check-namespace
+	kubectl exec -n $(NAMESPACE) deploy/polytrader -c polytrader -- polytrader backtest $(ARGS)
 
 dev: run
 
