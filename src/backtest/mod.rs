@@ -78,6 +78,18 @@ pub struct SettlementRow {
     pub recorded_pnl: Decimal,
 }
 
+/// A fill the counterfactual decided to make, captured so a Phase-3 pass can re-price it against the
+/// real order book. `approved_usdc` and `target_mid` are the inputs the live executor used to size and
+/// limit the order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FillDecision {
+    pub at: DateTime<Utc>,
+    pub market_id: String,
+    pub outcome: String,
+    pub approved_usdc: Decimal,
+    pub target_mid: Decimal,
+}
+
 /// Outcome of a simulation run.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SimResult {
@@ -87,6 +99,8 @@ pub struct SimResult {
     /// differences on UNRESOLVED markets show up — realized alone can't rank configs because the
     /// resolved markets are entered under every config.
     pub unrealized: Decimal,
+    /// Total taker fees paid on entries (Phase-3 realistic fills only; 0 for fill-at-mid).
+    pub fees: Decimal,
     /// Positions that actually settled (we held them at resolution).
     pub settled_positions: usize,
     pub wins: usize,
@@ -97,17 +111,19 @@ pub struct SimResult {
     pub open_at_end: usize,
     /// Running realized P&L after each settlement batch (a coarse equity path).
     pub realized_curve: Vec<Decimal>,
+    /// The fill decisions made (in order), for Phase-3 realistic re-pricing.
+    pub fill_log: Vec<FillDecision>,
 }
 
 impl SimResult {
-    /// Total P&L (realized + open marks).
+    /// Total P&L net of fees (realized + open marks − fees).
     pub fn total_pnl(&self) -> Decimal {
-        self.realized + self.unrealized
+        self.realized + self.unrealized - self.fees
     }
 
-    /// Final equity = base + realized + open marks.
+    /// Final equity = base + realized + open marks − fees.
     pub fn final_equity(&self) -> Decimal {
-        SIM_BASE_USDC + self.realized + self.unrealized
+        SIM_BASE_USDC + self.realized + self.unrealized - self.fees
     }
 }
 
@@ -380,6 +396,13 @@ pub fn simulate_counterfactual(
         }
         sim.fill(&rep.market_id, &rep.target_outcome, shares, approved_usdc);
         res.fills += 1;
+        res.fill_log.push(FillDecision {
+            at: rep.at,
+            market_id: rep.market_id.clone(),
+            outcome: rep.target_outcome.clone(),
+            approved_usdc,
+            target_mid: rep.target_mid,
+        });
     }
 
     // Settle the rest: remaining timed resolutions, then untimed ones.
@@ -416,6 +439,94 @@ pub fn build_marks(reports: &[ReportRow]) -> Marks {
         .into_iter()
         .map(|(k, (_, o, m))| (k, (o, m)))
         .collect()
+}
+
+/// A single order-book price level.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Level {
+    pub price: Decimal,
+    pub size: Decimal,
+}
+
+/// Limit-order slippage ceiling and max price, mirroring the live executor
+/// (`limit = min(mid × 1.20, 0.99)`, shares = approved_usdc / limit).
+const SLIPPAGE_CAP: Decimal = dec!(1.20);
+const MAX_LIMIT: Decimal = dec!(0.99);
+/// Taker fee rate for realistic fills — mirrors the deployed `paper_fee_bps = 50` (0.50%).
+const FEE_RATE: Decimal = dec!(0.005);
+
+/// Walk `asks` best-first (ascending) for a LIMIT buy: fill up to `target_shares`, only at prices
+/// ≤ `limit_price`. Mirrors the production `match_against_book` buy/limit path. Returns
+/// `(filled_shares, gross_cost, fee)` where `fee = round(gross_cost · fee_rate, 6)`. A thin/expensive
+/// book (best ask > limit) yields a zero fill — exactly the live "no_fill_at_limit" outcome.
+pub fn walk_asks_limit_buy(
+    asks: &[Level],
+    limit_price: Decimal,
+    target_shares: Decimal,
+    fee_rate: Decimal,
+) -> (Decimal, Decimal, Decimal) {
+    let mut sorted: Vec<&Level> = asks.iter().collect();
+    sorted.sort_by_key(|l| l.price); // best (cheapest) ask first
+    let mut remaining = target_shares;
+    let mut filled = dec!(0);
+    let mut cost = dec!(0);
+    for lvl in sorted {
+        if remaining <= dec!(0) {
+            break;
+        }
+        if lvl.price > limit_price {
+            break; // ask above the ceiling — stop (book sorted ascending)
+        }
+        let take = lvl.size.min(remaining);
+        if take <= dec!(0) {
+            continue;
+        }
+        filled += take;
+        cost += lvl.price * take;
+        remaining -= take;
+    }
+    let fee = (cost * fee_rate).round_dp(6);
+    (filled, cost, fee)
+}
+
+/// Phase-3 realistic re-pricing: take the fill DECISIONS from a counterfactual (which markets/outcomes
+/// were entered, with what approved size) and re-price each against the actual order book at the
+/// decision time, applying taker fees — then settle and mark exactly as the at-mid run does. This
+/// turns the counterfactual from an optimistic fill-at-mid estimate into a credible backtest with real
+/// entry costs. `books[i]` is the ask side for `fill_log[i]` (None ⇒ no snapshot ⇒ skip, like a live
+/// no-fill). NOTE: the fill DECISIONS are taken from the at-mid pass; the gate sequence is not re-run
+/// with realistic prices (a second-order effect), so this re-prices rather than re-decides.
+pub fn reprice_realistic(
+    fill_log: &[FillDecision],
+    books: &[Option<Vec<Level>>],
+    resolutions: &[Resolution],
+    marks: &Marks,
+    fee_rate: Decimal,
+) -> SimResult {
+    let mut sim = SimPortfolio::new();
+    let mut total_fees = dec!(0);
+    let mut fills = 0usize;
+    for (d, book) in fill_log.iter().zip(books.iter()) {
+        let Some(asks) = book else { continue };
+        let limit = (d.target_mid * SLIPPAGE_CAP).min(MAX_LIMIT);
+        if limit <= dec!(0) {
+            continue;
+        }
+        let target_shares = (d.approved_usdc / limit).round_dp(2);
+        let (filled, cost, fee) = walk_asks_limit_buy(asks, limit, target_shares, fee_rate);
+        if filled <= dec!(0) {
+            continue; // book too thin/expensive — no fill (matches live)
+        }
+        sim.fill(&d.market_id, &d.outcome, filled, cost);
+        total_fees += fee;
+        fills += 1;
+    }
+
+    // Settle resolved markets, then mark the rest — same accounting as the at-mid path.
+    let mut res = settle_in_time_order(&mut sim, resolutions, fills);
+    res.unrealized = sim.unrealized(marks);
+    res.fees = total_fees;
+    res
 }
 
 /// One row of a config sweep: a config's label, its simulation result, and the max drawdown of its
@@ -618,18 +729,37 @@ pub async fn run(pool: &sqlx::PgPool, args: &[String]) -> anyhow::Result<()> {
         res.fills, res.settled_positions, res.wins, res.losses, res.open_at_end
     );
     println!(
-        "  realized: {}   unrealized(marks): {}   total_pnl: {}   final_equity: {}",
+        "  [fill@mid]  realized: {}   unrealized: {}   total_pnl: {}",
         res.realized,
         res.unrealized.round_dp(2),
         res.total_pnl().round_dp(2),
-        res.final_equity().round_dp(2),
+    );
+
+    // --- Phase 3: re-price those same fills against the real book + taker fees ---
+    // Load the ask side nearest (≤) each fill's time, only for the markets actually entered (~50).
+    let mut books: Vec<Option<Vec<Level>>> = Vec::with_capacity(res.fill_log.len());
+    for d in &res.fill_log {
+        books.push(load_book_at(pool, &d.market_id, &d.outcome, d.at).await);
+    }
+    let with_book = books.iter().filter(|b| b.is_some()).count();
+    let real = reprice_realistic(&res.fill_log, &books, &resolutions, &marks, FEE_RATE);
+    println!(
+        "  [book-walk] realized: {}   unrealized: {}   fees: {}   total_pnl: {}   ({} of {} fills had a book snapshot)",
+        real.realized.round_dp(2),
+        real.unrealized.round_dp(2),
+        real.fees.round_dp(2),
+        real.total_pnl().round_dp(2),
+        with_book,
+        res.fill_log.len(),
     );
     println!(
-        "  NOTE: Phase-1 fills at target_mid (no book-walk) and excludes arb legs, so this will not"
+        "  NOTE: book-walk re-prices the at-mid fill DECISIONS at the real ask + {}bps taker fee",
+        FEE_RATE * dec!(10000)
     );
     println!(
-        "        match live fills exactly — that's Phase 3. The anchor above validates accounting."
+        "        (a credible backtest of THIS strategy). It is still a different strategy than the"
     );
+    println!("        live line ran (no arb/both-sides legs, fixed weights) — the anchor is the live check.");
     Ok(())
 }
 
@@ -853,6 +983,44 @@ async fn load_slug_map(pool: &sqlx::PgPool) -> anyhow::Result<BTreeMap<String, S
         .into_iter()
         .filter_map(|(g, s)| Some((g, s?)))
         .collect())
+}
+
+/// Parse a jsonb book side (`[{"price":"0.45","size":"123"}, ...]`) into levels.
+fn parse_levels(v: &serde_json::Value) -> Vec<Level> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| {
+                    let price = l.get("price")?.as_str()?.parse::<Decimal>().ok()?;
+                    let size = l.get("size")?.as_str()?.parse::<Decimal>().ok()?;
+                    Some(Level { price, size })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The ask side of the orderbook snapshot nearest (≤) `at` for a (market, outcome) — what a buy at that
+/// moment would have walked. Loaded lazily, only for the markets the counterfactual actually filled.
+async fn load_book_at(
+    pool: &sqlx::PgPool,
+    market_id: &str,
+    outcome: &str,
+    at: DateTime<Utc>,
+) -> Option<Vec<Level>> {
+    let asks: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT asks FROM market_data.orderbook_snapshots
+         WHERE market_id = $1 AND outcome = $2 AND fetched_at <= $3
+         ORDER BY fetched_at DESC LIMIT 1",
+    )
+    .bind(market_id)
+    .bind(outcome)
+    .bind(at)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    asks.map(|v| parse_levels(&v))
 }
 
 async fn load_live_realized(pool: &sqlx::PgPool) -> anyhow::Result<Decimal> {
@@ -1124,6 +1292,74 @@ mod tests {
         ];
         let marks = build_marks(&reports);
         assert_eq!(marks.get("m1"), Some(&("No".to_string(), dec!(0.60))));
+    }
+
+    fn lvl(price: &str, size: &str) -> Level {
+        Level {
+            price: price.parse().unwrap(),
+            size: size.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn walk_asks_fills_best_first_under_limit_with_fee() {
+        // Asks deliberately out of order; best (cheapest) must fill first, stop above the limit.
+        let asks = vec![lvl("0.52", "100"), lvl("0.50", "10"), lvl("0.51", "10")];
+        // limit 0.55, want 25 shares: take 10@0.50 + 10@0.51 + 5@0.52 = 25 shares.
+        let (filled, cost, fee) = walk_asks_limit_buy(&asks, dec!(0.55), dec!(25), dec!(0.005));
+        assert_eq!(filled, dec!(25));
+        // cost = 5.0 + 5.1 + 2.6 = 12.70 ; fee = 12.70 * 0.005 = 0.0635
+        assert_eq!(cost, dec!(12.70));
+        assert_eq!(fee, dec!(0.0635));
+    }
+
+    #[test]
+    fn walk_asks_no_fill_when_book_above_limit() {
+        let asks = vec![lvl("0.80", "100")];
+        let (filled, cost, fee) = walk_asks_limit_buy(&asks, dec!(0.60), dec!(10), dec!(0.005));
+        assert_eq!((filled, cost, fee), (dec!(0), dec!(0), dec!(0)));
+    }
+
+    #[test]
+    fn reprice_realistic_uses_book_price_not_mid() {
+        // One fill decision: $10 approved on a mid-0.50 market. Limit = 0.50*1.2 = 0.60, target shares
+        // = 10/0.60 ≈ 16.67. Book has plenty at 0.55, so it fills 16.67 @ 0.55.
+        let fill_log = vec![FillDecision {
+            at: ts(1),
+            market_id: "m1".into(),
+            outcome: "Yes".into(),
+            approved_usdc: dec!(10),
+            target_mid: dec!(0.50),
+        }];
+        let books = vec![Some(vec![lvl("0.55", "1000")])];
+        let resolutions = vec![Resolution {
+            market_id: "m1".into(),
+            winning_outcome: "Yes".into(),
+            at: Some(ts(10)),
+        }];
+        let res = reprice_realistic(&fill_log, &books, &resolutions, &Marks::new(), dec!(0.005));
+        // shares = 16.67 ; cost = 16.67*0.55 = 9.1685 ; won ⇒ payout 16.67, realized = (16.67 − 9.1685)
+        // rounded to 2dp by the production settlement formula = 7.50.
+        assert_eq!(res.fills, 1);
+        assert_eq!(res.settled_positions, 1);
+        assert_eq!(res.wins, 1);
+        assert_eq!(res.realized, dec!(7.50));
+        assert_eq!(res.fees, (dec!(9.1685) * dec!(0.005)).round_dp(6));
+    }
+
+    #[test]
+    fn reprice_realistic_skips_missing_books() {
+        let fill_log = vec![FillDecision {
+            at: ts(1),
+            market_id: "m1".into(),
+            outcome: "Yes".into(),
+            approved_usdc: dec!(10),
+            target_mid: dec!(0.50),
+        }];
+        let books = vec![None]; // no snapshot for this fill
+        let res = reprice_realistic(&fill_log, &books, &[], &Marks::new(), dec!(0.005));
+        assert_eq!(res.fills, 0);
+        assert_eq!(res.realized, dec!(0));
     }
 
     #[test]
