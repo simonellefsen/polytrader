@@ -207,17 +207,19 @@ pub fn cluster_key(slug: &str) -> &'static str {
     "uncorrelated"
 }
 
-/// Portfolio state loaded from DB for risk calculations.
+/// Portfolio state for risk calculations. In production this is loaded from Postgres by
+/// `RiskManager::load_exposure`; the offline backtest harness constructs it from its simulated
+/// portfolio and feeds it straight to the pure [`RiskManager::gate`].
 #[derive(Debug, Clone)]
-struct PortfolioExposure {
-    virtual_usdc: Decimal,
-    total_locked: Decimal,
-    total_pnl: Decimal,
-    market_locked: Decimal,
+pub struct PortfolioExposure {
+    pub virtual_usdc: Decimal,
+    pub total_locked: Decimal,
+    pub total_pnl: Decimal,
+    pub market_locked: Decimal,
     /// Correlated-cluster key of the candidate market ("uncorrelated" = cap N/A).
-    cluster_key: &'static str,
+    pub cluster_key: &'static str,
     /// Total collateral already locked across ALL open positions in the candidate's cluster.
-    cluster_locked: Decimal,
+    pub cluster_locked: Decimal,
 }
 
 pub struct RiskManager {
@@ -332,27 +334,53 @@ impl RiskManager {
         net_edge: Decimal,
         proposed_usdc: Decimal,
     ) -> Result<RiskCheck> {
+        // Gate 1 short-circuit: the common min-edge rejection skips the DB exposure load. gate()
+        // applies the identical check (via min_edge_reject) so the offline backtest harness
+        // reproduces this decision without a database.
+        if net_edge < self.config.min_net_edge {
+            return Ok(self.min_edge_reject(net_edge));
+        }
+        let exp = self.load_exposure(pool, market_id).await?;
+        Ok(self.gate(market_id, net_edge, proposed_usdc, &exp))
+    }
+
+    /// The standard "below minimum net edge" rejection, shared by the live short-circuit in
+    /// `check_pre_trade` and the pure `gate` so the message can't drift between them.
+    fn min_edge_reject(&self, net_edge: Decimal) -> RiskCheck {
+        RiskCheck {
+            approved: false,
+            reason: format!(
+                "net_edge {net_edge:.4} < min {:.4} (goals wiki 4-6% min net)",
+                self.config.min_net_edge
+            ),
+            recommended_size: None,
+        }
+    }
+
+    /// Pure pre-trade risk gate: given the candidate edge/size and a portfolio-exposure snapshot,
+    /// produce the approve / trim / reject decision. No DB, no async — the single source of truth
+    /// shared by the live [`RiskManager::check_pre_trade`] (which loads `exp` from Postgres) and the
+    /// offline backtest harness (which feeds a simulated `exp`). Gate order: 1 min-edge, 2 PnL floor,
+    /// 3 total exposure, 3.5 correlated-cluster cap (trim), 4 per-market concentration (trim/reject).
+    pub fn gate(
+        &self,
+        market_id: &str,
+        net_edge: Decimal,
+        proposed_usdc: Decimal,
+        exp: &PortfolioExposure,
+    ) -> RiskCheck {
         // Gate 1: minimum net edge
         if net_edge < self.config.min_net_edge {
-            return Ok(RiskCheck {
-                approved: false,
-                reason: format!(
-                    "net_edge {net_edge:.4} < min {:.4} (goals wiki 4-6% min net)",
-                    self.config.min_net_edge
-                ),
-                recommended_size: None,
-            });
+            return self.min_edge_reject(net_edge);
         }
 
-        let exp = self.load_exposure(pool, market_id).await?;
         let total_value = exp.virtual_usdc + exp.total_locked;
-
         if total_value <= Decimal::ZERO {
-            return Ok(RiskCheck {
+            return RiskCheck {
                 approved: false,
                 reason: "portfolio value is zero".into(),
                 recommended_size: None,
-            });
+            };
         }
 
         // Gate 2: PnL floor
@@ -363,7 +391,7 @@ impl RiskManager {
                 floor = %self.config.pnl_floor,
                 "risk gate: PnL floor breached; blocking trade (paper-only)"
             );
-            return Ok(RiskCheck {
+            return RiskCheck {
                 approved: false,
                 reason: format!(
                     "portfolio PnL {:.1}% below floor {:.1}%",
@@ -371,13 +399,13 @@ impl RiskManager {
                     self.config.pnl_floor * dec!(100)
                 ),
                 recommended_size: None,
-            });
+            };
         }
 
         // Gate 3: total exposure
         let post_locked = exp.total_locked + proposed_usdc;
         if post_locked / total_value > self.config.max_total_exposure_pct {
-            return Ok(RiskCheck {
+            return RiskCheck {
                 approved: false,
                 reason: format!(
                     "total exposure {:.1}% would exceed limit {:.1}%",
@@ -385,7 +413,7 @@ impl RiskManager {
                     self.config.max_total_exposure_pct * dec!(100)
                 ),
                 recommended_size: None,
-            });
+            };
         }
 
         // Gate 3.5: correlated-cluster concentration. Caps aggregate exposure across all markets that
@@ -403,7 +431,7 @@ impl RiskManager {
             let headroom =
                 (total_value * self.config.max_cluster_exposure_pct) - exp.cluster_locked;
             if headroom <= Decimal::ZERO {
-                return Ok(RiskCheck {
+                return RiskCheck {
                     approved: false,
                     reason: format!(
                         "correlated cluster '{}' already at {:.1}% exposure limit",
@@ -411,7 +439,7 @@ impl RiskManager {
                         self.config.max_cluster_exposure_pct * dec!(100)
                     ),
                     recommended_size: None,
-                });
+                };
             }
             warn!(
                 cluster = exp.cluster_key,
@@ -433,28 +461,28 @@ impl RiskManager {
         if market_pct > self.config.max_market_exposure_pct {
             let headroom = (total_value * self.config.max_market_exposure_pct) - exp.market_locked;
             if headroom <= Decimal::ZERO {
-                return Ok(RiskCheck {
+                return RiskCheck {
                     approved: false,
                     reason: format!(
                         "market {market_id} already at {:.1}% concentration limit",
                         self.config.max_market_exposure_pct * dec!(100)
                     ),
                     recommended_size: None,
-                });
+                };
             }
             warn!(
                 market = %market_id,
                 trimmed_to = %headroom,
                 "position trimmed to respect concentration limit (paper-only)"
             );
-            return Ok(RiskCheck {
+            return RiskCheck {
                 approved: true,
                 reason: format!(
                     "trimmed to {headroom:.2} USDC (concentration limit {:.1}%)",
                     self.config.max_market_exposure_pct * dec!(100)
                 ),
                 recommended_size: Some(headroom),
-            });
+            };
         }
 
         info!(
@@ -464,11 +492,11 @@ impl RiskManager {
             cluster = exp.cluster_key,
             "pre-trade risk check passed (paper-only)"
         );
-        Ok(RiskCheck {
+        RiskCheck {
             approved: true,
             reason: cluster_trim_note.unwrap_or_else(|| "all gates passed".into()),
             recommended_size: Some(proposed_usdc),
-        })
+        }
     }
 
     pub fn config(&self) -> &RiskConfig {
@@ -544,5 +572,131 @@ impl RiskManager {
             cluster_key,
             cluster_locked,
         })
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    // Defaults: min_edge 0.02, market 20%, cluster 35%, total 80%, pnl_floor -20%.
+    fn mgr() -> RiskManager {
+        RiskManager::with_defaults()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exp(
+        virtual_usdc: Decimal,
+        total_locked: Decimal,
+        total_pnl: Decimal,
+        market_locked: Decimal,
+        cluster_key: &'static str,
+        cluster_locked: Decimal,
+    ) -> PortfolioExposure {
+        PortfolioExposure {
+            virtual_usdc,
+            total_locked,
+            total_pnl,
+            market_locked,
+            cluster_key,
+            cluster_locked,
+        }
+    }
+
+    #[test]
+    fn gate_rejects_below_min_edge() {
+        let e = exp(
+            dec!(150),
+            dec!(0),
+            dec!(0),
+            dec!(0),
+            "uncorrelated",
+            dec!(0),
+        );
+        let r = mgr().gate("m", dec!(0.01), dec!(10), &e);
+        assert!(!r.approved);
+        assert!(r.reason.contains("min"), "{}", r.reason);
+        assert!(r.recommended_size.is_none());
+    }
+
+    #[test]
+    fn gate_approves_clean_trade_untrimmed() {
+        let e = exp(
+            dec!(150),
+            dec!(0),
+            dec!(0),
+            dec!(0),
+            "uncorrelated",
+            dec!(0),
+        );
+        let r = mgr().gate("m", dec!(0.05), dec!(10), &e);
+        assert!(r.approved);
+        assert_eq!(r.recommended_size, Some(dec!(10)));
+    }
+
+    #[test]
+    fn gate_rejects_on_pnl_floor() {
+        // -40 / 150 = -26.7% < -20% floor.
+        let e = exp(
+            dec!(150),
+            dec!(0),
+            dec!(-40),
+            dec!(0),
+            "uncorrelated",
+            dec!(0),
+        );
+        let r = mgr().gate("m", dec!(0.05), dec!(10), &e);
+        assert!(!r.approved);
+        assert!(r.reason.contains("floor"), "{}", r.reason);
+    }
+
+    #[test]
+    fn gate_rejects_on_total_exposure() {
+        // total_value 120; post_locked 110 -> 91.7% > 80%.
+        let e = exp(
+            dec!(20),
+            dec!(100),
+            dec!(0),
+            dec!(0),
+            "uncorrelated",
+            dec!(0),
+        );
+        let r = mgr().gate("m", dec!(0.05), dec!(10), &e);
+        assert!(!r.approved);
+        assert!(r.reason.contains("total exposure"), "{}", r.reason);
+    }
+
+    #[test]
+    fn gate_trims_to_cluster_headroom() {
+        // cluster 'iran' at $50 of $200; cap 35% = $70 -> headroom $20; proposed $30 trimmed to $20.
+        let e = exp(
+            dec!(150),
+            dec!(50),
+            dec!(0),
+            dec!(0),
+            "iran_geopolitics",
+            dec!(50),
+        );
+        let r = mgr().gate("m", dec!(0.05), dec!(30), &e);
+        assert!(r.approved);
+        assert_eq!(r.recommended_size, Some(dec!(20)));
+        assert!(r.reason.contains("cluster"), "{}", r.reason);
+    }
+
+    #[test]
+    fn gate_trims_to_market_concentration() {
+        // uncorrelated (cluster gate skipped); market at $20 of $170, cap 20% = $34 -> headroom $14.
+        let e = exp(
+            dec!(150),
+            dec!(20),
+            dec!(0),
+            dec!(20),
+            "uncorrelated",
+            dec!(20),
+        );
+        let r = mgr().gate("m", dec!(0.05), dec!(30), &e);
+        assert!(r.approved);
+        assert_eq!(r.recommended_size, Some(dec!(14)));
+        assert!(r.reason.contains("concentration"), "{}", r.reason);
     }
 }

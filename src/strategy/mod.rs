@@ -341,9 +341,10 @@ impl FusionEngine {
         snapshot: &serde_json::Value,
         ctx: &serde_json::Value,
     ) -> Result<(Decimal, serde_json::Value)> {
-        let mut total_weighted: Decimal = Decimal::ZERO;
-        let mut total_weight: Decimal = Decimal::ZERO;
         let mut attribution = serde_json::Map::new();
+        // (score, confidence, learned_weight) per successful processor — fed to the shared fusion core
+        // so the live path and the offline `fuse_from_attribution` replay use identical math.
+        let mut contributions: Vec<(Decimal, Decimal, Decimal)> = Vec::new();
 
         for p in &self.processors {
             match p.compute_signal(snapshot, ctx) {
@@ -352,8 +353,7 @@ impl FusionEngine {
                     // Default multiplier 1.0 reproduces the original confidence-only weighting.
                     let learned = self.weight_for(sig.processor_name);
                     let w = sig.confidence * learned;
-                    total_weighted += sig.score * w;
-                    total_weight += w;
+                    contributions.push((sig.score, sig.confidence, learned));
                     attribution.insert(
                         sig.processor_name.to_string(),
                         json!({
@@ -374,11 +374,7 @@ impl FusionEngine {
             }
         }
 
-        let fused = if total_weight > Decimal::ZERO {
-            total_weighted / total_weight
-        } else {
-            Decimal::ZERO
-        };
+        let fused = fuse_weighted(contributions.iter().copied());
 
         let attr_json = serde_json::Value::Object(attribution);
         Ok((fused, attr_json))
@@ -460,6 +456,65 @@ impl FusionEngine {
         let attr_json = attribution; // already a Value (from inner fuse); mutated in place via as_object_mut when Object
         Ok((gross, net, attr_json))
     }
+}
+
+/// Pure weighted-average fusion — the single source of truth for how per-signal scores combine.
+/// `fused = Σ(scoreᵢ · confidenceᵢ · learned_weightᵢ) / Σ(confidenceᵢ · learned_weightᵢ)`, and 0 when
+/// the total effective weight is ≤ 0. Shared by the live [`FusionEngine::fuse`] (fresh signals) and
+/// the offline backtest harness via [`fuse_from_attribution`] (stored decision-report scores replayed
+/// under a candidate weight vector — no processors re-run).
+pub fn fuse_weighted<I>(signals: I) -> Decimal
+where
+    I: IntoIterator<Item = (Decimal, Decimal, Decimal)>,
+{
+    let mut total_weighted = Decimal::ZERO;
+    let mut total_weight = Decimal::ZERO;
+    for (score, confidence, learned) in signals {
+        let w = confidence * learned;
+        total_weighted += score * w;
+        total_weight += w;
+    }
+    if total_weight > Decimal::ZERO {
+        total_weighted / total_weight
+    } else {
+        Decimal::ZERO
+    }
+}
+
+/// Replay fusion from a stored `report.attribution` object under a candidate weight vector — the
+/// backtest-harness primitive. For each per-signal entry that carries both `score` and `confidence`
+/// (this skips the `fee_impact`, `decision_report_summary`, and `{"error": …}` entries that also live
+/// in the attribution map), applies `clamp_weight(weights[name])` as the learned multiplier (default
+/// 1.0 when the signal is absent from the vector), then [`fuse_weighted`]. The `clamp_weight` mirrors
+/// the live read path ([`FusionEngine::weight_for`]) so a candidate weight outside [0.25, 2.0] is
+/// bounded exactly as production would bound it. By construction this reproduces
+/// [`FusionEngine::fuse`]'s gross edge without re-running any processor.
+pub fn fuse_from_attribution(
+    attribution: &serde_json::Value,
+    weights: &BTreeMap<String, Decimal>,
+) -> Decimal {
+    // Attribution numbers may be stored as JSON strings (rust_decimal default) or numbers — accept both.
+    fn parse_dec(v: &serde_json::Value) -> Option<Decimal> {
+        match v {
+            serde_json::Value::String(s) => s.parse::<Decimal>().ok(),
+            serde_json::Value::Number(n) => n.to_string().parse::<Decimal>().ok(),
+            _ => None,
+        }
+    }
+    let mut contributions: Vec<(Decimal, Decimal, Decimal)> = Vec::new();
+    if let Some(map) = attribution.as_object() {
+        for (name, entry) in map {
+            let (Some(score), Some(confidence)) = (
+                entry.get("score").and_then(parse_dec),
+                entry.get("confidence").and_then(parse_dec),
+            ) else {
+                continue; // fee_impact / decision_report_summary / error entry — not a signal
+            };
+            let learned = clamp_weight(weights.get(name).copied().unwrap_or(dec!(1.0)));
+            contributions.push((score, confidence, learned));
+        }
+    }
+    fuse_weighted(contributions)
 }
 
 impl Default for FusionEngine {
@@ -578,5 +633,71 @@ mod processor_tests {
             .compute_signal(&snap, &json!({}))
             .unwrap();
         assert_eq!(sig.score, Decimal::ZERO);
+    }
+
+    // --- Pure fusion cores (Phase 0: shared by live fuse + the backtest harness) ---
+
+    #[test]
+    fn fuse_weighted_matches_manual_weighted_average() {
+        // (score, confidence, learned): weighted avg = Σ(s·c·w) / Σ(c·w).
+        let signals = vec![
+            (dec!(0.10), dec!(0.5), dec!(1.0)),  // s·c·w = 0.05, w = 0.5
+            (dec!(-0.20), dec!(0.4), dec!(2.0)), // s·c·w = -0.16, w = 0.8
+        ];
+        // numerator = 0.05 - 0.16 = -0.11 ; denominator = 0.5 + 0.8 = 1.3
+        let expected = dec!(-0.11) / dec!(1.3);
+        assert_eq!(fuse_weighted(signals), expected);
+    }
+
+    #[test]
+    fn fuse_weighted_zero_total_weight_is_zero() {
+        assert_eq!(fuse_weighted(std::iter::empty()), Decimal::ZERO);
+        // All-zero confidence ⇒ zero total weight ⇒ 0 (no divide-by-zero).
+        assert_eq!(
+            fuse_weighted(vec![(dec!(0.9), dec!(0), dec!(1.5))]),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn fuse_from_attribution_skips_nonsignals_and_applies_candidate_weights() {
+        // A realistic attribution map: two signals plus the non-signal book-keeping entries that
+        // fuse_net adds. Only the two signals should drive the result.
+        let attr = json!({
+            "orderbook_momentum": {"score": "0.10", "confidence": "0.5"},
+            "news_sentiment": {"score": "-0.20", "confidence": "0.4"},
+            "spike_divergence": {"error": "boom"},          // skipped (no score/confidence)
+            "fee_impact": {"gross_edge": "0.01"},            // skipped
+            "decision_report_summary": {"net_edge_after_fees": "0.0"}, // skipped
+        });
+        let mut weights = BTreeMap::new();
+        weights.insert("orderbook_momentum".to_string(), dec!(1.0));
+        weights.insert("news_sentiment".to_string(), dec!(2.0));
+        // momentum: w=0.5 contrib 0.05 ; news: w=0.4·2=0.8 contrib -0.16 ; same as the manual case.
+        let expected = dec!(-0.11) / dec!(1.3);
+        assert_eq!(fuse_from_attribution(&attr, &weights), expected);
+
+        // Changing a candidate weight changes the fused edge (the harness's whole point).
+        weights.insert("news_sentiment".to_string(), dec!(0.5));
+        assert_ne!(fuse_from_attribution(&attr, &weights), expected);
+    }
+
+    #[test]
+    fn fuse_from_attribution_reproduces_live_fuse() {
+        // The Phase-0 guarantee: replaying a stored attribution under the SAME weights the engine used
+        // reproduces fuse()'s gross edge exactly — so the harness tests weights offline == live fusion.
+        let mut weights = BTreeMap::new();
+        weights.insert("orderbook_momentum".to_string(), dec!(1.3));
+        weights.insert("news_sentiment".to_string(), dec!(0.7));
+        let engine = FusionEngine::with_weights(weights.clone());
+        // A bid-heavy book fires orderbook_momentum; the other processors return neutral (still present
+        // in attribution), so this exercises a mixed fired/neutral fusion.
+        let snapshot = json!({
+            "bids": [{"price": "0.40", "size": "9000"}],
+            "asks": [{"price": "0.41", "size": "1000"}],
+        });
+        let (gross, attr) = engine.fuse(&snapshot, &json!({})).unwrap();
+        let replayed = fuse_from_attribution(&attr, &weights);
+        assert_eq!(replayed, gross, "harness replay must equal live fuse");
     }
 }
