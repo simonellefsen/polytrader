@@ -14,6 +14,7 @@ Start here, then follow links. For full context, also read:
 - **experiments/** — Past/present/future experiments, backtests, ideas under test.
 - **integrations/** — (Added 2026-05-25 transfer) Polymarket APIs, data sources, and patterns from community bots (with explicit credits).
 - **log.md** — Chronological living log of major progress, incidents, learnings.
+- **roadmap.md** — Forward-looking improvement plan (tiers + the backtest-harness first thread), grounded in observed live behavior.
 - **runbooks/** — Operational procedures (build, deploy, debug, incident response).
 - **schema.md** — Database schema, important data models, invariants.
 - **sources/** — External references, API docs summaries, version pins, data dictionaries.
