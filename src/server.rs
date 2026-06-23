@@ -1180,6 +1180,37 @@ async fn paper_positions_handler(State(state): State<Arc<AppState>>) -> impl Int
     }
 }
 
+/// Classify a fusion signal's health from its 24h baseline vs recent (3h) fire-rate, so a silently
+/// degrading signal (e.g. a stalled news feed, a processor that stopped firing) is flagged in the
+/// scorecard instead of needing manual comparison across status checks.
+///
+/// `"insufficient_data"` when too few recent reports to judge; `"elevated"` when the recent rate is
+/// notably higher than baseline (incl. a previously-quiet signal waking up); `"dormant"` when an
+/// active signal has gone silent; `"degraded"` when its fire-rate more than halved; else `"ok"`.
+fn signal_health(baseline_pct: Decimal, recent_pct: Decimal, recent_n: usize) -> &'static str {
+    if recent_n < 20 {
+        return "insufficient_data";
+    }
+    // Baseline near-silent: only notable if it suddenly woke up.
+    if baseline_pct < Decimal::from(5) {
+        return if recent_pct > Decimal::from(15) {
+            "elevated"
+        } else {
+            "ok"
+        };
+    }
+    if recent_pct <= Decimal::from(1) {
+        return "dormant"; // an active signal went silent
+    }
+    if recent_pct < baseline_pct / Decimal::from(2) {
+        return "degraded"; // fire-rate more than halved
+    }
+    if recent_pct > baseline_pct * Decimal::from(2) {
+        return "elevated"; // fire-rate doubled
+    }
+    "ok"
+}
+
 /// JSON backing the /trades visualization: portfolio summary, open positions with live unrealized
 /// P&L (current mid vs avg entry), and the recent autonomous execution feed. Read-only, paper-only.
 async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1561,6 +1592,17 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     .await
     .unwrap_or_default();
     let reports_total = dr_attrs.len();
+    // Recent sub-window (last 3h) for per-signal health: a fire-rate that collapses vs the 24h baseline
+    // flags a silently-degrading signal (e.g. a stale news feed) without manual eyeballing across checks.
+    let recent_attrs: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload->'report'->'attribution' FROM journal.events
+         WHERE event_type = 'decision_report' AND created_at > now() - interval '3 hours'
+         ORDER BY created_at DESC LIMIT 1000",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let recent_total = recent_attrs.len();
     // Latest Hermes weights + per-signal realized P&L (if any).
     let latest_weights: Option<serde_json::Value> = sqlx::query_scalar(
         "SELECT payload FROM journal.events WHERE event_type = 'strategy_weights'
@@ -1700,6 +1742,26 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
             } else {
                 Decimal::ZERO
             };
+            // Recent-window (3h) fire-rate + health classification vs the 24h baseline.
+            let mut recent_fired = 0usize;
+            for attr in &recent_attrs {
+                if let Some(score) = attr
+                    .pointer(&format!("/{name}/score"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<Decimal>().ok())
+                {
+                    if !score.is_zero() {
+                        recent_fired += 1;
+                    }
+                }
+            }
+            let recent_fire_rate = if recent_total > 0 {
+                (Decimal::from(recent_fired) / Decimal::from(recent_total) * Decimal::from(100))
+                    .round_dp(1)
+            } else {
+                Decimal::ZERO
+            };
+            let health = signal_health(fire_rate, recent_fire_rate, recent_total);
             let (settled_wins, settled_total) = settled_record_of(name);
             let settled_winrate = if settled_total > 0 {
                 (Decimal::from(settled_wins) / Decimal::from(settled_total) * Decimal::from(100))
@@ -1712,6 +1774,8 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
                 "name": name,
                 "fired": fired,
                 "fire_rate_pct": fire_rate.to_string(),
+                "recent_fire_rate_pct": recent_fire_rate.to_string(),
+                "health": health,
                 "avg_abs_score": avg_abs_score.to_string(),
                 "weight": weight_of(name),
                 "realized_pnl": realized_of(name),
@@ -1724,13 +1788,16 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     let signals_json = serde_json::json!({
         "reports_window_h": 24,
         "reports_total": reports_total,
+        "recent_window_h": 3,
+        "recent_total": recent_total,
         "settled_markets": net_by_market.len(),
         "rows": signal_rows,
         "note": "Fire-rate = share of the last 24h decision reports where the signal contributed a \
-                 non-zero score. Weight is Hermes's current confidence multiplier. Settled record = \
-                 win/loss of settled markets (by net realized P&L) where the signal fired in the final \
-                 decision report (count-based, overlapping). Realized P&L (Hermes's proportional split) \
-                 populates once weight tuning activates at 10 settled.",
+                 non-zero score. health compares the recent 3h fire-rate to the 24h baseline: \
+                 'degraded' = recent fire-rate more than halved, 'dormant' = went silent, 'elevated' = \
+                 doubled, 'insufficient_data' = <20 recent reports. Weight is Hermes's current confidence \
+                 multiplier. Settled record = win/loss of settled markets where the signal fired in the \
+                 final decision report (count-based, overlapping). Realized P&L populates at 10 settled.",
     });
 
     let gate_simulation = serde_json::json!({
@@ -2050,12 +2117,17 @@ function renderSignals(s){
     const cl = isNaN(wr) ? '' : (wr >= 50 ? 'pos' : 'neg');
     return `<span class="${cl}">${w}-${t-w}</span> <span class="muted">(${r.settled_winrate_pct}%)</span>`;
   };
+  const healthBadge = (h, recent) => {
+    if (!h || h === 'ok' || h === 'insufficient_data') return '';
+    const col = (h === 'dormant' || h === 'degraded') ? '#f85149' : '#d29922';
+    return ` <span title="recent 3h fire-rate ${recent}% vs 24h baseline" style="font-size:10px;padding:1px 5px;border-radius:4px;border:1px solid ${col};color:${col}">${h}</span>`;
+  };
   const row = (r) => {
     const rp = r.realized_pnl;
     const rpCell = (rp===null||rp===undefined) ? '<span class="muted">— pending</span>' : `<span class="${cls(rp)}">${sign(rp)}</span>`;
     return `<tr>
       <td>${pretty(r.name)}</td>
-      <td>${r.fire_rate_pct}% <span class="muted">(${r.fired})</span></td>
+      <td>${r.fire_rate_pct}% <span class="muted">(${r.fired})</span>${healthBadge(r.health, r.recent_fire_rate_pct)}</td>
       <td>${r.avg_abs_score}</td>
       <td class="${wcls(r.weight)}">${parseFloat(r.weight).toFixed(2)}×</td>
       <td>${recordCell(r)}</td>
@@ -11366,6 +11438,25 @@ fn merge_reconciliation_journal_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_health_flags_shifts() {
+        let d = Decimal::from;
+        // Too few recent reports to judge.
+        assert_eq!(signal_health(d(20), d(0), 5), "insufficient_data");
+        // The news-drop case: 24h baseline ~20%, recent 3h ~4% → more than halved.
+        assert_eq!(signal_health(d(20), d(4), 200), "degraded");
+        // Active signal gone fully silent.
+        assert_eq!(signal_health(d(15), d(0), 200), "dormant");
+        // Steady → ok.
+        assert_eq!(signal_health(d(20), d(18), 200), "ok");
+        // A previously-quiet signal waking up.
+        assert_eq!(signal_health(d(2), d(25), 200), "elevated");
+        // Quiet and still quiet → ok (don't cry wolf on dormant-by-design signals).
+        assert_eq!(signal_health(d(0), d(0), 200), "ok");
+        // Fire-rate doubled.
+        assert_eq!(signal_health(d(10), d(25), 200), "elevated");
+    }
 
     #[test]
     fn dry_run_event_limit_is_clamped() {
