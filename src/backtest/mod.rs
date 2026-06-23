@@ -481,13 +481,14 @@ pub async fn run(pool: &sqlx::PgPool, args: &[String]) -> anyhow::Result<()> {
 
     // --- Counterfactual under the chosen config ---
     let cfg = CounterfactualConfig { weights, risk };
-    let res = simulate_counterfactual(reports.clone(), &resolutions, &slug_of, &cfg);
+    let n_reports = reports.len();
+    let res = simulate_counterfactual(reports, &resolutions, &slug_of, &cfg);
     println!();
     println!(
         "== Counterfactual (min_net_edge={}, {} weights, {} reports) ==",
         cfg.risk.min_net_edge,
         cfg.weights.len(),
-        reports.len()
+        n_reports
     );
     println!(
         "  fills: {}   settled: {}   W/L: {}/{}   open_at_end: {}",
@@ -551,12 +552,30 @@ async fn load_settlements(
 }
 
 async fn load_reports(pool: &sqlx::PgPool, since: Option<&str>) -> anyhow::Result<Vec<ReportRow>> {
+    // MEMORY: the full `report.attribution` carries per-signal metadata (news headlines, etc.) — several
+    // KB per report × tens of thousands of reports would OOM the 512Mi pod (the exec'd backtest shares
+    // the live server's cgroup). Project to ONLY what `fuse_from_attribution` reads — each signal's
+    // score/confidence + the fee — server-side, so the DB returns ~200 bytes/row instead of the blob.
     let rows: Vec<ReportQueryRow> = sqlx::query_as(
-        "SELECT created_at, payload->>'market_id', payload->>'target_outcome',
-                payload->>'target_mid', payload->'report'->'attribution'
-         FROM journal.events
-         WHERE event_type = 'decision_report'
-           AND ($1::timestamptz IS NULL OR created_at >= $1::timestamptz)
+        "SELECT created_at, market_id, target_outcome, target_mid,
+                jsonb_build_object(
+                    'orderbook_momentum', jsonb_build_object('score', a->'orderbook_momentum'->'score', 'confidence', a->'orderbook_momentum'->'confidence'),
+                    'spike_divergence',   jsonb_build_object('score', a->'spike_divergence'->'score',   'confidence', a->'spike_divergence'->'confidence'),
+                    'overreaction_fade',  jsonb_build_object('score', a->'overreaction_fade'->'score',  'confidence', a->'overreaction_fade'->'confidence'),
+                    'yahoo_finance',      jsonb_build_object('score', a->'yahoo_finance'->'score',      'confidence', a->'yahoo_finance'->'confidence'),
+                    'news_sentiment',     jsonb_build_object('score', a->'news_sentiment'->'score',     'confidence', a->'news_sentiment'->'confidence'),
+                    'fee_impact',         jsonb_build_object('est_fees_and_gas', a->'fee_impact'->'est_fees_and_gas')
+                ) AS slim
+         FROM (
+            SELECT created_at,
+                   payload->>'market_id'      AS market_id,
+                   payload->>'target_outcome' AS target_outcome,
+                   payload->>'target_mid'     AS target_mid,
+                   payload->'report'->'attribution' AS a
+            FROM journal.events
+            WHERE event_type = 'decision_report'
+              AND ($1::timestamptz IS NULL OR created_at >= $1::timestamptz)
+         ) s
          ORDER BY created_at ASC",
     )
     .bind(since)
