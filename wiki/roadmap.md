@@ -126,8 +126,12 @@ unit-testable) and is the prerequisite:
   `ARGS="--min-net-edge 0.04"` or `ARGS="--weights name=val,..."`. **Documented Phase-1
   approximations** (deferred to Phase 3): fills at `target_mid` not the walked book; arb legs excluded;
   the counterfactual applies a *fixed* weight vector across history (live weights varied per cycle).
-  ⚠️ The real-data anchor run (`make backtest`) is still PENDING operator execution — kubectl exec is
-  blocked for the agent.
+  ✅ **Anchor run confirmed PASS (2026-06-23):** `make backtest` against live data reproduces 16
+  settlements / 5W-11L / realized **+$1.21 == live +$1.21**, every per-record formula match. The
+  accounting is validated — Phase 2 is unblocked. (`--since` is a counterfactual-only knob and does not
+  affect the anchor.) First counterfactual under live config: 49 fills, 14 settled, realized +$56.65 —
+  not comparable to live in absolute terms yet (fill-at-mid, no fees, no arb legs, fixed weights;
+  Phase-3 fidelity), but the gate/Kelly/dedup/settlement all fire correctly.
 - **Phase 2 — config sweep.** Grid over `{min_net_edge, weight vectors, caps}`, rank by realized P&L /
   drawdown / Sharpe. Quantitatively settles the strict-vs-lenient question and validates any Hermes
   weight vector before it goes live.
