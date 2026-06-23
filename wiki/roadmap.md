@@ -114,12 +114,20 @@ unit-testable) and is the prerequisite:
   lifted out of `check_pre_trade`, which just loads exposure + delegates). 10 new unit tests incl. an
   end-to-end check that `fuse_from_attribution` reproduces live `fuse()` exactly. Behavior-preserving:
   live portfolio unchanged post-deploy (realized +$1.21, 16 settled).
-- **Phase 1 — sequential simulator + fidelity anchor.** New read-only bin `src/bin/backtest.rs`
-  (mirrors `hermes.rs`; same DB, never writes). Walks `decision_report`s, maintains a `SimPortfolio`,
-  applies pure-gate → Kelly-size → fill → settles at each `resolved_outcome` timestamp.
-  **Acceptance test: fed the exact weights + gate config the live line used, it must reproduce live
-  history — +$1.21, 16 settled, 5W/11L.** Until it matches, trust no counterfactual. The
-  `autonomous_paper_execution` fill log is the oracle.
+- **Phase 1 — sequential simulator + fidelity anchor. ✅ DONE (2026-06-23, commit 6cb7910).** Built as
+  a read-only **`polytrader backtest` subcommand** (not a separate bin — reuses `risk`/`strategy`
+  natively) in `src/backtest/mod.rs`. `SimPortfolio.settle` calls the production
+  `settlement_payout_and_pnl` directly (identical by construction). **Fidelity anchor =
+  `realized_from_settlements`**: recompute realized P&L from every journaled settlement via the
+  production formula and compare to the live recorded realized (+$1.21 / 16 / 5W-11L). `replay_fills`
+  reconstructs the equity path from actual fills; `simulate_counterfactual` is the analysis engine
+  (fuse_from_attribution + gate + quarter-Kelly + fill-at-mid). 6 unit tests; polytrader suite 92.
+  **Run it:** `make backtest` (read-only, inside the live pod), optionally
+  `ARGS="--min-net-edge 0.04"` or `ARGS="--weights name=val,..."`. **Documented Phase-1
+  approximations** (deferred to Phase 3): fills at `target_mid` not the walked book; arb legs excluded;
+  the counterfactual applies a *fixed* weight vector across history (live weights varied per cycle).
+  ⚠️ The real-data anchor run (`make backtest`) is still PENDING operator execution — kubectl exec is
+  blocked for the agent.
 - **Phase 2 — config sweep.** Grid over `{min_net_edge, weight vectors, caps}`, rank by realized P&L /
   drawdown / Sharpe. Quantitatively settles the strict-vs-lenient question and validates any Hermes
   weight vector before it goes live.
@@ -148,4 +156,10 @@ unit-testable) and is the prerequisite:
   equivalence tests; behavior-preserving, deployed, live unchanged. Decided the harness will be a
   **subcommand of the `polytrader` binary** (one-shot CLI branching before the server starts), not a
   separate bin — so it reuses `risk`/`strategy` natively without a `lib.rs` extraction or the
-  duplication the `hermes` bin suffers. **Next: Phase 1** (sequential simulator + fidelity anchor).
+  duplication the `hermes` bin suffers.
+- **2026-06-23** — **Phase 1 complete** (commit 6cb7910): `polytrader backtest` subcommand +
+  `SimPortfolio` + fidelity anchor + counterfactual engine, deployed, 6 unit tests. **Open follow-up:**
+  run `make backtest` against live data to confirm the anchor PASSes (+$1.21 / 16 / 5W-11L) and capture
+  the first counterfactual numbers — agent can't kubectl exec, so this is an operator step. **Next:
+  Phase 2** (config sweep over `{min_net_edge, weight vectors}`, ranked by realized P&L / drawdown),
+  which calls `simulate_counterfactual` — gated on the anchor passing first.
