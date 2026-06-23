@@ -128,7 +128,7 @@ run:
 # e.g.  make backtest ARGS="--min-net-edge 0.04"  or  ARGS="--weights news_sentiment=1.2,orderbook_momentum=0.9".
 # Deploy first (make k8s-deploy) so the pod runs a binary that has the subcommand.
 backtest: k8s-check-namespace
-	kubectl exec -n $(NAMESPACE) deploy/polytrader -c polytrader -- polytrader backtest $(ARGS)
+	kubectl exec -n $(NAMESPACE) deploy/polytrader -c polytrader -- /app/polytrader backtest $(ARGS)
 
 dev: run
 
