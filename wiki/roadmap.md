@@ -107,8 +107,13 @@ unit-testable) and is the prerequisite:
    stays put.
 
 ### Phasing
-- **Phase 0 — pure-core refactor.** Extract the two functions, no behavior change. Ship, verify live
-  realized P&L / weights unchanged. Safe, self-contained, valuable on its own. **← next step.**
+- **Phase 0 — pure-core refactor. ✅ DONE (2026-06-23, commit 1062068).** Extracted
+  `strategy::fuse_weighted` + `strategy::fuse_from_attribution` (live `fuse` delegates to the former;
+  the latter is the harness replay primitive, clamps candidate weights like the live read path) and
+  `risk::RiskManager::gate(market_id, net_edge, proposed, &PortfolioExposure)` (now public; gates 1–4
+  lifted out of `check_pre_trade`, which just loads exposure + delegates). 10 new unit tests incl. an
+  end-to-end check that `fuse_from_attribution` reproduces live `fuse()` exactly. Behavior-preserving:
+  live portfolio unchanged post-deploy (realized +$1.21, 16 settled).
 - **Phase 1 — sequential simulator + fidelity anchor.** New read-only bin `src/bin/backtest.rs`
   (mirrors `hermes.rs`; same DB, never writes). Walks `decision_report`s, maintains a `SimPortfolio`,
   applies pure-gate → Kelly-size → fill → settles at each `resolved_outcome` timestamp.
@@ -138,5 +143,9 @@ unit-testable) and is the prerequisite:
 
 - **2026-06-23** — Roadmap drafted during the quiet period. Chosen first thread: **backtest/replay
   harness** (Tier 1.1), because it de-risks and accelerates every other tier by enabling offline
-  validation. **Phase 0 (pure-core refactor) is the agreed next implementation step** — not yet
-  started.
+  validation.
+- **2026-06-23** — **Phase 0 complete** (commit 1062068): pure fusion + risk-gate cores extracted with
+  equivalence tests; behavior-preserving, deployed, live unchanged. Decided the harness will be a
+  **subcommand of the `polytrader` binary** (one-shot CLI branching before the server starts), not a
+  separate bin — so it reuses `risk`/`strategy` natively without a `lib.rs` extraction or the
+  duplication the `hermes` bin suffers. **Next: Phase 1** (sequential simulator + fidelity anchor).
