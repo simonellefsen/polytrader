@@ -145,9 +145,22 @@ unit-testable) and is the prerequisite:
   while boosting any single signal above the ~neutral Hermes weights yields no gain. Caveat: `max_dd` is
   config-invariant (computed from the realized path); a marks-aware equity curve is future work. Run:
   `/app/polytrader backtest sweep`.
-- **Phase 3 — Level-2 signal replay.** Reconstruct the snapshot (bids/asks/mid/`recent_move_signed`)
-  from `market_data.orderbook_snapshots` at each decision time and re-run the *real* `FusionEngine` —
-  enables testing **new/changed signals** offline. Unlocks all of Tier 2 cheaply.
+- **Phase 3 — realistic fills + fees. ✅ DONE (2026-06-23, commit a1b5ed3).** The single-run
+  counterfactual re-prices its fill decisions against the real order book instead of `target_mid`.
+  Two-phase: the at-mid pass records a `fill_log`; books are loaded lazily (only the ~50 entered
+  markets, nearest snapshot ≤ decision time) and each fill is re-walked via `walk_asks_limit_buy` (a
+  pure mirror of the production `match_against_book` buy/limit path) + a 50bps taker fee
+  (`reprice_realistic`). Output shows `[fill@mid]` vs `[book-walk]` side by side. **Live result: 49/49
+  fills had a book; realistic re-pricing took total P&L +$93.25 → +$74.01 (~21% haircut)** — the
+  fill-at-mid optimism quantified, and the counterfactual is now a credible standalone backtest. The
+  sweep stays at fill-at-mid (relative ranking); realistic pricing is on the single run for the
+  absolute number. **Still NOT a live reproduction** (different strategy: no arb/both-sides legs, fixed
+  weights) — the fidelity anchor remains the live check.
+  - **Deferred / future:** true Level-2 signal replay (re-run the *whole* FusionEngine on reconstructed
+    snapshots to test NEW signals) is only partially feasible — the book-based processors reconstruct
+    from `orderbook_snapshots`, but the external `yahoo`/`news` snapshot block was fetched live and
+    isn't stored, so a full 5-processor re-run can't be faithfully reconstructed. Also future: a
+    marks-aware equity curve for per-config drawdown/Sharpe; realistic fills inside the sweep.
 
 ### Risks to design around
 - **Fidelity** — paper fills execute at mid; the sim's slippage/fill assumptions must match the live
@@ -176,6 +189,11 @@ unit-testable) and is the prerequisite:
   (+$1.21 / 16 / 5W-11L).
 - **2026-06-23** — **Phase 2 complete** (commit d94d8dc): config sweep + mark-to-market. Findings: gate
   threshold barely affects total P&L; `orderbook_momentum` is load-bearing (de-weighting it craters
-  return), Hermes's ~neutral weights are near-optimal among presets. **Next: Phase 3** (Level-2 signal
-  replay — book-walk fills + fees + arb legs, so the counterfactual's *absolute* P&L becomes
-  live-comparable), and/or a marks-aware equity curve for real drawdown/Sharpe per config.
+  return), Hermes's ~neutral weights are near-optimal among presets.
+- **2026-06-23** — **Phase 3 complete** (commit a1b5ed3): realistic book-walk fills + 50bps fees on the
+  single run. Fill-at-mid was ~21% optimistic (+$93.25 → +$74.01). **The backtest-harness roadmap
+  thread (Tier 1.1) is now complete through Phase 3.** Remaining harness ideas are explicitly deferred
+  (full Level-2 signal replay is only partly feasible — external signals aren't stored; marks-aware
+  equity curve; realistic fills in the sweep). **Natural next focus:** back to the broader roadmap —
+  Tier 1.2 (faster-resolving market universe, to fatten the settled sample) or Tier 2 (new signals:
+  calibration / theta / cross-market), both of which the harness can now validate.
