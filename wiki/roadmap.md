@@ -132,9 +132,19 @@ unit-testable) and is the prerequisite:
   affect the anchor.) First counterfactual under live config: 49 fills, 14 settled, realized +$56.65 —
   not comparable to live in absolute terms yet (fill-at-mid, no fees, no arb legs, fixed weights;
   Phase-3 fidelity), but the gate/Kelly/dedup/settlement all fire correctly.
-- **Phase 2 — config sweep.** Grid over `{min_net_edge, weight vectors, caps}`, rank by realized P&L /
-  drawdown / Sharpe. Quantitatively settles the strict-vs-lenient question and validates any Hermes
-  weight vector before it goes live.
+- **Phase 2 — config sweep. ✅ DONE (2026-06-23, commit d94d8dc).** `polytrader backtest sweep` runs two
+  grids (A: gate threshold 0.02..0.06; B: weight presets) and ranks by total P&L. Key addition:
+  **mark-to-market** — realized alone can't rank configs (the ~14 resolved Iran markets are entered under
+  *every* config since near-extreme prices clear every gate and Kelly pins at the $20 cap), so
+  `SimResult.unrealized` marks still-open positions at each market's latest mid (binary complement via
+  `build_marks`); config differences live there. `simulate_counterfactual` now borrows reports (one load,
+  reused across configs). **Findings (relative only, not live-comparable):** (1) the **gate threshold
+  barely matters** — total P&L is flat ~+93.2 across 0.02..0.06, so the live "strict beats lenient
+  ~$29 vs ~$16" gap is an artifact of that comparison's subset methodology, not a real edge-level effect;
+  (2) **`orderbook_momentum` is load-bearing** — de-weighting it to 0.25 craters total P&L (+93 → +73),
+  while boosting any single signal above the ~neutral Hermes weights yields no gain. Caveat: `max_dd` is
+  config-invariant (computed from the realized path); a marks-aware equity curve is future work. Run:
+  `/app/polytrader backtest sweep`.
 - **Phase 3 — Level-2 signal replay.** Reconstruct the snapshot (bids/asks/mid/`recent_move_signed`)
   from `market_data.orderbook_snapshots` at each decision time and re-run the *real* `FusionEngine` —
   enables testing **new/changed signals** offline. Unlocks all of Tier 2 cheaply.
@@ -162,8 +172,10 @@ unit-testable) and is the prerequisite:
   separate bin — so it reuses `risk`/`strategy` natively without a `lib.rs` extraction or the
   duplication the `hermes` bin suffers.
 - **2026-06-23** — **Phase 1 complete** (commit 6cb7910): `polytrader backtest` subcommand +
-  `SimPortfolio` + fidelity anchor + counterfactual engine, deployed, 6 unit tests. **Open follow-up:**
-  run `make backtest` against live data to confirm the anchor PASSes (+$1.21 / 16 / 5W-11L) and capture
-  the first counterfactual numbers — agent can't kubectl exec, so this is an operator step. **Next:
-  Phase 2** (config sweep over `{min_net_edge, weight vectors}`, ranked by realized P&L / drawdown),
-  which calls `simulate_counterfactual` — gated on the anchor passing first.
+  `SimPortfolio` + fidelity anchor + counterfactual engine. Anchor confirmed **PASS** against live data
+  (+$1.21 / 16 / 5W-11L).
+- **2026-06-23** — **Phase 2 complete** (commit d94d8dc): config sweep + mark-to-market. Findings: gate
+  threshold barely affects total P&L; `orderbook_momentum` is load-bearing (de-weighting it craters
+  return), Hermes's ~neutral weights are near-optimal among presets. **Next: Phase 3** (Level-2 signal
+  replay — book-walk fills + fees + arb legs, so the counterfactual's *absolute* P&L becomes
+  live-comparable), and/or a marks-aware equity curve for real drawdown/Sharpe per config.
