@@ -47,10 +47,15 @@ rate-limited.** That framing drives the tier ordering below.
 1. **Backtest / replay harness** *(chosen first thread — see plan below)*. Replay the journal of
    resolved markets offline to (a) bootstrap signal calibration from history and (b) validate any
    weight/gate/signal change before it touches the live line.
-2. **Faster-resolving market universe.** Re-weight the tracked universe toward daily/weekly resolvers
-   (sports finals, daily crypto closes, econ prints, weekly political markets) to take settlement
-   throughput from ~12/week toward ~10/day — Hermes crosses `FULL_CONFIDENCE_SETTLED=40` in days, not
-   never.
+2. **Faster-resolving market universe. ❌ INVESTIGATED 2026-06-23 — structurally infeasible right now.**
+   Gamma scan showed: fast-resolving markets (next ~16d) are almost all **decided extreme longshots**
+   (Yes 0.0005–0.007 → uninformative No-resolutions); the only fast markets with **genuine uncertainty**
+   are **sports** (FIFA World Cup, MLB), which polytrader trades **arb-only** (our signals don't model
+   match outcomes); genuinely-uncertain DIRECTIONAL markets all resolve slowly (elections, World Cup
+   winner). So the data starvation is *structural*, not a watchlist oversight — can't fatten the settled
+   sample with the current strategy scope. Forks if more data is wanted: build sports-directional
+   capability (new signal class, big), or accept slow data and do no-data-dependent work. **Do NOT stuff
+   the bootstrap list with June-30 longshots.**
 3. **Fix attribution causality.** Anchor per-signal realized P&L to the **decision report at entry**
    (the report that actually triggered the trade) instead of a sliding recent-20 window. Removes the
    re-split noise source and makes Hermes attribution stable + causally correct.
@@ -62,8 +67,14 @@ rate-limited.** That framing drives the tier ordering below.
 - **Theta / convergence signal** — near resolution, price should converge to 0/1; flag laggards.
 - **Cross-market correlation** — related markets drifting out of line (extends the arb scanner from
   exact to *statistical* arb).
-- **Automated signal-health monitor** — alert on fire-rate / score-distribution shift (automate the
-  news-drop catch).
+- **Automated signal-health monitor. ✅ DONE (2026-06-23, commit 34b0a47).** The `/trades` scorecard now
+  carries a recent-3h fire-rate alongside the 24h baseline and a pure `signal_health` classifier
+  (degraded = fire-rate >½ drop, dormant = went silent, elevated = doubled/woke up, insufficient_data,
+  else ok), shown as a colored badge. Automates the manual eyeballing that caught the news
+  19.9%→4.5% drop; only alarms on drops from an active (≥5%) baseline so dormant-by-design signals
+  aren't false-flagged. **Limitation:** 3h-vs-24h catches *sudden* shifts, not multi-day gradual decay
+  (a longer baseline window is a follow-up — note `news_sentiment` has slow-decayed to ~1.8% and reads
+  `ok` because the 24h baseline itself eroded).
 
 ## Tier 3 — Fusion, risk & validation
 
