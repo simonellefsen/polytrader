@@ -82,6 +82,11 @@ pub struct SettlementRow {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SimResult {
     pub realized: Decimal,
+    /// Mark-to-market P&L of positions still open at the end (Σ shares·mark − cost), using each
+    /// market's latest decision-report mid. Zero when no marks are supplied. This is where config
+    /// differences on UNRESOLVED markets show up — realized alone can't rank configs because the
+    /// resolved markets are entered under every config.
+    pub unrealized: Decimal,
     /// Positions that actually settled (we held them at resolution).
     pub settled_positions: usize,
     pub wins: usize,
@@ -95,11 +100,21 @@ pub struct SimResult {
 }
 
 impl SimResult {
-    /// Final equity under the sim identity (cash + locked == base + realized; open marks excluded).
+    /// Total P&L (realized + open marks).
+    pub fn total_pnl(&self) -> Decimal {
+        self.realized + self.unrealized
+    }
+
+    /// Final equity = base + realized + open marks.
     pub fn final_equity(&self) -> Decimal {
-        SIM_BASE_USDC + self.realized
+        SIM_BASE_USDC + self.realized + self.unrealized
     }
 }
+
+/// Per-market latest mid for marking open positions: market_id → (latest target_outcome, latest mid).
+/// For a held outcome, the mark is `mid` if it matches the latest target side, else `1 − mid` (binary
+/// complement). Built from the decision_report stream by [`build_marks`].
+pub type Marks = BTreeMap<String, (String, Decimal)>;
 
 #[derive(Clone, Debug, Default)]
 struct Position {
@@ -146,6 +161,27 @@ impl SimPortfolio {
         self.positions
             .iter()
             .any(|((m, _), p)| m == market_id && p.shares > dec!(0))
+    }
+
+    /// Mark-to-market P&L of all open positions: Σ (shares·mark − cost). `marks` gives each market's
+    /// latest (target_outcome, mid); a held outcome marks at `mid` if it is that target side, else
+    /// `1 − mid` (binary complement). Positions in a market with no mark contribute 0 (held at cost).
+    pub fn unrealized(&self, marks: &Marks) -> Decimal {
+        let mut u = dec!(0);
+        for ((market, outcome), p) in &self.positions {
+            if p.shares <= dec!(0) {
+                continue;
+            }
+            if let Some((target_outcome, mid)) = marks.get(market) {
+                let mark = if outcome.eq_ignore_ascii_case(target_outcome) {
+                    *mid
+                } else {
+                    dec!(1) - *mid
+                };
+                u += p.shares * mark - p.cost;
+            }
+        }
+        u
     }
 
     /// Collateral locked in a single market (across outcomes).
@@ -282,12 +318,16 @@ pub struct CounterfactualConfig {
 /// candidate weights, subtract the report's own fee, quarter-Kelly size, run the pure gate, and (if
 /// approved) fill at `target_mid`. Settles all remaining resolved markets at the end.
 pub fn simulate_counterfactual(
-    mut reports: Vec<ReportRow>,
+    reports: &[ReportRow],
     resolutions: &[Resolution],
     slug_of: &BTreeMap<String, String>,
+    marks: &Marks,
     cfg: &CounterfactualConfig,
 ) -> SimResult {
-    reports.sort_by_key(|r| r.at);
+    // Borrow + sort references (not the data) so a config sweep can reuse one loaded report set across
+    // many runs without cloning ~50k rows per config.
+    let mut order: Vec<&ReportRow> = reports.iter().collect();
+    order.sort_by_key(|r| r.at);
     let rm = RiskManager::new(cfg.risk.clone());
 
     // Resolutions with a known time, sorted; the rest are applied at the end.
@@ -299,7 +339,7 @@ pub fn simulate_counterfactual(
     let mut res = SimResult::default();
     let mut next_res = 0usize;
 
-    for rep in &reports {
+    for rep in &order {
         // Settle anything resolved at or before this report's timestamp.
         while next_res < timed.len() && timed[next_res].at.unwrap() <= rep.at {
             apply_resolution(&mut sim, timed[next_res], &mut settled_markets, &mut res);
@@ -352,8 +392,80 @@ pub fn simulate_counterfactual(
     }
 
     res.realized = sim.realized();
+    res.unrealized = sim.unrealized(marks);
     res.open_at_end = sim.open_count();
     res
+}
+
+/// Build the per-market marks (latest target_outcome + mid) from the decision_report stream — the
+/// latest report per market wins. Used to mark open positions at the end of a counterfactual.
+pub fn build_marks(reports: &[ReportRow]) -> Marks {
+    let mut latest: BTreeMap<String, (DateTime<Utc>, String, Decimal)> = BTreeMap::new();
+    for r in reports {
+        match latest.get(&r.market_id) {
+            Some((t, _, _)) if *t >= r.at => {}
+            _ => {
+                latest.insert(
+                    r.market_id.clone(),
+                    (r.at, r.target_outcome.clone(), r.target_mid),
+                );
+            }
+        }
+    }
+    latest
+        .into_iter()
+        .map(|(k, (_, o, m))| (k, (o, m)))
+        .collect()
+}
+
+/// One row of a config sweep: a config's label, its simulation result, and the max drawdown of its
+/// realized equity path.
+#[derive(Clone, Debug)]
+pub struct SweepRow {
+    pub label: String,
+    pub result: SimResult,
+    pub max_drawdown: Decimal,
+}
+
+/// Run [`simulate_counterfactual`] for each labelled config against one shared (borrowed) report set —
+/// the Phase-2 config sweep. Borrowing means no per-config clone of the (large) report set.
+pub fn run_sweep(
+    reports: &[ReportRow],
+    resolutions: &[Resolution],
+    slug_of: &BTreeMap<String, String>,
+    marks: &Marks,
+    configs: &[(String, CounterfactualConfig)],
+) -> Vec<SweepRow> {
+    configs
+        .iter()
+        .map(|(label, cfg)| {
+            let result = simulate_counterfactual(reports, resolutions, slug_of, marks, cfg);
+            let mdd = max_drawdown(&result.realized_curve);
+            SweepRow {
+                label: label.clone(),
+                result,
+                max_drawdown: mdd,
+            }
+        })
+        .collect()
+}
+
+/// Max peak-to-trough decline of a running-realized path (equity drawdown == realized drawdown since
+/// the base is constant). The implicit pre-settlement peak is 0, so an all-losses path reports its
+/// full depth.
+pub fn max_drawdown(realized_curve: &[Decimal]) -> Decimal {
+    let mut peak = dec!(0);
+    let mut mdd = dec!(0);
+    for &r in realized_curve {
+        if r > peak {
+            peak = r;
+        }
+        let dd = peak - r;
+        if dd > mdd {
+            mdd = dd;
+        }
+    }
+    mdd
 }
 
 /// Settle every resolution in (best-effort) time order. Used by [`replay_fills`].
@@ -481,25 +593,36 @@ pub async fn run(pool: &sqlx::PgPool, args: &[String]) -> anyhow::Result<()> {
         }
     );
 
-    // --- Counterfactual under the chosen config ---
+    // Marks for valuing positions left open at the end (where config differences on unresolved markets
+    // actually show up). Built once from the report stream, shared across all configs.
+    let marks = build_marks(&reports);
+
+    // `backtest sweep` → run the config grids; otherwise a single counterfactual under the chosen config.
+    if args.iter().any(|a| a == "sweep") {
+        run_sweep_report(&reports, &resolutions, &slug_of, &marks, &weights, &risk);
+        return Ok(());
+    }
+
+    // --- Single counterfactual under the chosen config ---
     let cfg = CounterfactualConfig { weights, risk };
-    let n_reports = reports.len();
-    let res = simulate_counterfactual(reports, &resolutions, &slug_of, &cfg);
+    let res = simulate_counterfactual(&reports, &resolutions, &slug_of, &marks, &cfg);
     println!();
     println!(
         "== Counterfactual (min_net_edge={}, {} weights, {} reports) ==",
         cfg.risk.min_net_edge,
         cfg.weights.len(),
-        n_reports
+        reports.len()
     );
     println!(
         "  fills: {}   settled: {}   W/L: {}/{}   open_at_end: {}",
         res.fills, res.settled_positions, res.wins, res.losses, res.open_at_end
     );
     println!(
-        "  realized: {}   final_equity: {}",
+        "  realized: {}   unrealized(marks): {}   total_pnl: {}   final_equity: {}",
         res.realized,
-        res.final_equity()
+        res.unrealized.round_dp(2),
+        res.total_pnl().round_dp(2),
+        res.final_equity().round_dp(2),
     );
     println!(
         "  NOTE: Phase-1 fills at target_mid (no book-walk) and excludes arb legs, so this will not"
@@ -508,6 +631,112 @@ pub async fn run(pool: &sqlx::PgPool, args: &[String]) -> anyhow::Result<()> {
         "        match live fills exactly — that's Phase 3. The anchor above validates accounting."
     );
     Ok(())
+}
+
+/// Render the Phase-2 config sweeps: gate-threshold (the strict-vs-lenient question) and a few weight
+/// presets. Ranked by realized P&L; max-drawdown shown alongside. Absolute P&L is not live-comparable
+/// (Phase-1 approximations), but RELATIVE ranking across configs is meaningful — they share the same
+/// approximations, so the differences are real.
+fn run_sweep_report(
+    reports: &[ReportRow],
+    resolutions: &[Resolution],
+    slug_of: &BTreeMap<String, String>,
+    marks: &Marks,
+    base_weights: &BTreeMap<String, Decimal>,
+    base_risk: &RiskConfig,
+) {
+    println!();
+    println!("== Sweep A — gate threshold (weights fixed = loaded/baseline) ==");
+    let gate_grid: Vec<Decimal> = vec![
+        dec!(0.02),
+        dec!(0.025),
+        dec!(0.03),
+        dec!(0.04),
+        dec!(0.05),
+        dec!(0.06),
+    ];
+    let configs_a: Vec<(String, CounterfactualConfig)> = gate_grid
+        .iter()
+        .map(|edge| {
+            let mut risk = base_risk.clone();
+            risk.min_net_edge = *edge;
+            (
+                format!("edge={edge}"),
+                CounterfactualConfig {
+                    weights: base_weights.clone(),
+                    risk,
+                },
+            )
+        })
+        .collect();
+    print_sweep_table(run_sweep(reports, resolutions, slug_of, marks, &configs_a));
+
+    println!();
+    println!(
+        "== Sweep B — weight presets (min_net_edge fixed = {}) ==",
+        base_risk.min_net_edge
+    );
+    let presets: Vec<(&str, Vec<(&str, Decimal)>)> = vec![
+        ("neutral", vec![]),
+        ("momentum+", vec![("orderbook_momentum", dec!(1.5))]),
+        ("news+", vec![("news_sentiment", dec!(1.5))]),
+        (
+            "external+",
+            vec![("yahoo_finance", dec!(1.5)), ("news_sentiment", dec!(1.5))],
+        ),
+        ("momentum-off", vec![("orderbook_momentum", dec!(0.25))]),
+    ];
+    let mut configs_b: Vec<(String, CounterfactualConfig)> = vec![(
+        "hermes-latest".to_string(),
+        CounterfactualConfig {
+            weights: base_weights.clone(),
+            risk: base_risk.clone(),
+        },
+    )];
+    for (label, kvs) in presets {
+        let weights: BTreeMap<String, Decimal> =
+            kvs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        configs_b.push((
+            label.to_string(),
+            CounterfactualConfig {
+                weights,
+                risk: base_risk.clone(),
+            },
+        ));
+    }
+    print_sweep_table(run_sweep(reports, resolutions, slug_of, marks, &configs_b));
+
+    println!();
+    println!("  Ranked by total_pnl (realized + open marks). Absolute P&L is NOT live-comparable");
+    println!(
+        "  (fill-at-mid, no fees/arb); only the RELATIVE ranking is meaningful. `realized` covers"
+    );
+    println!(
+        "  the ~14 markets resolved in-window (entered under every config, so it barely moves);"
+    );
+    println!("  config differences live in `unreal` — the marked value of still-open positions.");
+}
+
+fn print_sweep_table(mut rows: Vec<SweepRow>) {
+    rows.sort_by_key(|r| std::cmp::Reverse(r.result.total_pnl())); // realized + marks, descending
+    println!(
+        "  {:<16} {:>9} {:>8} {:>9} {:>7} {:>6} {:>6} {:>9}",
+        "config", "total_pnl", "realized", "unreal", "settled", "fills", "open", "max_dd"
+    );
+    for r in &rows {
+        let s = &r.result;
+        println!(
+            "  {:<16} {:>9} {:>8} {:>9} {:>7} {:>6} {:>6} {:>9}",
+            r.label,
+            s.total_pnl().round_dp(2),
+            s.realized.round_dp(2),
+            s.unrealized.round_dp(2),
+            s.settled_positions,
+            s.fills,
+            s.open_at_end,
+            r.max_drawdown.round_dp(2),
+        );
+    }
 }
 
 /// Raw row for the settlement query: (won, shares, cost_basis, realized_pnl) as JSON text.
@@ -796,14 +1025,14 @@ mod tests {
             weights: BTreeMap::new(),
             risk: RiskConfig::default(),
         };
-        let res = simulate_counterfactual(reports.clone(), &resolutions, &slug_of, &cfg);
+        let res = simulate_counterfactual(&reports, &resolutions, &slug_of, &Marks::new(), &cfg);
         assert_eq!(res.fills, 1, "dedup: only one position per market");
         assert_eq!(res.settled_positions, 1);
         assert!(res.wins == 1 && res.realized > dec!(0));
 
         // Raise the gate above the net edge ⇒ no trade.
         cfg.risk.min_net_edge = dec!(0.99);
-        let res2 = simulate_counterfactual(reports, &resolutions, &slug_of, &cfg);
+        let res2 = simulate_counterfactual(&reports, &resolutions, &slug_of, &Marks::new(), &cfg);
         assert_eq!(res2.fills, 0);
         assert_eq!(res2.realized, dec!(0));
     }
@@ -837,7 +1066,14 @@ mod tests {
             risk: RiskConfig::default(),
         };
         assert_eq!(
-            simulate_counterfactual(reports.clone(), &resolutions, &slug_of, &cfg_balanced).fills,
+            simulate_counterfactual(
+                &reports,
+                &resolutions,
+                &slug_of,
+                &Marks::new(),
+                &cfg_balanced
+            )
+            .fills,
             0
         );
 
@@ -849,8 +1085,96 @@ mod tests {
             risk: RiskConfig::default(),
         };
         assert_eq!(
-            simulate_counterfactual(reports, &resolutions, &slug_of, &cfg_tilted).fills,
+            simulate_counterfactual(&reports, &resolutions, &slug_of, &Marks::new(), &cfg_tilted)
+                .fills,
             1
         );
+    }
+
+    #[test]
+    fn unrealized_marks_open_positions_with_binary_complement() {
+        let mut sim = SimPortfolio::new();
+        // Bought 10 Yes for $4 (entry 0.40). Latest report targets No @ 0.55 ⇒ Yes mark = 1−0.55 = 0.45.
+        sim.fill("m1", "Yes", dec!(10), dec!(4));
+        let mut marks: Marks = BTreeMap::new();
+        marks.insert("m1".into(), ("No".into(), dec!(0.55)));
+        // unrealized = 10·0.45 − 4 = 0.50
+        assert_eq!(sim.unrealized(&marks), dec!(0.50));
+        // No mark for the market ⇒ held at cost ⇒ 0.
+        assert_eq!(sim.unrealized(&Marks::new()), dec!(0));
+    }
+
+    #[test]
+    fn build_marks_keeps_latest_report_per_market() {
+        let reports = vec![
+            ReportRow {
+                at: ts(1),
+                market_id: "m1".into(),
+                target_outcome: "Yes".into(),
+                target_mid: dec!(0.30),
+                attribution: json!({}),
+            },
+            ReportRow {
+                at: ts(5),
+                market_id: "m1".into(),
+                target_outcome: "No".into(),
+                target_mid: dec!(0.60),
+                attribution: json!({}),
+            },
+        ];
+        let marks = build_marks(&reports);
+        assert_eq!(marks.get("m1"), Some(&("No".to_string(), dec!(0.60))));
+    }
+
+    #[test]
+    fn max_drawdown_tracks_peak_to_trough() {
+        // path: +5, +2 (dd 3 from peak 5), +8 (new peak), +1 (dd 7) → max dd 7.
+        assert_eq!(max_drawdown(&[dec!(5), dec!(2), dec!(8), dec!(1)]), dec!(7));
+        // monotonic up ⇒ no drawdown.
+        assert_eq!(max_drawdown(&[dec!(1), dec!(2), dec!(3)]), dec!(0));
+        // all losses from the implicit 0 peak ⇒ depth = worst point.
+        assert_eq!(max_drawdown(&[dec!(-4), dec!(-9), dec!(-6)]), dec!(9));
+        assert_eq!(max_drawdown(&[]), dec!(0));
+    }
+
+    #[test]
+    fn run_sweep_ranks_gate_thresholds() {
+        // One market, strong +0.25 net edge. A loose gate (0.02) trades it; a gate above 0.25 doesn't.
+        let attr = json!({
+            "orderbook_momentum": {"score": "0.30", "confidence": "0.5"},
+            "fee_impact": {"est_fees_and_gas": "0.05"},
+        });
+        let reports = vec![ReportRow {
+            at: ts(1),
+            market_id: "m1".into(),
+            target_outcome: "Yes".into(),
+            target_mid: dec!(0.50),
+            attribution: attr,
+        }];
+        let resolutions = vec![Resolution {
+            market_id: "m1".into(),
+            winning_outcome: "Yes".into(),
+            at: None,
+        }];
+        let slug_of: BTreeMap<String, String> = BTreeMap::new();
+
+        let mk = |edge: Decimal| {
+            let mut risk = RiskConfig::default();
+            risk.min_net_edge = edge;
+            CounterfactualConfig {
+                weights: BTreeMap::new(),
+                risk,
+            }
+        };
+        let configs = vec![
+            ("loose".to_string(), mk(dec!(0.02))),
+            ("tight".to_string(), mk(dec!(0.50))),
+        ];
+        let rows = run_sweep(&reports, &resolutions, &slug_of, &Marks::new(), &configs);
+        let loose = rows.iter().find(|r| r.label == "loose").unwrap();
+        let tight = rows.iter().find(|r| r.label == "tight").unwrap();
+        assert_eq!(loose.result.fills, 1);
+        assert_eq!(tight.result.fills, 0);
+        assert!(loose.result.realized > tight.result.realized);
     }
 }
