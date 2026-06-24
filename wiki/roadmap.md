@@ -118,15 +118,20 @@ rate-limited.** That framing drives the tier ordering below.
 Drawdown circuit-breaker (auto-pause execution on equity drop), push-alerts for anomalies currently
 caught by hand (WAL archiving flip, LLM health, signal drift), calibration dashboard.
 
-- **Drawdown monitor + alert. ✅ DONE (2026-06-24, commit bda857a) — observability half.** Hermes
-  reflection now carries a `drawdown` block (current NAV, all-time peak, current & max drawdown %) and
-  journals a rate-limited `drawdown_alert` when NAV falls > `HERMES_DRAWDOWN_ALERT_PCT` (default 10%)
-  from peak. NAV = virtual_usdc + total_locked + unrealized_pnl (matches /trades). Live: NAV ~9966,
-  peak ~10056, max drawdown 1.01% → no alert (book stable). **The auto-pause CIRCUIT-BREAKER (halting
-  execution on breach) is deliberately NOT built** — it's a trading-behavior change that needs an
-  explicit operator decision: (a) drawdown threshold, (b) pause-vs-alert-only, (c) auto-resume vs manual
-  reset, (d) gating env (default off, like the other autonomous features). The monitor + alert is the
-  safe precursor and gives the trigger signal the breaker would consume.
+- **Drawdown circuit-breaker. ✅ DONE (2026-06-24, commits bda857a + ed6142a).** Two halves:
+  - *Observability* (bda857a): Hermes reflection carries a `drawdown` block (current NAV, all-time peak,
+    current & max drawdown %) and journals a rate-limited `drawdown_alert` when NAV falls >
+    `HERMES_DRAWDOWN_ALERT_PCT` (default 10%) from peak. Live: NAV ~9966, peak ~10056, max drawdown
+    1.01% → quiet.
+  - *Behavior, opt-in* (ed6142a): the directional executor halts NEW entries while NAV is >=
+    `POLYTRADER_DRAWDOWN_HALT_PCT` below peak. **Default OFF** (env unset → disabled, zero overhead,
+    behavior unchanged — verified inert post-deploy). Decisions baked as documented defaults: halt new
+    entries only (no liquidation); risk-free arb executor unaffected; **auto-resumes** when drawdown
+    recovers (no persisted latch / manual reset); halt journaled (de-spammed once/hour). NAV =
+    virtual_usdc + total_locked + unrealized_pnl (matches /trades + the monitor).
+  - **To enable:** set `POLYTRADER_DRAWDOWN_HALT_PCT` (e.g. 15). **Possible follow-ups if desired:** a
+    manual-reset latch (don't auto-resume until an operator clears it), or extending the halt to the arb
+    path. Left as defaults pending operator preference.
 
 - **Signal-health monitor — longer baseline window. ✅ DONE (2026-06-24, commits 5c61e7d + 5577ada).**
   The 3h-vs-24h comparison was blind to *multi-day gradual decay* (the 24h baseline erodes along with
@@ -300,8 +305,12 @@ unit-testable) and is the prerequisite:
   on entry `win_prob_estimate` vs outcomes, in Hermes reflection metrics. First live read: skill +0.28,
   model underconfident on high-conviction bets. Pure `compute_calibration` unit-tested; join is
   entry-report anchored (reuses the Tier 1.3 basis).
-- **2026-06-24** — **Drawdown monitor + alert DONE** (Tier 4, observability half). `drawdown` block in
-  reflection metrics + rate-limited `drawdown_alert` on NAV fall from peak (threshold via
-  HERMES_DRAWDOWN_ALERT_PCT, default 10%). Live max drawdown 1.01% → quiet. The auto-pause circuit-breaker
-  is deliberately deferred — it changes trading behavior and needs an operator decision on
-  threshold/pause-policy/auto-resume/gating.
+- **2026-06-24** — **Drawdown monitor + alert DONE** (Tier 4, observability half, commit bda857a).
+  `drawdown` block in reflection metrics + rate-limited `drawdown_alert` on NAV fall from peak (threshold
+  via HERMES_DRAWDOWN_ALERT_PCT, default 10%). Live max drawdown 1.01% → quiet.
+- **2026-06-24** — **Drawdown circuit-breaker DONE** (Tier 4, behavior half, commit ed6142a). Opt-in
+  executor halt on NAV drawdown via POLYTRADER_DRAWDOWN_HALT_PCT, **default OFF** (ships inert; verified
+  disabled post-deploy). Halts new directional entries only, auto-resumes on recovery, arb path
+  unaffected. Follows the gated-autonomous-feature pattern so no behavior change ships until enabled.
+  Tier 4 ops items (signal-health, LLM-health, drawdown) are now complete; remaining roadmap work is
+  Tier 2 structural signals.
