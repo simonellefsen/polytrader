@@ -338,7 +338,8 @@ async fn do_reflection(
 
     // Per-signal REALIZED P&L from settled positions (ground truth). Empty until markets resolve;
     // once present, it drives P&L-based weight boosting (net-winners >1.0) instead of trim-only.
-    let (realized_pnl_summary, realized_pnl_map) = load_per_signal_realized_pnl(pool).await;
+    let (realized_pnl_summary, realized_pnl_map, attr_window_fire_rate) =
+        load_per_signal_realized_pnl(pool).await;
     let settled_count = realized_pnl_summary
         .get("settled_positions")
         .and_then(|v| v.as_u64())
@@ -360,6 +361,7 @@ async fn do_reflection(
         pool,
         &strategy_signal_attribution,
         &realized_pnl_map,
+        &attr_window_fire_rate,
         settled_count,
     )
     .await
@@ -1352,6 +1354,20 @@ fn clamp_weight(w: Decimal) -> Decimal {
 ///   1. REALIZED-P&L-BASED (when the signal has attributed realized P&L from settled positions):
 ///      target = 1.0 + realized_pnl / PNL_SCALE, clamped [MIN, MAX]. Net-winners get BOOSTED above
 ///      1.0; net-losers get trimmed below. This is real outcome-driven learning.
+///
+///      RECENCY-OF-ACTIVITY DISCOUNT: the realized P&L was earned over the settled-market window. If a
+///      signal's RECENT fire-rate has collapsed relative to that window (it was active when it earned
+///      the credit but has since gone quiet), crediting/debiting it on that stale evidence is unsafe:
+///      the boost/trim is mostly inert while it's silent (low fire-rate ⇒ low fusion contribution) but
+///      leaves it over-/under-trusted on stale evidence the moment it fires again. So the deviation
+///      from neutral is scaled by `activity = min(1, recent_fire_rate / attribution_window_fire_rate)`:
+///      a signal as active now as when it earned the P&L keeps the full adjustment; one that has gone
+///      quiet drifts back toward 1.0. This is measured as a RATIO (not an absolute floor) precisely so a
+///      selectively-firing-but-consistent signal (e.g. a volatility-gated one that fires rarely both
+///      then and now) is NOT penalized for its low absolute rate — only a genuine collapse is. The
+///      discount is gated on a minimum recent sample so a reporting gap (no recent observations) can't
+///      spuriously erase a learned weight. Distinct from #2 below: that branch handles a signal that
+///      NEVER earned P&L (dormant by design); this handles one that did, then went quiet.
 ///   2. Neutral fallback (no realized P&L yet — markets unresolved): every present signal targets 1.0,
 ///      absent → hold. A present-but-never-fired signal returns only score-0 entries, which can't
 ///      dilute the weighted-average fusion, so it is NOT trimmed for staying silent (that would bench a
@@ -1369,9 +1385,14 @@ fn compute_weight_adjustments(
     prev: &BTreeMap<String, Decimal>,
     attribution: &serde_json::Value,
     realized_pnl: &BTreeMap<String, Decimal>,
+    attr_window_fire_rate: &BTreeMap<String, Decimal>,
     settled_count: usize,
 ) -> BTreeMap<String, Decimal> {
     const STEP: Decimal = dec!(0.34);
+    // Minimum recent presence (reports the signal appeared in this window) before we trust the recent
+    // fire-rate enough to apply the recency-of-activity discount. Below this we lack a recent sample
+    // (e.g. a reporting gap), so we keep the full realized-P&L target rather than erase a learned weight.
+    const MIN_RECENT_PRESENT_FOR_DISCOUNT: i64 = 5;
     // realized_pnl is now the AVERAGE attributed P&L per market the signal drove (not a cumulative
     // sum), so the scale is per-market: ±$20 avg (≈ one full max position) → full boost (2.0) / trim
     // (0.25). This makes the boost reflect per-market quality and is immune to how many markets a
@@ -1392,10 +1413,33 @@ fn compute_weight_adjustments(
                 .get("present_in_reports")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
+            let fired = stats
+                .get("fired_nonzero_score")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             let current = prev.get(name).copied().unwrap_or(dec!(1.0));
             let target = if let Some(pnl) = realized_pnl.get(name) {
                 // Realized-P&L-based (the real learning signal).
-                clamp_weight(dec!(1.0) + (*pnl / PNL_SCALE))
+                let raw = clamp_weight(dec!(1.0) + (*pnl / PNL_SCALE));
+                // Recency-of-activity discount (see fn doc): pull the deviation from neutral back toward
+                // 1.0 in proportion to how much of the signal's earning-window activity remains. Only
+                // applied when (a) we have a recent sample to judge by and (b) we know the
+                // attribution-window baseline it was earned at; otherwise keep the raw target.
+                let recent_fire_rate = if present > 0 {
+                    Decimal::from(fired) / Decimal::from(present)
+                } else {
+                    Decimal::ZERO
+                };
+                match attr_window_fire_rate.get(name) {
+                    Some(&window_fr)
+                        if window_fr > Decimal::ZERO
+                            && present >= MIN_RECENT_PRESENT_FOR_DISCOUNT =>
+                    {
+                        let activity = (recent_fire_rate / window_fr).min(dec!(1.0));
+                        clamp_weight(dec!(1.0) + activity * (raw - dec!(1.0)))
+                    }
+                    _ => raw,
+                }
             } else if present == 0 {
                 // Entirely absent from reports this window (e.g. not wired) → leave its weight alone.
                 current
@@ -1423,13 +1467,27 @@ fn compute_weight_adjustments(
 /// feedback loop this avoids).
 /// `settled`: (market_id, realized_pnl). `dr_attr_by_market`: market_id → that market's
 /// `report.attribution` objects. Returns (per-signal CUMULATIVE realized P&L, per-signal
-/// participation = #settled markets it drove, unattributed P&L). The participation counts let the
-/// caller normalize cumulative P&L into an AVERAGE per market (so a ubiquitous signal isn't credited
-/// more just by being present everywhere).
+/// participation = #settled markets it drove, unattributed P&L, per-signal ATTRIBUTION-WINDOW
+/// fire-rate). The participation counts let the caller normalize cumulative P&L into an AVERAGE per
+/// market (so a ubiquitous signal isn't credited more just by being present everywhere). The
+/// attribution-window fire-rate (fired-with-nonzero-score reports / reports the signal was present in,
+/// measured over the SAME decision reports the P&L is attributed from) is the baseline activity level
+/// the realized P&L was earned at — weight tuning compares it against the signal's RECENT fire-rate to
+/// detect a signal that was active when it earned its credit but has since gone quiet, and discount the
+/// now-stale boost/trim accordingly.
+/// (per-signal cumulative realized P&L, per-signal participation, unattributed P&L, per-signal
+/// attribution-window fire-rate) — the output of [`attribute_pnl_to_signals`].
+type SignalPnlAttribution = (
+    BTreeMap<String, Decimal>,
+    BTreeMap<String, u32>,
+    Decimal,
+    BTreeMap<String, Decimal>,
+);
+
 fn attribute_pnl_to_signals(
     settled: &[(String, Decimal)],
     dr_attr_by_market: &BTreeMap<String, Vec<serde_json::Value>>,
-) -> (BTreeMap<String, Decimal>, BTreeMap<String, u32>, Decimal) {
+) -> SignalPnlAttribution {
     const PROCESSORS: [&str; 5] = [
         "orderbook_momentum",
         "spike_divergence",
@@ -1441,12 +1499,21 @@ fn attribute_pnl_to_signals(
     // #settled markets each signal participated in (fired with >0 influence) — for averaging.
     let mut participation: BTreeMap<String, u32> = BTreeMap::new();
     let mut unattributed = Decimal::ZERO;
+    // Per-signal present/fired tallies across ALL attribution reports (every settled market's reports),
+    // used to derive the attribution-window fire-rate. `fired` uses score-nonzero to match the recent
+    // fire-rate definition in aggregate_strategy_signal_attribution, so the two are directly comparable.
+    let mut window_present: BTreeMap<String, u32> = BTreeMap::new();
+    let mut window_fired: BTreeMap<String, u32> = BTreeMap::new();
     for (market, pnl) in settled {
         let mut influence: BTreeMap<String, Decimal> = BTreeMap::new();
         if let Some(attrs) = dr_attr_by_market.get(market) {
             for attr in attrs {
                 for name in PROCESSORS {
                     if let Some(sig) = attr.get(name) {
+                        *window_present.entry(name.to_string()).or_insert(0) += 1;
+                        if !dec_from_json(&sig["score"]).is_zero() {
+                            *window_fired.entry(name.to_string()).or_insert(0) += 1;
+                        }
                         // Influence = the signal's INTRINSIC strength (|score| × |confidence|), NOT
                         // |score| × |effective_weight|. effective_weight = confidence × learned_weight,
                         // and learned_weight is exactly what Hermes is tuning — using it here creates a
@@ -1477,7 +1544,19 @@ fn attribute_pnl_to_signals(
             unattributed += *pnl;
         }
     }
-    (per_signal, participation, unattributed)
+    // Attribution-window fire-rate per signal = fired / present over the reports the P&L came from.
+    let window_fire_rate: BTreeMap<String, Decimal> = window_present
+        .iter()
+        .filter(|(_, &present)| present > 0)
+        .map(|(name, &present)| {
+            let fired = window_fired.get(name).copied().unwrap_or(0);
+            (
+                name.clone(),
+                (Decimal::from(fired) / Decimal::from(present)).round_dp(4),
+            )
+        })
+        .collect();
+    (per_signal, participation, unattributed, window_fire_rate)
 }
 
 /// Convert cumulative per-signal P&L + participation counts into AVERAGE realized P&L per market the
@@ -1503,7 +1582,11 @@ fn average_pnl_per_market(
 /// realized P&L. Returns (summary JSON for metrics, per-signal map for weight tuning).
 async fn load_per_signal_realized_pnl(
     pool: &sqlx::PgPool,
-) -> (serde_json::Value, BTreeMap<String, Decimal>) {
+) -> (
+    serde_json::Value,
+    BTreeMap<String, Decimal>,
+    BTreeMap<String, Decimal>,
+) {
     let settled: Vec<(Option<String>, Option<Decimal>)> = sqlx::query_as(
         "SELECT payload->>'market_id', (payload->>'realized_pnl')::numeric
          FROM journal.events WHERE event_type = 'paper_position_settled'",
@@ -1533,7 +1616,7 @@ async fn load_per_signal_realized_pnl(
         dr_by_market.insert(m.clone(), attrs);
     }
 
-    let (per_signal, participation, unattributed) =
+    let (per_signal, participation, unattributed, window_fire_rate) =
         attribute_pnl_to_signals(&settled, &dr_by_market);
     // Average per market the signal drove — this (not the cumulative sum) is what tunes weights, so a
     // ubiquitous signal isn't credited more just for being present on every market.
@@ -1551,16 +1634,21 @@ async fn load_per_signal_realized_pnl(
         .iter()
         .map(|(k, v)| (k.clone(), json!(v)))
         .collect();
+    let window_fire_rate_json: serde_json::Map<String, serde_json::Value> = window_fire_rate
+        .iter()
+        .map(|(k, v)| (k.clone(), json!(v.to_string())))
+        .collect();
     let summary = json!({
         "settled_positions": settled.len(),
         "total_realized_pnl": total_realized.to_string(),
         "per_signal": per_signal_json,
         "per_signal_avg_per_market": avg_json,
         "per_signal_participation": participation_json,
+        "per_signal_attribution_window_fire_rate": window_fire_rate_json,
         "unattributed_pnl": unattributed.to_string(),
-        "note": "Realized P&L attributed to signals by decision-report influence (|score×confidence| — intrinsic, no learned-weight feedback). Weight tuning uses the AVERAGE per market driven (per_signal_avg_per_market), not the cumulative sum, so ubiquitous signals aren't over-credited. Empty until positions resolve.",
+        "note": "Realized P&L attributed to signals by decision-report influence (|score×confidence| — intrinsic, no learned-weight feedback). Weight tuning uses the AVERAGE per market driven (per_signal_avg_per_market), not the cumulative sum, so ubiquitous signals aren't over-credited. per_signal_attribution_window_fire_rate is the fire-rate the P&L was earned at — weight tuning discounts a signal's boost/trim when its RECENT fire-rate has collapsed below it (stale attribution). Empty until positions resolve.",
     });
-    (summary, avg_per_signal)
+    (summary, avg_per_signal, window_fire_rate)
 }
 
 /// Load the most recent Hermes-written processor weights (for incremental adjustment).
@@ -1603,6 +1691,7 @@ async fn maybe_update_processor_weights(
     pool: &sqlx::PgPool,
     attribution: &serde_json::Value,
     realized_pnl: &BTreeMap<String, Decimal>,
+    attr_window_fire_rate: &BTreeMap<String, Decimal>,
     settled_count: usize,
 ) -> Option<serde_json::Value> {
     if std::env::var("HERMES_AUTONOMOUS_WEIGHT_TUNING")
@@ -1632,7 +1721,13 @@ async fn maybe_update_processor_weights(
     }
 
     let prev = load_prev_weights(pool).await;
-    let next = compute_weight_adjustments(&prev, attribution, realized_pnl, settled_count);
+    let next = compute_weight_adjustments(
+        &prev,
+        attribution,
+        realized_pnl,
+        attr_window_fire_rate,
+        settled_count,
+    );
     if next.is_empty() {
         return None;
     }
@@ -1953,7 +2048,8 @@ mod tests {
         let mut prev: BTreeMap<String, Decimal> = BTreeMap::new();
         prev.insert("spike_divergence".to_string(), dec!(0.501)); // benched at the floor by the old bug
         let no_pnl: BTreeMap<String, Decimal> = BTreeMap::new();
-        let next = compute_weight_adjustments(&prev, &attribution, &no_pnl, 40);
+        let no_window: BTreeMap<String, Decimal> = BTreeMap::new();
+        let next = compute_weight_adjustments(&prev, &attribution, &no_pnl, &no_window, 40);
 
         // active processor held at neutral (target 1.0, already there)
         assert_eq!(next.get("overreaction_fade").copied().unwrap(), dec!(1.0));
@@ -1965,7 +2061,7 @@ mod tests {
         );
         assert!(sd <= dec!(1.0));
         // a second cycle keeps recovering toward neutral (gradual)
-        let next2 = compute_weight_adjustments(&next, &attribution, &no_pnl, 40);
+        let next2 = compute_weight_adjustments(&next, &attribution, &no_pnl, &no_window, 40);
         assert!(next2.get("spike_divergence").copied().unwrap() > sd);
     }
 
@@ -1980,7 +2076,8 @@ mod tests {
         let mut prev = BTreeMap::new();
         prev.insert("spike_divergence".to_string(), dec!(0.26));
         let no_pnl: BTreeMap<String, Decimal> = BTreeMap::new();
-        let next = compute_weight_adjustments(&prev, &attribution, &no_pnl, 40);
+        let no_window: BTreeMap<String, Decimal> = BTreeMap::new();
+        let next = compute_weight_adjustments(&prev, &attribution, &no_pnl, &no_window, 40);
         // absent → hold at the prior weight, and never below the floor
         assert_eq!(next.get("spike_divergence").copied().unwrap(), dec!(0.26));
         assert!(next.get("spike_divergence").copied().unwrap() >= dec!(0.25));
@@ -1999,7 +2096,7 @@ mod tests {
                 "news_sentiment": {"score": "0", "confidence": "0.1"},
             })],
         );
-        let (per_signal, participation, unattributed) =
+        let (per_signal, participation, unattributed, _window_fr) =
             attribute_pnl_to_signals(&[("M1".to_string(), dec!(-20))], &dr_by_market);
         assert_eq!(
             per_signal.get("overreaction_fade").copied().unwrap(),
@@ -2010,16 +2107,20 @@ mod tests {
 
         // Weight tuning now consumes the AVERAGE per market (scale $20): a −$10 avg → trimmed, a +$20
         // avg → boosted to the cap.
+        // present_in_reports = 3 (< MIN_RECENT_PRESENT_FOR_DISCOUNT) so the recency discount is inactive
+        // here and these assertions exercise the raw realized-P&L target (the staleness discount has its
+        // own dedicated test below).
         let attribution = json!({"per_processor": {
             "overreaction_fade": {"present_in_reports": 3, "fired_nonzero_score": 3},
             "news_sentiment": {"present_in_reports": 3, "fired_nonzero_score": 3},
         }});
         let prev: BTreeMap<String, Decimal> = BTreeMap::new();
+        let no_window: BTreeMap<String, Decimal> = BTreeMap::new();
         let mut realized = BTreeMap::new();
         realized.insert("overreaction_fade".to_string(), dec!(-10)); // loser, −$10 avg/market
         realized.insert("news_sentiment".to_string(), dec!(20)); // winner, +$20 avg/market
                                                                  // settled_count = 40 (full confidence) so the step is the full 0.34 used in these assertions.
-        let next = compute_weight_adjustments(&prev, &attribution, &realized, 40);
+        let next = compute_weight_adjustments(&prev, &attribution, &realized, &no_window, 40);
         // loser target = 1 + (-10/20) = 0.5 → 1.0 + 0.34*(0.5-1.0) = 0.83
         assert_eq!(next.get("overreaction_fade").copied().unwrap(), dec!(0.83));
         // winner target = 1 + (20/20) = 2.0 → 1.0 + 0.34*(2.0-1.0) = 1.34 (boosted ABOVE 1.0)
@@ -2027,7 +2128,7 @@ mod tests {
 
         // SAME inputs but a THIN settled sample (10) → the step is damped (10/40 * 0.34 = 0.085), so
         // the moves are much smaller and the weights drift instead of lurching.
-        let damped = compute_weight_adjustments(&prev, &attribution, &realized, 10);
+        let damped = compute_weight_adjustments(&prev, &attribution, &realized, &no_window, 10);
         // loser: 1.0 + 0.085*(0.5-1.0) = 0.9575 → 0.958 (vs 0.83 at full confidence)
         assert_eq!(
             damped.get("overreaction_fade").copied().unwrap(),
@@ -2047,6 +2148,51 @@ mod tests {
     }
 
     #[test]
+    fn weight_tuning_discounts_boost_for_signal_that_went_quiet() {
+        // Three signals all earned the SAME strong realized P&L (+$20/market → raw target 2.0), but
+        // differ in how their RECENT activity compares to the window the P&L was earned at:
+        //   - news_sentiment: fired ~20% when it earned the credit, now fires ~2% (a real COLLAPSE) →
+        //     its stale boost must be discounted hard, back toward neutral.
+        //   - spike_divergence: fired ~5% then and ~5% now (selective BY DESIGN, no collapse) → it must
+        //     keep the FULL boost; a low absolute rate alone must not penalize it (32e1edd philosophy).
+        //   - orderbook_momentum: barely present recently (present < min sample) → reporting-gap gate
+        //     keeps the full target rather than erasing the learned weight on a thin recent sample.
+        let attribution = json!({"per_processor": {
+            // 200 present / 4 fired = 2% recent vs 20% window → collapse
+            "news_sentiment":     {"present_in_reports": 200, "fired_nonzero_score": 4},
+            // 200 present / 10 fired = 5% recent == 5% window → consistent, no collapse
+            "spike_divergence":   {"present_in_reports": 200, "fired_nonzero_score": 10},
+            // only 3 present recently → below MIN_RECENT_PRESENT_FOR_DISCOUNT
+            "orderbook_momentum": {"present_in_reports": 3,   "fired_nonzero_score": 0},
+        }});
+        let mut window_fr: BTreeMap<String, Decimal> = BTreeMap::new();
+        window_fr.insert("news_sentiment".to_string(), dec!(0.20));
+        window_fr.insert("spike_divergence".to_string(), dec!(0.05));
+        window_fr.insert("orderbook_momentum".to_string(), dec!(0.50));
+        let mut realized = BTreeMap::new();
+        realized.insert("news_sentiment".to_string(), dec!(20));
+        realized.insert("spike_divergence".to_string(), dec!(20));
+        realized.insert("orderbook_momentum".to_string(), dec!(20));
+        let prev: BTreeMap<String, Decimal> = BTreeMap::new();
+        let next = compute_weight_adjustments(&prev, &attribution, &realized, &window_fr, 40);
+
+        // news_sentiment: activity = 0.02/0.20 = 0.1 → target 1.0 + 0.1*(2.0-1.0) = 1.1 →
+        // 1.0 + 0.34*(1.1-1.0) = 1.034. Far below the undiscounted 1.34.
+        assert_eq!(next.get("news_sentiment").copied().unwrap(), dec!(1.034));
+        // spike_divergence: activity = 0.05/0.05 = 1.0 (capped) → full boost, identical to no discount.
+        assert_eq!(next.get("spike_divergence").copied().unwrap(), dec!(1.34));
+        // orderbook_momentum: recent sample too thin to judge → full target kept (no erasure).
+        assert_eq!(next.get("orderbook_momentum").copied().unwrap(), dec!(1.34));
+
+        // The collapsed signal is boosted strictly less than the consistent one despite identical P&L.
+        assert!(
+            next.get("news_sentiment").copied().unwrap()
+                < next.get("spike_divergence").copied().unwrap(),
+            "a signal that went quiet must be trusted less than a consistently-active one with the same P&L"
+        );
+    }
+
+    #[test]
     fn attribution_ignores_learned_weight_no_feedback_loop() {
         use super::attribute_pnl_to_signals;
         // Two signals fire with EQUAL intrinsic strength (score×confidence) but very different
@@ -2062,7 +2208,7 @@ mod tests {
                 "news_sentiment":     {"score": "0.2", "confidence": "0.3", "effective_weight": "0.1"},
             })],
         );
-        let (per_signal, _participation, unattributed) =
+        let (per_signal, _participation, unattributed, _window_fr) =
             attribute_pnl_to_signals(&[("M1".to_string(), dec!(10))], &dr_by_market);
         // ...so each gets exactly half of the +$10 despite the 90x effective_weight gap.
         assert_eq!(
@@ -2099,7 +2245,7 @@ mod tests {
             ("D".to_string(), dec!(10)),
             ("E".to_string(), dec!(40)),
         ];
-        let (cumulative, participation, _) = attribute_pnl_to_signals(&settled, &dr);
+        let (cumulative, participation, _, _) = attribute_pnl_to_signals(&settled, &dr);
         // identical cumulative...
         assert_eq!(
             cumulative.get("orderbook_momentum").copied().unwrap(),
