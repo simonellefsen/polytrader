@@ -380,6 +380,70 @@ async fn current_portfolio_usdc(pool: &sqlx::PgPool) -> rust_decimal::Decimal {
 /// Minimal 5-min DR producer (called from dedicated spawn; reuses existing patterns).
 /// Produces DecisionReport via fuse_net (net_edge_after_fees PRIMARY), journals 'decision_report' event (reuse jsonb).
 /// No submit, no real, paper-only. See long RISK comment at spawn site.
+/// One side's fused decision for a market (the result of evaluating "buy this outcome").
+struct SideEval {
+    outcome: &'static str,
+    mid: rust_decimal::Decimal,
+    gross: rust_decimal::Decimal,
+    net: rust_decimal::Decimal,
+    attr: serde_json::Value,
+}
+
+/// Build the per-side snapshot (recent move + book + shared external/resolution context) and fuse it,
+/// returning the side's gross/net edge + attribution. Shared by the default (cheaper-side) path and the
+/// opt-in both-sides path so the fusion math is identical for either. `external` and `days_to_resolution`
+/// are market-level (fetched once by the caller and reused for both sides — important: news is metered).
+/// Returns `None` on an invalid mid or a fusion error (logged; the market is then skipped/ignored).
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_dr_side(
+    pool: &sqlx::PgPool,
+    engine: &FusionEngine,
+    gamma_id: &str,
+    outcome: &'static str,
+    mid: rust_decimal::Decimal,
+    external: &serde_json::Value,
+    days_to_resolution: Option<rust_decimal::Decimal>,
+    ctx: &serde_json::Value,
+    fee_ctx: &FeeContext,
+    notional: rust_decimal::Decimal,
+) -> Option<SideEval> {
+    if !(mid >= dec!(0) && mid <= dec!(1)) {
+        warn!(market = %gamma_id, outcome, mid = %mid, "invalid mid; skipping side (robust)");
+        return None;
+    }
+    let recent_move_signed = compute_recent_move_signed(pool, gamma_id, outcome, mid).await;
+    let recent_move = recent_move_signed.abs();
+    let (book_bids, book_asks) = fetch_latest_book(pool, gamma_id, outcome).await;
+    let mut snapshot = serde_json::json!({
+        "gamma_id": gamma_id,
+        "target_outcome": outcome,
+        "target_mid": mid.to_string(),
+        "recent_move": recent_move.to_string(),
+        "recent_move_signed": recent_move_signed.to_string(),
+        "bids": book_bids,
+        "asks": book_asks,
+        "external": external,
+        "paper_only": true,
+        "source": "5min_dr_generator"
+    });
+    if let Some(d) = days_to_resolution {
+        snapshot["days_to_resolution"] = serde_json::json!(d.to_string());
+    }
+    match engine.fuse_net(&snapshot, ctx, Some(fee_ctx), notional) {
+        Ok((gross, net, attr)) => Some(SideEval {
+            outcome,
+            mid,
+            gross,
+            net,
+            attr,
+        }),
+        Err(e) => {
+            warn!(market = %gamma_id, outcome, error = %e, "fuse_net failed for side (robust; skip)");
+            None
+        }
+    }
+}
+
 async fn produce_5min_decision_report(
     pool: &sqlx::PgPool,
     journal: &Arc<JournalWriter>,
@@ -445,29 +509,19 @@ async fn produce_5min_decision_report(
     // (reuse when aligning). This ensures net_edge_after_fees is the "PRIMARY signal for deliberate 5-min tier".
     let realistic_notional = dec!(10);
 
+    // Side selection mode. Default: target the cheaper side (historical behavior). Opt-in via
+    // POLYTRADER_DR_EVAL_BOTH_SIDES=on: evaluate BOTH outcomes and target whichever has the higher net
+    // edge after fees — so the DR/executor can buy a favorite when the signals support it (e.g. theta's
+    // converging-favorite case, or the calibration finding that high-conviction bets are underpriced),
+    // instead of being locked to the underdog. Paper-only; the net-edge gate + Kelly still govern.
+    let eval_both_sides = std::env::var("POLYTRADER_DR_EVAL_BOTH_SIDES")
+        .map(|v| v.trim().eq_ignore_ascii_case("on"))
+        .unwrap_or(false);
+
     for (gamma_id, slug, my, mn, end_date_iso) in markets {
-        let (target_outcome, target_mid) = if my.unwrap_or(dec!(0)) <= mn.unwrap_or(dec!(0)) {
-            ("Yes", my.unwrap_or(dec!(0.5)))
-        } else {
-            ("No", mn.unwrap_or(dec!(0.5)))
-        };
-        // Skeleton choice (Issues 9/14 review): pick lower/equal-priced side as target for initial DR (arbitrary for limited wiring; fuller generator per goals "Ranked list of top opportunities" + multi-signal will use processor direction + filters). net_edge_after_fees remains PRIMARY signal regardless (per strategy/DecisionReport + fees wiki 4-6% min net); see long RISK at spawn + "limited (no full ranked... see goals)" non-overclaim.
-        // Explicit bounds (Issue 15 review): mids from public ingester/market_data are trusted but validate 0..=1 at generator input boundary (PRIMARY net_edge signal); warn+skip malformed (additive defense; paper-only; no change to limited skeleton or "skeleton vs production"). See RISK at spawn.
-        if !(target_mid >= dec!(0) && target_mid <= dec!(1)) {
-            warn!(market = %gamma_id, mid = %target_mid, "invalid mid from market_data; skipping DR (robust)");
-            continue;
-        }
-        // Recent price move for this outcome (volatility guard input): compare current mid to the
-        // oldest mid in the last ~3h of snapshots. A large move = the extreme price is NEW (genuine
-        // overreaction to fade); a stable extreme is likely correctly priced (no overreaction).
-        let recent_move_signed =
-            compute_recent_move_signed(pool, &gamma_id, target_outcome, target_mid).await;
-        let recent_move = recent_move_signed.abs();
-        // Latest orderbook for the target token — feeds orderbook_momentum + spike_divergence (and the
-        // overreaction book-confirmation bonus), which were previously starved (snapshot carried no book).
-        let (book_bids, book_asks) = fetch_latest_book(pool, &gamma_id, target_outcome).await;
         // External advisory context: Yahoo spot (free, every cycle) + newsdata.io news (metered —
-        // 200 credits/day, so cached per market with a daily budget cap). Best-effort.
+        // 200 credits/day, so cached per market with a daily budget cap). Market-level (same for both
+        // outcomes) — fetched ONCE and reused across sides so both-sides eval doesn't double news spend.
         let mut external = serde_json::Map::new();
         if let (true, Some(c)) = (external_enabled, &http_client) {
             if let Some(y) = crate::strategy::fetch_yahoo_context(c, &slug).await {
@@ -494,101 +548,131 @@ async fn produce_5min_decision_report(
                 let secs = (end.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
                 (rust_decimal::Decimal::from(secs) / dec!(86400)).round_dp(4)
             });
-        let mut snapshot = serde_json::json!({
-            "gamma_id": gamma_id,
-            "target_outcome": target_outcome,
-            "target_mid": target_mid.to_string(),
-            "recent_move": recent_move.to_string(),
-            "recent_move_signed": recent_move_signed.to_string(),
-            "bids": book_bids,
-            "asks": book_asks,
-            "external": external,
-            "paper_only": true,
-            "source": "5min_dr_generator"
-        });
-        if let Some(d) = days_to_resolution {
-            snapshot["days_to_resolution"] = serde_json::json!(d.to_string());
-        }
         let ctx = serde_json::json!({
             "paper_only": true,
             "tier": "5min_dr_cadence",
             "min_net_edge_for_trade": crate::risk::RiskConfig::from_env().min_net_edge.to_string(),
             "costing_notional": realistic_notional.to_string()
         });
-        match engine.fuse_net(&snapshot, &ctx, Some(&fee_ctx), realistic_notional) {
-            Ok((gross, net, attr)) => {
-                let report = DecisionReport {
-                    fused_gross_edge: gross,
-                    net_edge_after_fees: net,
-                    confidence: dec!(0.5),
-                    attribution: attr,
+
+        // Candidate side(s): the cheaper side always; the other side too when both-sides eval is on.
+        let cheaper_is_yes = my.unwrap_or(dec!(0)) <= mn.unwrap_or(dec!(0));
+        let (cheap_outcome, cheap_mid): (&'static str, rust_decimal::Decimal) = if cheaper_is_yes {
+            ("Yes", my.unwrap_or(dec!(0.5)))
+        } else {
+            ("No", mn.unwrap_or(dec!(0.5)))
+        };
+        let mut candidates: Vec<(&'static str, rust_decimal::Decimal)> =
+            vec![(cheap_outcome, cheap_mid)];
+        if eval_both_sides {
+            let (other_outcome, other_mid): (&'static str, rust_decimal::Decimal) =
+                if cheaper_is_yes {
+                    ("No", mn.unwrap_or(dec!(0.5)))
+                } else {
+                    ("Yes", my.unwrap_or(dec!(0.5)))
                 };
+            candidates.push((other_outcome, other_mid));
+        }
 
-                // Kelly sizing recommendation (for Hermes attribution; no auto-submit).
-                // win_prob ≈ target_mid + net_edge (crude but directionally correct).
-                // RISK: this is a rough estimate; always apply fractional Kelly + caps.
-                let portfolio_usdc = current_portfolio_usdc(pool).await;
-                let win_prob = (target_mid + net).min(dec!(0.99)).max(dec!(0.01));
-                let risk_mgr = RiskManager::from_env();
-                let sizing = risk_mgr.kelly_size(win_prob, target_mid, portfolio_usdc);
+        let mut evals: Vec<SideEval> = Vec::new();
+        for (outcome, mid) in candidates {
+            if let Some(e) = evaluate_dr_side(
+                pool,
+                &engine,
+                &gamma_id,
+                outcome,
+                mid,
+                &external,
+                days_to_resolution,
+                &ctx,
+                &fee_ctx,
+                realistic_notional,
+            )
+            .await
+            {
+                evals.push(e);
+            }
+        }
+        // Target the side with the highest net edge after fees (the single candidate when eval is off).
+        let Some(chosen) = evals.into_iter().max_by(|a, b| a.net.cmp(&b.net)) else {
+            continue; // no valid side (e.g. invalid mids) — skip this market
+        };
+        let target_outcome = chosen.outcome;
+        let target_mid = chosen.mid;
+        let side_selection = if eval_both_sides {
+            "both_sides_best_net_edge"
+        } else {
+            "cheaper_side_default"
+        };
+        let (gross, net, attr) = (chosen.gross, chosen.net, chosen.attr);
+        let report = DecisionReport {
+            fused_gross_edge: gross,
+            net_edge_after_fees: net,
+            confidence: dec!(0.5),
+            attribution: attr,
+        };
 
-                let payload = serde_json::json!({
-                    "report": {
-                        "fused_gross_edge": report.fused_gross_edge.to_string(),
-                        "net_edge_after_fees": report.net_edge_after_fees.to_string(),
-                        "confidence": report.confidence.to_string(),
-                        "attribution": report.attribution
-                    },
-                    "kelly_sizing": {
-                        "recommended_usdc": sizing.recommended_usdc.to_string(),
-                        "kelly_usdc": sizing.kelly_usdc.to_string(),
-                        "capped_by": sizing.capped_by,
-                        "rationale": sizing.rationale,
-                        "portfolio_usdc": portfolio_usdc.to_string(),
-                        "win_prob_estimate": win_prob.to_string(),
-                    },
-                    "market_id": gamma_id,
-                    "target_outcome": target_outcome,
-                    "target_mid": target_mid.to_string(),
-                    "generated_by": "5min_dr_cadence_in_main",
-                    "paper_only": true,
-                    "real_orders_enabled": false,
-                    "note": "5-min DR per goals-and-operational-cadence.md + strategy/DecisionReport + fuse_net; net_edge_after_fees is PRIMARY signal for deliberate tier (4-6% min net per goals); journaled for Hermes clob_safety + reflections + future attribution (vs approvals/fills); no auto-submit (per goals optional behind flag). See wiki/strategies/goals-and-operational-cadence.md + decisions/real-order-approval-flow.md."
-                });
-                // Capture id for audit (Issue 10 review); writer logs at debug. Robust: warn on err, do not crash loop (per plan "smallest").
-                match journal
-                    .record_journal_event("decision_report", "polytrader_5min_dr", "info", payload)
-                    .await
-                {
-                    Ok(id) => {
-                        tracing::debug!(id = %id, market = %gamma_id, "decision_report journaled");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, market = %gamma_id, "failed to journal decision_report (robust; continue)");
-                    }
-                }
+        // Kelly sizing recommendation (for Hermes attribution; no auto-submit).
+        // win_prob ≈ target_mid + net_edge (crude but directionally correct).
+        // RISK: this is a rough estimate; always apply fractional Kelly + caps.
+        let portfolio_usdc = current_portfolio_usdc(pool).await;
+        let win_prob = (target_mid + net).min(dec!(0.99)).max(dec!(0.01));
+        let risk_mgr = RiskManager::from_env();
+        let sizing = risk_mgr.kelly_size(win_prob, target_mid, portfolio_usdc);
 
-                // Autonomous executor: take this opportunity through the risk gate and (if approved
-                // + enabled) place a Kelly-sized paper order. Gated + paper-only; errors never abort.
-                if let Err(e) = maybe_execute_opportunity(
-                    pool,
-                    journal,
-                    paper_engine,
-                    &gamma_id,
-                    &slug,
-                    target_outcome,
-                    target_mid,
-                    net,
-                    &sizing,
-                )
-                .await
-                {
-                    warn!(error = %e, market = %gamma_id, "autonomous execution error (paper-only; continue)");
-                }
+        let payload = serde_json::json!({
+            "report": {
+                "fused_gross_edge": report.fused_gross_edge.to_string(),
+                "net_edge_after_fees": report.net_edge_after_fees.to_string(),
+                "confidence": report.confidence.to_string(),
+                "attribution": report.attribution
+            },
+            "kelly_sizing": {
+                "recommended_usdc": sizing.recommended_usdc.to_string(),
+                "kelly_usdc": sizing.kelly_usdc.to_string(),
+                "capped_by": sizing.capped_by,
+                "rationale": sizing.rationale,
+                "portfolio_usdc": portfolio_usdc.to_string(),
+                "win_prob_estimate": win_prob.to_string(),
+            },
+            "market_id": gamma_id,
+            "target_outcome": target_outcome,
+            "target_mid": target_mid.to_string(),
+            "side_selection": side_selection,
+            "generated_by": "5min_dr_cadence_in_main",
+            "paper_only": true,
+            "real_orders_enabled": false,
+            "note": "5-min DR per goals-and-operational-cadence.md + strategy/DecisionReport + fuse_net; net_edge_after_fees is PRIMARY signal for deliberate tier (4-6% min net per goals); journaled for Hermes clob_safety + reflections + future attribution (vs approvals/fills); no auto-submit (per goals optional behind flag). See wiki/strategies/goals-and-operational-cadence.md + decisions/real-order-approval-flow.md."
+        });
+        // Capture id for audit (Issue 10 review); writer logs at debug. Robust: warn on err, do not crash loop (per plan "smallest").
+        match journal
+            .record_journal_event("decision_report", "polytrader_5min_dr", "info", payload)
+            .await
+        {
+            Ok(id) => {
+                tracing::debug!(id = %id, market = %gamma_id, "decision_report journaled");
             }
             Err(e) => {
-                warn!(error = %e, market = %gamma_id, "fuse_net failed for 5min DR (paper-only; degrade)");
+                warn!(error = %e, market = %gamma_id, "failed to journal decision_report (robust; continue)");
             }
+        }
+
+        // Autonomous executor: take this opportunity through the risk gate and (if approved
+        // + enabled) place a Kelly-sized paper order. Gated + paper-only; errors never abort.
+        if let Err(e) = maybe_execute_opportunity(
+            pool,
+            journal,
+            paper_engine,
+            &gamma_id,
+            &slug,
+            target_outcome,
+            target_mid,
+            net,
+            &sizing,
+        )
+        .await
+        {
+            warn!(error = %e, market = %gamma_id, "autonomous execution error (paper-only; continue)");
         }
     }
     Ok(())
