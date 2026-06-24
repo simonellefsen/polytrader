@@ -103,7 +103,15 @@ rate-limited.** That framing drives the tier ordering below.
   news-heavy for geopolitics vs momentum for sports. Needs Tier 1 data first.
 - **Generalize the shadow framework** — run N parallel shadow configs so any proposed change is
   validated as a shadow strategy before promotion.
-- **Calibration scorecard** — Brier score / reliability curve on `win_prob_estimate` vs outcomes.
+- **Calibration scorecard. ✅ DONE (2026-06-24, commit bd77832).** Brier score + reliability curve on the
+  model's entry `win_prob_estimate` vs actual settled outcomes, in Hermes reflection metrics
+  (`calibration`). Entry-report anchored (same basis as P&L attribution); reports Brier, the climatology
+  reference + Brier **skill** score, and 5 reliability buckets. **First live read (12 settled): Brier
+  0.176 vs 0.243 ref → skill +0.28** (beats base-rate), but the buckets show the model is mildly
+  **overconfident on low-conviction bets** (predicted ~0.35, won 0.25) and **underconfident on
+  high-conviction ones** (predicted ~0.66, won 1.00, n=3). Thin sample, caveated; auto-sharpens as
+  markets resolve. Potential future use: a confidence-recalibration map, or sizing more aggressively on
+  high-conviction signals once the high-end underconfidence holds up on more data.
 
 ## Tier 4 — Ops polish
 
@@ -278,3 +286,7 @@ unit-testable) and is the prerequisite:
   monitoring. Noted the 7d signal-health aggregate is a seq scan (warm ~420ms, cold ~2.67s); a partial
   index `events(created_at) WHERE event_type='decision_report'` would help but is a schema migration
   (deferred — warm perf is acceptable for the 10-min cycle / on-demand dashboard).
+- **2026-06-24** — **Calibration scorecard DONE** (commit bd77832, Tier 3). Brier + reliability buckets
+  on entry `win_prob_estimate` vs outcomes, in Hermes reflection metrics. First live read: skill +0.28,
+  model underconfident on high-conviction bets. Pure `compute_calibration` unit-tested; join is
+  entry-report anchored (reuses the Tier 1.3 basis).
