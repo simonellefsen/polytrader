@@ -465,9 +465,18 @@ async fn produce_5min_decision_report(
         Option<String>,
     );
     let markets: Vec<DrMarketRow> = sqlx::query_as(
+        // resolved_outcome IS NULL: never generate a DR for an already-resolved market. Without this a
+        // resolved-but-still-`active` market is re-entered every cycle and `settle_resolved_positions`
+        // settles it immediately (open→settle→open→settle), pumping phantom realized P&L and producing
+        // the sawtooth P&L chart. (Surfaced 2026-06-24: us-iran-nuclear-deal-by-july-31 settled 20×/day
+        // at +$0.20.) closed = false is the belt-and-suspenders companion: a market that has closed but
+        // is not yet UMA-resolved still isn't tradeable, so it should never produce a DR or be entered
+        // either (Polymarket leaves both `active=true` after a market closes/resolves).
         "SELECT gamma_id, slug, last_mid_yes, last_mid_no, raw_json->>'end_date'
          FROM market_data.markets
          WHERE active = true
+           AND resolved_outcome IS NULL
+           AND closed = false
            AND (last_mid_yes IS NOT NULL OR last_mid_no IS NOT NULL)
          ORDER BY updated_at DESC
          LIMIT $1",

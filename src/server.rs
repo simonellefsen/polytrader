@@ -1371,15 +1371,24 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     };
 
     // Settlements: resolved positions → realized P&L (ground truth on strategy performance).
+    // ALL settlements (not a LIMIT-25 window): the realized-P&L aggregates below (the settlements card
+    // AND the dual-gate simulation) must reconcile with the AUTHORITATIVE cumulative portfolio realized
+    // P&L in virtual_portfolio_snapshots, which is the running sum of every paper_position_settled
+    // event. Summing only the most-recent 25 events under-/over-counted wildly — e.g. when a resolved
+    // market was being re-settled every cycle, 21 of the last 25 events were phantom duplicates, which
+    // crowded out the real (mostly losing) settlements and reported settled_realized ≈ −$84 against a
+    // true portfolio realized of +$5. The display list is capped to the 25 most recent separately.
     let settle_rows: Vec<(serde_json::Value, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         "SELECT payload, created_at FROM journal.events
-         WHERE event_type = 'paper_position_settled' ORDER BY created_at DESC LIMIT 25",
+         WHERE event_type = 'paper_position_settled' ORDER BY created_at DESC",
     )
     .fetch_all(pool)
     .await
     .unwrap_or_default();
+    // Recent settlements for the UI list only (capped); aggregates below use the full set.
     let settlements: Vec<serde_json::Value> = settle_rows
         .iter()
+        .take(25)
         .map(|(p, at)| {
             serde_json::json!({
                 "at": at.to_rfc3339(),
@@ -1392,7 +1401,8 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
             })
         })
         .collect();
-    let settled_count = settlements.len();
+    // Total settled count over ALL settlements (the recent list is capped at 25 for display).
+    let settled_count = settle_rows.len();
     let settled_pnl: Decimal = settle_rows
         .iter()
         .filter_map(|(p, _)| p.get("realized_pnl")?.as_str()?.parse::<Decimal>().ok())
