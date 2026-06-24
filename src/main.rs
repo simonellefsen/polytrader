@@ -581,6 +581,48 @@ async fn produce_5min_decision_report(
 }
 
 /// Autonomous paper executor: take a passing Decision Report through the risk gate and, if approved
+/// Drawdown circuit-breaker threshold (percent) from `POLYTRADER_DRAWDOWN_HALT_PCT`. Returns `None`
+/// (breaker DISABLED — default) unless a positive percent is configured. Opt-in, mirroring the other
+/// autonomous gates; when set, new directional entries halt while NAV is >= this far below its peak.
+fn drawdown_halt_threshold() -> Option<rust_decimal::Decimal> {
+    std::env::var("POLYTRADER_DRAWDOWN_HALT_PCT")
+        .ok()
+        .and_then(|s| s.trim().parse::<rust_decimal::Decimal>().ok())
+        .filter(|t| *t > dec!(0))
+}
+
+/// Pure: is the drawdown circuit-breaker tripped? Disabled (always false) when `threshold_pct` is
+/// `None`; otherwise tripped once the current drawdown-from-peak reaches the threshold.
+fn drawdown_breaker_tripped(
+    current_dd_pct: rust_decimal::Decimal,
+    threshold_pct: Option<rust_decimal::Decimal>,
+) -> bool {
+    matches!(threshold_pct, Some(t) if current_dd_pct >= t)
+}
+
+/// Current paper-account NAV drawdown from its all-time peak, in percent (0 if there are no snapshots
+/// or no positive peak). NAV = virtual_usdc + total_locked + unrealized_pnl — the same equity
+/// definition as the /trades scorecard and the Hermes drawdown monitor.
+async fn current_drawdown_pct(pool: &sqlx::PgPool) -> rust_decimal::Decimal {
+    let row: Option<(rust_decimal::Decimal, rust_decimal::Decimal)> = sqlx::query_as(
+        "WITH eq AS (
+           SELECT as_of, (virtual_usdc + total_locked + unrealized_pnl) AS equity
+           FROM paper_trading.virtual_portfolio_snapshots)
+         SELECT COALESCE((SELECT equity FROM eq ORDER BY as_of DESC LIMIT 1), 0),
+                COALESCE((SELECT max(equity) FROM eq), 0)",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    match row {
+        Some((current, peak)) if peak > dec!(0) => {
+            ((peak - current) / peak * dec!(100)).round_dp(2)
+        }
+        _ => dec!(0),
+    }
+}
+
 /// and enabled, submit a Kelly-sized paper order. Gated by POLYTRADER_AUTONOMOUS_PAPER_EXECUTION=on
 /// (default off — pure evaluation, no orders).
 ///
@@ -609,6 +651,48 @@ async fn maybe_execute_opportunity(
     {
         return Ok(());
     }
+
+    // Drawdown circuit-breaker (opt-in via POLYTRADER_DRAWDOWN_HALT_PCT; default OFF). When the paper
+    // account NAV has fallen >= the configured % from its all-time peak, HALT new directional entries
+    // ("stop digging") until it recovers. Re-checked every cycle, so it AUTO-RESUMES once drawdown
+    // falls back below the threshold. It does NOT liquidate existing positions, and does NOT block the
+    // risk-free YES+NO arbitrage executor (which only reduces net risk). Same signal the Hermes
+    // `drawdown` monitor / drawdown_alert surface. Zero overhead when disabled (no query unless set).
+    if let Some(threshold) = drawdown_halt_threshold() {
+        let dd = current_drawdown_pct(pool).await;
+        if drawdown_breaker_tripped(dd, Some(threshold)) {
+            // De-spam: while halted, every market would trip this each cycle — journal once / hour.
+            let recent_halt: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM journal.events
+                 WHERE event_type = 'autonomous_paper_execution'
+                   AND payload->>'action' = 'halted_by_drawdown_circuit_breaker'
+                   AND created_at > now() - interval '1 hour'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+            if recent_halt == 0 {
+                let _ = journal
+                    .record_journal_event(
+                        "autonomous_paper_execution",
+                        "polytrader_executor",
+                        "warn",
+                        serde_json::json!({
+                            "action": "halted_by_drawdown_circuit_breaker",
+                            "current_drawdown_pct": dd.to_string(),
+                            "threshold_pct": threshold.to_string(),
+                            "paper_only": true,
+                            "real_orders_enabled": false,
+                            "note": "New directional entries paused: NAV drawdown from peak >= POLYTRADER_DRAWDOWN_HALT_PCT. Auto-resumes when drawdown recovers below the threshold. Existing positions untouched; risk-free arb executor unaffected.",
+                        }),
+                    )
+                    .await;
+            }
+            tracing::warn!(drawdown_pct = %dd, threshold_pct = %threshold, "drawdown circuit-breaker tripped; halting new directional entries (paper)");
+            return Ok(());
+        }
+    }
+
     // Arb-only markets (sports / World Cup): never take a directional bet — only the YES+NO
     // arbitrage executor may trade them. Skip here.
     if is_arb_only_market(slug) {
@@ -1472,8 +1556,20 @@ async fn fetch_latest_book(
 
 #[cfg(test)]
 mod tests {
-    use super::settlement_payout_and_pnl;
+    use super::{drawdown_breaker_tripped, settlement_payout_and_pnl};
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn drawdown_breaker_gating_and_threshold() {
+        // Disabled (no threshold configured) → never trips, even on a huge drawdown.
+        assert!(!drawdown_breaker_tripped(dec!(99), None));
+        // Configured at 15%: below → run, at/above → halt.
+        assert!(!drawdown_breaker_tripped(dec!(14.99), Some(dec!(15))));
+        assert!(drawdown_breaker_tripped(dec!(15), Some(dec!(15)))); // boundary halts
+        assert!(drawdown_breaker_tripped(dec!(22.5), Some(dec!(15))));
+        // At/near peak (0% drawdown) never trips a positive threshold.
+        assert!(!drawdown_breaker_tripped(dec!(0), Some(dec!(15))));
+    }
 
     #[test]
     fn settlement_winner_pays_one_per_share() {
