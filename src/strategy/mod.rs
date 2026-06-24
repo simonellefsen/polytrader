@@ -30,6 +30,7 @@
 pub mod arbitrage;
 pub mod external;
 pub mod overreaction;
+pub mod theta;
 pub mod weights;
 
 pub use arbitrage::ArbitrageScanner;
@@ -38,6 +39,7 @@ pub use external::{
     YahooFinanceProcessor,
 };
 pub use overreaction::OverreactionProcessor;
+pub use theta::ThetaConvergenceProcessor;
 pub use weights::{clamp_weight, load_processor_weights};
 
 use anyhow::Result;
@@ -321,6 +323,8 @@ impl FusionEngine {
                 Box::new(OrderbookMomentumProcessor),
                 Box::new(SpikeDivergenceProcessor),
                 Box::new(OverreactionProcessor),
+                // Time-decay convergence tilt near resolution (dormant far out; low confidence).
+                Box::new(ThetaConvergenceProcessor),
                 // External advisory signals (low confidence; risk gate still governs; Hermes learns weights).
                 Box::new(YahooFinanceProcessor),
                 Box::new(NewsSentimentProcessor),

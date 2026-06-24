@@ -1577,10 +1577,11 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     // Hermes currently weights them, and (once positions settle) the realized P&L attributed to each.
     // Fire-rate/influence are available now; realized P&L stays empty until settlements exist — the
     // same data-gate that pauses Hermes weight tuning.
-    const SIGNALS: [&str; 5] = [
+    const SIGNALS: [&str; 6] = [
         "orderbook_momentum",
         "spike_divergence",
         "overreaction_fade",
+        "theta_convergence",
         "yahoo_finance",
         "news_sentiment",
     ];
@@ -1611,11 +1612,12 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     // against a 7d baseline surfaces the slow slide. "fired" = the score string contains a 1-9 digit
     // (any nonzero decimal does; "0"/"-0"/"0.00"/absent do not) — a cast-free, robust mirror of
     // `!Decimal::is_zero()` that can't throw on a stray non-numeric score. Columns follow SIGNALS order.
-    let long_baseline: Option<(i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
+    let long_baseline: Option<(i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT count(*)::bigint,
            count(*) FILTER (WHERE payload->'report'->'attribution'->'orderbook_momentum'->>'score' ~ '[1-9]')::bigint,
            count(*) FILTER (WHERE payload->'report'->'attribution'->'spike_divergence'->>'score' ~ '[1-9]')::bigint,
            count(*) FILTER (WHERE payload->'report'->'attribution'->'overreaction_fade'->>'score' ~ '[1-9]')::bigint,
+           count(*) FILTER (WHERE payload->'report'->'attribution'->'theta_convergence'->>'score' ~ '[1-9]')::bigint,
            count(*) FILTER (WHERE payload->'report'->'attribution'->'yahoo_finance'->>'score' ~ '[1-9]')::bigint,
            count(*) FILTER (WHERE payload->'report'->'attribution'->'news_sentiment'->>'score' ~ '[1-9]')::bigint
          FROM journal.events
@@ -1625,9 +1627,9 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     .await
     .ok()
     .flatten();
-    let (baseline_7d_total, baseline_7d_fired): (i64, [i64; 5]) = match long_baseline {
-        Some((t, a, b, c, d, e)) => (t, [a, b, c, d, e]),
-        None => (0, [0; 5]),
+    let (baseline_7d_total, baseline_7d_fired): (i64, [i64; 6]) = match long_baseline {
+        Some((t, a, b, c, d, e, f)) => (t, [a, b, c, d, e, f]),
+        None => (0, [0; 6]),
     };
     // Latest Hermes weights + per-signal realized P&L (if any).
     let latest_weights: Option<serde_json::Value> = sqlx::query_scalar(
@@ -2520,10 +2522,11 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
         .map(|(m, o, s, a)| (m, (o, s, a)))
         .collect();
 
-    const SIGNALS: [&str; 5] = [
+    const SIGNALS: [&str; 6] = [
         "orderbook_momentum",
         "spike_divergence",
         "overreaction_fade",
+        "theta_convergence",
         "yahoo_finance",
         "news_sentiment",
     ];

@@ -1158,10 +1158,11 @@ fn aggregate_strategy_signal_attribution(
     arb_best_net: Option<String>,
     arb_latest_opportunity_count: i64,
 ) -> serde_json::Value {
-    const PROCESSORS: [&str; 5] = [
+    const PROCESSORS: [&str; 6] = [
         "orderbook_momentum",
         "spike_divergence",
         "overreaction_fade",
+        "theta_convergence",
         "yahoo_finance",
         "news_sentiment",
     ];
@@ -1503,10 +1504,11 @@ fn attribute_pnl_to_signals(
     settled: &[(String, Decimal)],
     dr_attr_by_market: &BTreeMap<String, Vec<serde_json::Value>>,
 ) -> SignalPnlAttribution {
-    const PROCESSORS: [&str; 5] = [
+    const PROCESSORS: [&str; 6] = [
         "orderbook_momentum",
         "spike_divergence",
         "overreaction_fade",
+        "theta_convergence",
         "yahoo_finance",
         "news_sentiment",
     ];
@@ -1727,27 +1729,28 @@ fn signal_health(baseline_pct: Decimal, recent_pct: Decimal, recent_n: i64) -> &
 
 /// Per-signal slim count-only fire-rate aggregate (total reports + per-signal fired count, in SIGNALS
 /// order) over the given interval. "fired" = the score string contains a 1-9 digit (cast-free mirror of
-/// `!Decimal::is_zero()`; can't throw on a stray non-numeric score). Returns (total, [fired; 5]).
-async fn signal_fire_counts(pool: &sqlx::PgPool, interval: &str) -> (i64, [i64; 5]) {
+/// `!Decimal::is_zero()`; can't throw on a stray non-numeric score). Returns (total, [fired; 6]).
+async fn signal_fire_counts(pool: &sqlx::PgPool, interval: &str) -> (i64, [i64; 6]) {
     // interval is a fixed internal literal ('24 hours' / '7 days'), never user input.
     let sql = format!(
         "SELECT count(*)::bigint,
            count(*) FILTER (WHERE payload->'report'->'attribution'->'orderbook_momentum'->>'score' ~ '[1-9]')::bigint,
            count(*) FILTER (WHERE payload->'report'->'attribution'->'spike_divergence'->>'score' ~ '[1-9]')::bigint,
            count(*) FILTER (WHERE payload->'report'->'attribution'->'overreaction_fade'->>'score' ~ '[1-9]')::bigint,
+           count(*) FILTER (WHERE payload->'report'->'attribution'->'theta_convergence'->>'score' ~ '[1-9]')::bigint,
            count(*) FILTER (WHERE payload->'report'->'attribution'->'yahoo_finance'->>'score' ~ '[1-9]')::bigint,
            count(*) FILTER (WHERE payload->'report'->'attribution'->'news_sentiment'->>'score' ~ '[1-9]')::bigint
          FROM journal.events
          WHERE event_type = 'decision_report' AND created_at > now() - interval '{interval}'"
     );
-    let row: Option<(i64, i64, i64, i64, i64, i64)> = sqlx::query_as(&sql)
+    let row: Option<(i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(&sql)
         .fetch_optional(pool)
         .await
         .ok()
         .flatten();
     match row {
-        Some((t, a, b, c, d, e)) => (t, [a, b, c, d, e]),
-        None => (0, [0; 5]),
+        Some((t, a, b, c, d, e, f)) => (t, [a, b, c, d, e, f]),
+        None => (0, [0; 6]),
     }
 }
 
@@ -1808,10 +1811,11 @@ async fn maybe_journal_alert(
 /// doesn't spam an alert every reflection cycle. Returns a JSON block for the reflection metrics.
 /// Append-only observability evidence (no trading effect); non-fatal — degrades to an empty block.
 async fn load_and_alert_signal_health(pool: &sqlx::PgPool) -> serde_json::Value {
-    const SIGNALS: [&str; 5] = [
+    const SIGNALS: [&str; 6] = [
         "orderbook_momentum",
         "spike_divergence",
         "overreaction_fade",
+        "theta_convergence",
         "yahoo_finance",
         "news_sentiment",
     ];

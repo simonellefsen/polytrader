@@ -22,6 +22,10 @@ pub struct Market {
     pub closed: bool,
     /// Gamma `outcomePrices`, aligned with `outcomes`. After resolution one is "1" and the rest "0".
     pub outcome_prices: Vec<String>,
+    /// Gamma `endDate` (ISO 8601, e.g. "2026-06-30T12:00:00Z"), if present. Resolution time — feeds the
+    /// theta/convergence signal's days-to-resolution. Serialized into `raw_json` as `end_date`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
 }
 
 #[derive(Clone)]
@@ -81,6 +85,11 @@ impl GammaClient {
             active: v.get("active").and_then(|a| a.as_bool()).unwrap_or(false),
             closed: v.get("closed").and_then(|c| c.as_bool()).unwrap_or(true),
             outcome_prices,
+            end_date: v
+                .get("endDate")
+                .and_then(|d| d.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
         }
     }
 

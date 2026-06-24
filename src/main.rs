@@ -392,15 +392,16 @@ async fn produce_5min_decision_report(
     // Cover the full curated bootstrap set (was 3 — too few once we hold >10 markets).
     const DR_MARKET_LIMIT: i64 = 20;
     // Active markets with mids; slug drives arb-only routing + the newsdata query.
-    // (gamma_id, slug, last_mid_yes, last_mid_no)
+    // (gamma_id, slug, last_mid_yes, last_mid_no, end_date_iso)
     type DrMarketRow = (
         String,
         String,
         Option<rust_decimal::Decimal>,
         Option<rust_decimal::Decimal>,
+        Option<String>,
     );
     let markets: Vec<DrMarketRow> = sqlx::query_as(
-        "SELECT gamma_id, slug, last_mid_yes, last_mid_no
+        "SELECT gamma_id, slug, last_mid_yes, last_mid_no, raw_json->>'end_date'
          FROM market_data.markets
          WHERE active = true
            AND (last_mid_yes IS NOT NULL OR last_mid_no IS NOT NULL)
@@ -444,7 +445,7 @@ async fn produce_5min_decision_report(
     // (reuse when aligning). This ensures net_edge_after_fees is the "PRIMARY signal for deliberate 5-min tier".
     let realistic_notional = dec!(10);
 
-    for (gamma_id, slug, my, mn) in markets {
+    for (gamma_id, slug, my, mn, end_date_iso) in markets {
         let (target_outcome, target_mid) = if my.unwrap_or(dec!(0)) <= mn.unwrap_or(dec!(0)) {
             ("Yes", my.unwrap_or(dec!(0.5)))
         } else {
@@ -483,7 +484,17 @@ async fn produce_5min_decision_report(
             }
         }
         let external = serde_json::Value::Object(external);
-        let snapshot = serde_json::json!({
+        // Days to resolution (for the theta/convergence signal), parsed from the market's gamma end
+        // date. Absent/unparseable (e.g. not re-ingested with end_date yet) ⇒ omitted, and theta stays
+        // dormant. Negative (already past end date, e.g. UMA dispute) is passed through; theta gates it.
+        let days_to_resolution: Option<rust_decimal::Decimal> = end_date_iso
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|end| {
+                let secs = (end.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
+                (rust_decimal::Decimal::from(secs) / dec!(86400)).round_dp(4)
+            });
+        let mut snapshot = serde_json::json!({
             "gamma_id": gamma_id,
             "target_outcome": target_outcome,
             "target_mid": target_mid.to_string(),
@@ -495,6 +506,9 @@ async fn produce_5min_decision_report(
             "paper_only": true,
             "source": "5min_dr_generator"
         });
+        if let Some(d) = days_to_resolution {
+            snapshot["days_to_resolution"] = serde_json::json!(d.to_string());
+        }
         let ctx = serde_json::json!({
             "paper_only": true,
             "tier": "5min_dr_cadence",

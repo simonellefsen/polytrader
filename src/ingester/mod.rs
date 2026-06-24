@@ -83,6 +83,7 @@ pub async fn ingest_tick(
                  closed = EXCLUDED.closed,
                  outcome_prices = EXCLUDED.outcome_prices,
                  resolved_outcome = COALESCE(EXCLUDED.resolved_outcome, market_data.markets.resolved_outcome),
+                 raw_json = EXCLUDED.raw_json,
                  updated_at = now()"#,
         )
         .bind(&m.id)
