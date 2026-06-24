@@ -121,8 +121,22 @@ caught by hand (WAL archiving flip, LLM health, signal drift), calibration dashb
   `signal_health_alert` event journaled whenever a signal degrades/goes dormant from an active weekly
   baseline. Dormant-by-design signals (quiet both windows) stay `ok` (no false alarm). Verified live:
   all signals currently `ok`, `alerts_journaled: 0`.
-  - **Follow-up (optional):** wire the same push pattern to the *other* hand-caught anomalies named in
-    this tier (WAL-archiving flip, LLM-health) so they alert too, not just signal drift.
+
+- **Push-alerts for hand-caught anomalies — LLM health. ✅ DONE (2026-06-24, commit 472d2e9).** Extended
+  the same push pattern to LLM/AI health: `journal_llm_health` already wrote a routine `llm_health` event
+  every cycle (mostly "ok" noise); it now also PUSHES a rate-limited (once/1h per status+cause)
+  `llm_health_alert` when the model is disabled/failing (out-of-credits, auth, rate-limit). No trading
+  effect (Hermes falls back to local synthesis) but AI reflections/wiki proposals pause until restored.
+  Refactored the rate-limited-journal logic into a shared `maybe_journal_alert` helper used by both the
+  signal-health and LLM-health alerts.
+  - **WAL-archiving flip — deliberately NOT in Hermes.** Investigated 2026-06-24: `pg_stat_archiver` is
+    **per-instance and misleading on replicas** — the replica `polytrader-postgres-1` showed 45,576
+    failures / last archive 2026-06-17 (frozen stats from when it was previously primary), while the
+    actual **primary `polytrader-postgres-2` archived healthily seconds before the check**. A naive
+    Hermes check would false-alarm on whichever instance its pool hit. WAL-archiving health belongs in
+    **primary-aware CNPG cluster monitoring**, not the trading meta-agent. No real issue found.
+  - **Follow-up (optional):** drawdown circuit-breaker (Tier 4 lead line) is the remaining ops item; it
+    touches the execution path (auto-pause), so it's a behavior change, not pure observability.
 
 ---
 
@@ -257,3 +271,10 @@ unit-testable) and is the prerequisite:
   multi-day-decay blindspot: `/trades` scorecard gained a 24h-vs-7d `health_7d` badge (slim cast-free
   aggregate), and Hermes now pushes rate-limited `signal_health_alert` events from its reflection loop.
   Closes the Tier 4 signal-health follow-up and the Tier 2 monitor's noted limitation.
+- **2026-06-24** — **LLM-health push-alert DONE** (commit 472d2e9) via a shared `maybe_journal_alert`
+  helper. **WAL-archiving alerting deliberately NOT built into Hermes** — investigation showed
+  `pg_stat_archiver` is per-instance and misleading on replicas (replica froze at 45k failures / last
+  archive 06-17 while the primary archived healthily in real time); it belongs in primary-aware CNPG
+  monitoring. Noted the 7d signal-health aggregate is a seq scan (warm ~420ms, cold ~2.67s); a partial
+  index `events(created_at) WHERE event_type='decision_report'` would help but is a schema migration
+  (deferred — warm perf is acceptable for the 10-min cycle / on-demand dashboard).
