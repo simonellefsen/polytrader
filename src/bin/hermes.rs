@@ -344,6 +344,10 @@ async fn do_reflection(
     // Per-signal health vs a 7d baseline + push alerts on multi-day decay (closes the loop on the
     // scorecard's pull-only 7d monitor). Non-fatal: a transient DB issue never drops the reflection.
     let signal_health = load_and_alert_signal_health(pool).await;
+
+    // Calibration scorecard: is the model's entry win_prob_estimate trustworthy? Brier + reliability
+    // buckets vs actual settled outcomes (entry-report anchored). Non-fatal; thin until markets resolve.
+    let calibration = load_calibration(pool).await;
     let settled_count = realized_pnl_summary
         .get("settled_positions")
         .and_then(|v| v.as_u64())
@@ -394,6 +398,7 @@ async fn do_reflection(
         "strategy_signal_attribution": strategy_signal_attribution.clone(),
         "per_signal_realized_pnl": realized_pnl_summary,
         "signal_health": signal_health,
+        "calibration": calibration,
         "processor_weight_tuning": processor_weight_tuning,
         "fills_in_window": fill_count,
         "total_fees_in_window": total_fees.to_string(),
@@ -1867,6 +1872,102 @@ async fn load_and_alert_signal_health(pool: &sqlx::PgPool) -> serde_json::Value 
     })
 }
 
+/// Pure: calibration scorecard from (won, predicted_win_prob_at_entry) samples — Brier score +
+/// reliability buckets. Extracted for unit testing. Brier = mean((p − o)²): 0 = perfect, 0.25 = a
+/// coin-flip forecast. The reference is the "climatology" forecast (always predict the base rate),
+/// whose Brier is base_rate·(1−base_rate); the Brier SKILL score = 1 − brier/brier_ref is positive iff
+/// the model beats that naive baseline. Reliability buckets compare avg predicted vs actual win
+/// frequency per probability band — a gap reveals systematic over-/under-confidence.
+fn compute_calibration(samples: &[(bool, Decimal)]) -> serde_json::Value {
+    let n = samples.len();
+    if n == 0 {
+        return json!({
+            "n": 0,
+            "note": "No settled positions with an entry-report win_prob yet (populates as positions resolve).",
+        });
+    }
+    let nd = Decimal::from(n as i64);
+    let wins = samples.iter().filter(|(w, _)| *w).count();
+    let base_rate = Decimal::from(wins as i64) / nd;
+    let brier = samples
+        .iter()
+        .map(|(w, p)| {
+            let o = if *w { dec!(1) } else { dec!(0) };
+            let d = *p - o;
+            d * d
+        })
+        .sum::<Decimal>()
+        / nd;
+    let brier_ref = base_rate * (dec!(1) - base_rate);
+    let skill = if brier_ref > dec!(0) {
+        Some((dec!(1) - brier / brier_ref).round_dp(3))
+    } else {
+        None
+    };
+    // Five reliability buckets: [0,0.2), [0.2,0.4), [0.4,0.6), [0.6,0.8), [0.8,1.0].
+    let mut buckets = Vec::new();
+    for b in 0..5 {
+        let lo = Decimal::from(b) / dec!(5);
+        let hi = Decimal::from(b + 1) / dec!(5);
+        let in_b: Vec<&(bool, Decimal)> = samples
+            .iter()
+            .filter(|(_, p)| *p >= lo && (*p < hi || (b == 4 && *p <= hi)))
+            .collect();
+        if in_b.is_empty() {
+            continue;
+        }
+        let cnt = in_b.len() as i64;
+        let avg_pred = in_b.iter().map(|(_, p)| *p).sum::<Decimal>() / Decimal::from(cnt);
+        let actual =
+            Decimal::from(in_b.iter().filter(|(w, _)| *w).count() as i64) / Decimal::from(cnt);
+        buckets.push(json!({
+            "range": format!("{}-{}", lo.round_dp(1), hi.round_dp(1)),
+            "n": cnt,
+            "avg_predicted": avg_pred.round_dp(3).to_string(),
+            "actual_win_freq": actual.round_dp(3).to_string(),
+        }));
+    }
+    json!({
+        "n": n,
+        "wins": wins,
+        "base_rate": base_rate.round_dp(3).to_string(),
+        "brier_score": brier.round_dp(4).to_string(),
+        "brier_reference_climatology": brier_ref.round_dp(4).to_string(),
+        "brier_skill_score": skill.map(|s| s.to_string()),
+        "reliability_buckets": buckets,
+        "note": "Calibration of the model's ENTRY win_prob_estimate vs actual settled outcomes (anchored to the entry decision report, same basis as P&L attribution). Brier lower=better (0 perfect, 0.25 coin-flip); brier_skill_score>0 beats always predicting the base rate. Reliability buckets: avg_predicted vs actual_win_freq per band — a gap = systematic over/under-confidence. Thin sample (few settled markets) — directional only.",
+    })
+}
+
+/// Load (won, entry-report win_prob) for each settled market and compute the calibration scorecard.
+/// Anchored to the ENTRY decision report (the prediction the trade was actually made on), matching the
+/// P&L attribution basis. Non-fatal: a DB error degrades to an empty (n=0) block.
+async fn load_calibration(pool: &sqlx::PgPool) -> serde_json::Value {
+    let samples: Vec<(bool, Decimal)> = sqlx::query_as(
+        "WITH settled AS (
+           SELECT DISTINCT ON (payload->>'market_id')
+                  payload->>'market_id' AS mid, (payload->>'won')::bool AS won
+           FROM journal.events WHERE event_type = 'paper_position_settled'
+           ORDER BY payload->>'market_id', created_at)
+         SELECT s.won, dr.win_prob
+         FROM settled s
+         CROSS JOIN LATERAL (
+           SELECT (d.payload->'kelly_sizing'->>'win_prob_estimate')::numeric AS win_prob
+           FROM journal.events d
+           WHERE d.event_type = 'decision_report' AND d.payload->>'market_id' = s.mid
+             AND d.created_at <= (
+               SELECT min(ex.created_at) FROM journal.events ex
+               WHERE ex.event_type = 'autonomous_paper_execution'
+                 AND ex.payload->>'action' = 'filled' AND ex.payload->>'market_id' = s.mid)
+           ORDER BY d.created_at DESC LIMIT 1) dr
+         WHERE dr.win_prob IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    compute_calibration(&samples)
+}
+
 /// Load the most recent Hermes-written processor weights (for incremental adjustment).
 async fn load_prev_weights(pool: &sqlx::PgPool) -> BTreeMap<String, Decimal> {
     let latest: Option<serde_json::Value> = sqlx::query_scalar(
@@ -2267,13 +2368,60 @@ fn augment_wiki_proposal_if_gated(
 mod tests {
     use super::{
         aggregate_strategy_signal_attribution, augment_wiki_proposal_if_gated,
-        build_final_review_decision_boundary_coverage, compute_weight_adjustments, dec_from_json,
-        signal_health,
+        build_final_review_decision_boundary_coverage, compute_calibration,
+        compute_weight_adjustments, dec_from_json, signal_health,
     };
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn calibration_brier_skill_and_buckets() {
+        // Parse a numeric field to Decimal (string assertions are brittle — round_dp doesn't pad).
+        let num = |v: &serde_json::Value, k: &str| -> Decimal {
+            v[k].as_str().unwrap().parse::<Decimal>().unwrap()
+        };
+
+        // Empty → n=0 sentinel, no panic.
+        assert_eq!(compute_calibration(&[])["n"], json!(0));
+
+        // A PERFECT forecaster: predicts 1.0 for winners, 0.0 for losers → Brier 0, skill 1.
+        let perfect = vec![
+            (true, dec!(1)),
+            (false, dec!(0)),
+            (true, dec!(1)),
+            (false, dec!(0)),
+        ];
+        let c = compute_calibration(&perfect);
+        assert_eq!(num(&c, "brier_score"), dec!(0));
+        assert_eq!(num(&c, "base_rate"), dec!(0.5));
+        assert_eq!(num(&c, "brier_skill_score"), dec!(1)); // 1 - 0/0.25
+
+        // No skill (always predicts the base rate) → Brier == reference → skill 0.
+        let no_skill = vec![
+            (true, dec!(0.5)),
+            (false, dec!(0.5)),
+            (true, dec!(0.5)),
+            (false, dec!(0.5)),
+        ];
+        let c2 = compute_calibration(&no_skill);
+        assert_eq!(
+            num(&c2, "brier_score"),
+            num(&c2, "brier_reference_climatology")
+        );
+        assert_eq!(num(&c2, "brier_skill_score"), dec!(0));
+
+        // Reliability buckets land predictions in the right band and report actual frequency.
+        // Two predictions in [0.6,0.8): one won, one lost → avg_predicted 0.7, actual_win_freq 0.5.
+        let c3 = compute_calibration(&[(true, dec!(0.7)), (false, dec!(0.7))]);
+        let buckets = c3["reliability_buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0]["range"], json!("0.6-0.8"));
+        assert_eq!(buckets[0]["n"], json!(2));
+        assert_eq!(num(&buckets[0], "avg_predicted"), dec!(0.7));
+        assert_eq!(num(&buckets[0], "actual_win_freq"), dec!(0.5));
+    }
 
     #[test]
     fn signal_health_alert_classification_matches_server() {
