@@ -87,9 +87,9 @@ rate-limited.** That framing drives the tier ordering below.
   (degraded = fire-rate >½ drop, dormant = went silent, elevated = doubled/woke up, insufficient_data,
   else ok), shown as a colored badge. Automates the manual eyeballing that caught the news
   19.9%→4.5% drop; only alarms on drops from an active (≥5%) baseline so dormant-by-design signals
-  aren't false-flagged. **Limitation:** 3h-vs-24h catches *sudden* shifts, not multi-day gradual decay
-  (a longer baseline window is a follow-up — note `news_sentiment` has slow-decayed to ~1.8% and reads
-  `ok` because the 24h baseline itself eroded).
+  aren't false-flagged. ~~**Limitation:** 3h-vs-24h catches *sudden* shifts, not multi-day gradual
+  decay.~~ **✅ Limitation fixed 2026-06-24** — see the 7-day baseline + push alert under Tier 4 below
+  (commits 5c61e7d, 5577ada).
 
 ## Tier 3 — Fusion, risk & validation
 
@@ -110,13 +110,19 @@ rate-limited.** That framing drives the tier ordering below.
 Drawdown circuit-breaker (auto-pause execution on equity drop), push-alerts for anomalies currently
 caught by hand (WAL archiving flip, LLM health, signal drift), calibration dashboard.
 
-- **Signal-health monitor — longer baseline window** (follow-up to commit 34b0a47). The current
-  3h-vs-24h comparison catches *sudden* fire-rate shifts but is blind to *multi-day gradual decay* (the
-  24h baseline erodes along with the signal — exactly what masked `news_sentiment`'s slow slide from
-  ~20% to ~1.8% over 2026-06-23, which reads `ok`). Add a long baseline (e.g. recent-24h vs a 7-day
-  baseline) so slow erosion is flagged too. Watch the row-count/memory (use a slim projection like the
-  scorecard already does). Optionally push the alert (journal a `signal_health_alert` event) rather than
-  only surfacing it in the pull-based scorecard.
+- **Signal-health monitor — longer baseline window. ✅ DONE (2026-06-24, commits 5c61e7d + 5577ada).**
+  The 3h-vs-24h comparison was blind to *multi-day gradual decay* (the 24h baseline erodes along with
+  the signal — what masked `news_sentiment`'s ~20%→~1.8% slide, reading `ok`). Now: (1) the `/trades`
+  scorecard adds a `health_7d` classification comparing the 24h fire-rate to a **7-day baseline**
+  (commit 5c61e7d), surfaced as a second badge; the baseline is a **slim count-only SQL aggregate**
+  (`count(*) FILTER` per signal, cast-free `~ '[1-9]'` zero-check, no payloads loaded — validated
+  instant over ~39k reports). (2) Hermes's reflection loop **pushes** it (commit 5577ada): a
+  `signal_health` block in reflection metrics + a rate-limited (once/6h per signal+status)
+  `signal_health_alert` event journaled whenever a signal degrades/goes dormant from an active weekly
+  baseline. Dormant-by-design signals (quiet both windows) stay `ok` (no false alarm). Verified live:
+  all signals currently `ok`, `alerts_journaled: 0`.
+  - **Follow-up (optional):** wire the same push pattern to the *other* hand-caught anomalies named in
+    this tier (WAL-archiving flip, LLM-health) so they alert too, not just signal drift.
 
 ---
 
@@ -247,3 +253,7 @@ unit-testable) and is the prerequisite:
 - **2026-06-24** — **Tier 3 strict-gate flip DROPPED.** Reconciled the "cheapest standalone win" bullet
   with the Phase 2 finding that gate threshold barely moves total P&L (~+93.2 flat across 0.02..0.06);
   the live strict-vs-lenient gap was a subset-methodology artifact, not an edge. Not worth flipping.
+- **2026-06-24** — **Signal-health longer-baseline DONE** (commits 5c61e7d + 5577ada). Fixed the
+  multi-day-decay blindspot: `/trades` scorecard gained a 24h-vs-7d `health_7d` badge (slim cast-free
+  aggregate), and Hermes now pushes rate-limited `signal_health_alert` events from its reflection loop.
+  Closes the Tier 4 signal-health follow-up and the Tier 2 monitor's noted limitation.
