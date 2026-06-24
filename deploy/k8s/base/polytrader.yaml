@@ -51,6 +51,13 @@ spec:
             # gates and place Kelly-sized PAPER orders (never real). Default off = evaluation only.
             - name: POLYTRADER_AUTONOMOUS_PAPER_EXECUTION
               value: "on"
+            # Both-sides target selection: when "on", the 5-min DR generator evaluates BOTH outcomes
+            # and targets whichever has the higher net edge after fees (instead of always the cheaper
+            # side). Lets the book buy a favorite when signals support it — unlocks theta's converging-
+            # favorite case + the calibration finding (high-conviction bets underpriced). Paper-only;
+            # net-edge gate + Kelly still govern. Default off = cheaper-side only.
+            - name: POLYTRADER_DR_EVAL_BOTH_SIDES
+              value: "on"
             # Risk gate tuning (paper-only; surfaced read-only in the /trades Parameters panel).
             # MIN_NET_EDGE is the LIVE gate (2%); SHADOW_NET_EDGE (4%) is recorded-not-enforced so the
             # /trades Gate Simulation can compare how a stricter gate would have done on the same run.
