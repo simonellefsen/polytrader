@@ -1180,9 +1180,10 @@ async fn paper_positions_handler(State(state): State<Arc<AppState>>) -> impl Int
     }
 }
 
-/// Classify a fusion signal's health from its 24h baseline vs recent (3h) fire-rate, so a silently
-/// degrading signal (e.g. a stalled news feed, a processor that stopped firing) is flagged in the
-/// scorecard instead of needing manual comparison across status checks.
+/// Classify a fusion signal's health by comparing a `recent` fire-rate against a `baseline`, so a
+/// silently degrading signal (e.g. a stalled news feed, a processor that stopped firing) is flagged in
+/// the scorecard instead of needing manual comparison across status checks. Window-agnostic: used both
+/// for 3h-vs-24h (sudden shifts) and 24h-vs-7d (slow multi-day decay).
 ///
 /// `"insufficient_data"` when too few recent reports to judge; `"elevated"` when the recent rate is
 /// notably higher than baseline (incl. a previously-quiet signal waking up); `"dormant"` when an
@@ -1603,6 +1604,31 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     .await
     .unwrap_or_default();
     let recent_total = recent_attrs.len();
+    // Long baseline (7d) per-signal fire-rate — a SLIM count-only aggregate (no payloads pulled into
+    // memory) so multi-day GRADUAL decay is caught too. The 3h-vs-24h check only sees SUDDEN shifts: when
+    // a signal erodes slowly the 24h baseline erodes with it, so the recent/baseline ratio stays ~1 and
+    // it reads "ok" — exactly how news_sentiment's ~20%→~1.8% slide hid. Comparing the 24h fire-rate
+    // against a 7d baseline surfaces the slow slide. "fired" = the score string contains a 1-9 digit
+    // (any nonzero decimal does; "0"/"-0"/"0.00"/absent do not) — a cast-free, robust mirror of
+    // `!Decimal::is_zero()` that can't throw on a stray non-numeric score. Columns follow SIGNALS order.
+    let long_baseline: Option<(i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT count(*)::bigint,
+           count(*) FILTER (WHERE payload->'report'->'attribution'->'orderbook_momentum'->>'score' ~ '[1-9]')::bigint,
+           count(*) FILTER (WHERE payload->'report'->'attribution'->'spike_divergence'->>'score' ~ '[1-9]')::bigint,
+           count(*) FILTER (WHERE payload->'report'->'attribution'->'overreaction_fade'->>'score' ~ '[1-9]')::bigint,
+           count(*) FILTER (WHERE payload->'report'->'attribution'->'yahoo_finance'->>'score' ~ '[1-9]')::bigint,
+           count(*) FILTER (WHERE payload->'report'->'attribution'->'news_sentiment'->>'score' ~ '[1-9]')::bigint
+         FROM journal.events
+         WHERE event_type = 'decision_report' AND created_at > now() - interval '7 days'",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let (baseline_7d_total, baseline_7d_fired): (i64, [i64; 5]) = match long_baseline {
+        Some((t, a, b, c, d, e)) => (t, [a, b, c, d, e]),
+        None => (0, [0; 5]),
+    };
     // Latest Hermes weights + per-signal realized P&L (if any).
     let latest_weights: Option<serde_json::Value> = sqlx::query_scalar(
         "SELECT payload FROM journal.events WHERE event_type = 'strategy_weights'
@@ -1716,7 +1742,8 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
 
     let signal_rows: Vec<serde_json::Value> = SIGNALS
         .iter()
-        .map(|name| {
+        .enumerate()
+        .map(|(idx, name)| {
             let mut fired = 0usize;
             let mut abs_sum = Decimal::ZERO;
             for attr in &dr_attrs {
@@ -1762,6 +1789,17 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
                 Decimal::ZERO
             };
             let health = signal_health(fire_rate, recent_fire_rate, recent_total);
+            // Long-baseline (7d) health: compare the 24h fire-rate to the 7d baseline to catch slow,
+            // multi-day decay the 3h-vs-24h check is blind to. Reuses the same classifier (baseline=7d,
+            // recent=24h, n=24h report count).
+            let fire_rate_7d = if baseline_7d_total > 0 {
+                (Decimal::from(baseline_7d_fired[idx]) / Decimal::from(baseline_7d_total)
+                    * Decimal::from(100))
+                .round_dp(1)
+            } else {
+                Decimal::ZERO
+            };
+            let health_7d = signal_health(fire_rate_7d, fire_rate, reports_total);
             let (settled_wins, settled_total) = settled_record_of(name);
             let settled_winrate = if settled_total > 0 {
                 (Decimal::from(settled_wins) / Decimal::from(settled_total) * Decimal::from(100))
@@ -1775,7 +1813,9 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
                 "fired": fired,
                 "fire_rate_pct": fire_rate.to_string(),
                 "recent_fire_rate_pct": recent_fire_rate.to_string(),
+                "fire_rate_7d_pct": fire_rate_7d.to_string(),
                 "health": health,
+                "health_7d": health_7d,
                 "avg_abs_score": avg_abs_score.to_string(),
                 "weight": weight_of(name),
                 "realized_pnl": realized_of(name),
@@ -1790,14 +1830,19 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
         "reports_total": reports_total,
         "recent_window_h": 3,
         "recent_total": recent_total,
+        "baseline_window_h": 168,
+        "baseline_7d_total": baseline_7d_total,
         "settled_markets": net_by_market.len(),
         "rows": signal_rows,
         "note": "Fire-rate = share of the last 24h decision reports where the signal contributed a \
-                 non-zero score. health compares the recent 3h fire-rate to the 24h baseline: \
-                 'degraded' = recent fire-rate more than halved, 'dormant' = went silent, 'elevated' = \
-                 doubled, 'insufficient_data' = <20 recent reports. Weight is Hermes's current confidence \
-                 multiplier. Settled record = win/loss of settled markets where the signal fired in the \
-                 final decision report (count-based, overlapping). Realized P&L populates at 10 settled.",
+                 non-zero score. health compares the recent 3h fire-rate to the 24h baseline (catches \
+                 SUDDEN shifts); health_7d compares the 24h fire-rate to the 7d baseline (catches \
+                 multi-day GRADUAL decay the 3h-vs-24h check is blind to — the 24h baseline erodes with \
+                 the signal). Both: 'degraded' = fire-rate more than halved, 'dormant' = went silent, \
+                 'elevated' = doubled, 'insufficient_data' = too few reports to judge. Weight is Hermes's \
+                 current confidence multiplier. Settled record = win/loss of settled markets where the \
+                 signal fired in the final decision report (count-based, overlapping). Realized P&L \
+                 populates at 10 settled.",
     });
 
     let gate_simulation = serde_json::json!({
@@ -2117,17 +2162,17 @@ function renderSignals(s){
     const cl = isNaN(wr) ? '' : (wr >= 50 ? 'pos' : 'neg');
     return `<span class="${cl}">${w}-${t-w}</span> <span class="muted">(${r.settled_winrate_pct}%)</span>`;
   };
-  const healthBadge = (h, recent) => {
+  const healthBadge = (h, title) => {
     if (!h || h === 'ok' || h === 'insufficient_data') return '';
     const col = (h === 'dormant' || h === 'degraded') ? '#f85149' : '#d29922';
-    return ` <span title="recent 3h fire-rate ${recent}% vs 24h baseline" style="font-size:10px;padding:1px 5px;border-radius:4px;border:1px solid ${col};color:${col}">${h}</span>`;
+    return ` <span title="${title}" style="font-size:10px;padding:1px 5px;border-radius:4px;border:1px solid ${col};color:${col}">${h}</span>`;
   };
   const row = (r) => {
     const rp = r.realized_pnl;
     const rpCell = (rp===null||rp===undefined) ? '<span class="muted">— pending</span>' : `<span class="${cls(rp)}">${sign(rp)}</span>`;
     return `<tr>
       <td>${pretty(r.name)}</td>
-      <td>${r.fire_rate_pct}% <span class="muted">(${r.fired})</span>${healthBadge(r.health, r.recent_fire_rate_pct)}</td>
+      <td>${r.fire_rate_pct}% <span class="muted">(${r.fired})</span>${healthBadge(r.health, `recent 3h fire-rate ${r.recent_fire_rate_pct}% vs 24h baseline (sudden shift)`)}${healthBadge(r.health_7d, `24h fire-rate ${r.fire_rate_pct}% vs 7d baseline ${r.fire_rate_7d_pct}% (multi-day trend)`)}</td>
       <td>${r.avg_abs_score}</td>
       <td class="${wcls(r.weight)}">${parseFloat(r.weight).toFixed(2)}×</td>
       <td>${recordCell(r)}</td>
@@ -11456,6 +11501,35 @@ mod tests {
         assert_eq!(signal_health(d(0), d(0), 200), "ok");
         // Fire-rate doubled.
         assert_eq!(signal_health(d(10), d(25), 200), "elevated");
+    }
+
+    #[test]
+    fn signal_health_long_baseline_catches_slow_decay() {
+        let d = Decimal::from;
+        // The blindspot the 7d baseline fixes: news_sentiment slow-decayed ~20% → ~1.8% over days.
+        // The 3h-vs-24h check reads "ok" because the 24h baseline eroded along with the signal — recent
+        // 3h (~1.8%) vs an already-eroded 24h baseline (~2%) is a steady ratio.
+        let now_3h = Decimal::new(18, 1); // 1.8%
+        let baseline_24h = d(2); // the 24h baseline has itself eroded to ~2%
+        assert_eq!(
+            signal_health(baseline_24h, now_3h, 200),
+            "ok",
+            "3h-vs-24h is blind to slow decay once the 24h baseline erodes"
+        );
+        // But comparing the 24h fire-rate (~2%) against the 7d baseline (~20%) flags the slide.
+        let baseline_7d = d(20);
+        let rate_24h = d(2);
+        assert_eq!(
+            signal_health(baseline_7d, rate_24h, 200),
+            "degraded",
+            "24h-vs-7d must flag the multi-day erosion"
+        );
+        // Fully silent over 24h vs a 7d-active baseline → dormant.
+        assert_eq!(signal_health(d(20), d(0), 200), "dormant");
+        // A genuinely dormant-by-design signal (quiet across BOTH windows) must NOT false-alarm.
+        assert_eq!(signal_health(d(0), d(0), 200), "ok");
+        // A signal steady over the week → ok (no trend alarm).
+        assert_eq!(signal_health(d(20), d(19), 200), "ok");
     }
 
     #[test]
