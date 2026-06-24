@@ -1394,13 +1394,12 @@ mod tests {
         }];
         let slug_of: BTreeMap<String, String> = BTreeMap::new();
 
-        let mk = |edge: Decimal| {
-            let mut risk = RiskConfig::default();
-            risk.min_net_edge = edge;
-            CounterfactualConfig {
-                weights: BTreeMap::new(),
-                risk,
-            }
+        let mk = |edge: Decimal| CounterfactualConfig {
+            weights: BTreeMap::new(),
+            risk: RiskConfig {
+                min_net_edge: edge,
+                ..RiskConfig::default()
+            },
         };
         let configs = vec![
             ("loose".to_string(), mk(dec!(0.02))),
