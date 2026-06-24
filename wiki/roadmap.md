@@ -79,7 +79,21 @@ rate-limited.** That framing drives the tier ordering below.
 
 - **Calibration signal** — per category, track historical implied-prob vs actual resolution; exploit
   structural over/under-pricing of "X-by-date" markets. A structural edge, not a momentum scrape.
-- **Theta / convergence signal** — near resolution, price should converge to 0/1; flag laggards.
+- **Theta / convergence signal. ✅ DONE (2026-06-24, commit 2486eae).** New 6th FusionEngine processor
+  `theta_convergence`: near resolution, lean toward the side the market already favors, scaled by
+  lean × time-urgency (`score = (mid−0.5) × (HORIZON−days)/HORIZON × GAIN`, HORIZON 14d, GAIN 0.5).
+  In the "buy the target outcome" frame (target = cheaper side), it's usually NEGATIVE on near-expiry
+  underdogs — a brake on `overreaction_fade`'s longshot buys — and positive on a favored target.
+  Dormant far out / on coin-flips / without an end date. Low confidence (≤0.45); Hermes learns its
+  weight. **Plumbing:** the gamma ingester now captures `endDate` into `raw_json` (and the upsert
+  refreshes raw_json — it didn't before, so existing rows would never gain it); the DR generator
+  computes `days_to_resolution` into the snapshot; added to all attribution/scorecard/health signal
+  lists (now 6). **Verified live:** the June-30 cluster fires correctly, e.g. mid 0.023 / 5.3d →
+  score −0.148 (underdog_converges_down_avoid_target); far-horizon markets stay neutral.
+  - **Follow-up (optional):** the pipeline always targets the *cheaper* side, so theta's positive
+    "buy the converging favorite" case rarely surfaces (the favorite isn't the target). A fuller
+    generator that can target either side would unlock that; and the calibration finding (model
+    underconfident on high-conviction bets) suggests that's where the real convergence edge is.
 - **Cross-market correlation** — related markets drifting out of line (extends the arb scanner from
   exact to *statistical* arb).
 - **Automated signal-health monitor. ✅ DONE (2026-06-23, commit 34b0a47).** The `/trades` scorecard now
@@ -308,6 +322,13 @@ unit-testable) and is the prerequisite:
 - **2026-06-24** — **Drawdown monitor + alert DONE** (Tier 4, observability half, commit bda857a).
   `drawdown` block in reflection metrics + rate-limited `drawdown_alert` on NAV fall from peak (threshold
   via HERMES_DRAWDOWN_ALERT_PCT, default 10%). Live max drawdown 1.01% → quiet.
+- **2026-06-24** — **Theta/convergence signal DONE** (Tier 2, commit 2486eae). First new FusionEngine
+  processor since the external signals: a near-resolution convergence tilt. Required plumbing the gamma
+  `endDate` through the ingester (+ fixing the upsert to refresh raw_json) into a `days_to_resolution`
+  snapshot field. Verified firing live on the June-30 cluster; dormant elsewhere. Hermes will now
+  attribute/weight it as the 6th signal. Note: theta's positive "buy the favorite" case is gated out by
+  the cheaper-side target selection — a fuller either-side generator is the unlock (ties to the
+  calibration finding that high-conviction bets are underpriced).
 - **2026-06-24** — **Drawdown circuit-breaker DONE** (Tier 4, behavior half, commit ed6142a). Opt-in
   executor halt on NAV drawdown via POLYTRADER_DRAWDOWN_HALT_PCT, **default OFF** (ships inert; verified
   disabled post-deploy). Halts new directional entries only, auto-resumes on recovery, arb path
