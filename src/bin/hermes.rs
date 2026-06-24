@@ -1741,6 +1741,56 @@ async fn signal_fire_counts(pool: &sqlx::PgPool, interval: &str) -> (i64, [i64; 
     }
 }
 
+/// Journal an alert event, RATE-LIMITED to once per `within` window for the given (payload key → value)
+/// dedup tuple, so a sustained anomaly doesn't spam an alert every reflection cycle (Hermes runs every
+/// ~10 min). `dedup` keys are fixed code-level literals (never user input); values are bound. Returns
+/// true iff an event was written. Append-only observability; non-fatal — on any DB error it SUPPRESSES
+/// (returns false) rather than risk a spam loop. Shared by the signal-health and LLM-health alerts.
+async fn maybe_journal_alert(
+    pool: &sqlx::PgPool,
+    event_type: &str,
+    source: &str,
+    severity: &str,
+    dedup: &[(&str, &str)],
+    within: &str,
+    payload: &serde_json::Value,
+) -> bool {
+    // Existence check: same event_type + same key/value tuple within the window. `within` and the dedup
+    // KEY names are fixed internal literals; only the VALUES are user/runtime data and they are bound.
+    let mut sql = format!(
+        "SELECT count(*) FROM journal.events WHERE event_type = $1 AND created_at > now() - interval '{within}'"
+    );
+    for (i, (k, _)) in dedup.iter().enumerate() {
+        sql.push_str(&format!(" AND payload->>'{k}' = ${}", i + 2));
+    }
+    let mut q = sqlx::query_scalar::<_, i64>(&sql).bind(event_type.to_string());
+    for (_, v) in dedup {
+        q = q.bind(v.to_string());
+    }
+    let recent = q.fetch_one(pool).await.unwrap_or(1); // on error, suppress
+    if recent != 0 {
+        return false;
+    }
+    let insert = sqlx::query(
+        "INSERT INTO journal.events (id, event_type, source, severity, payload)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(event_type)
+    .bind(source)
+    .bind(severity)
+    .bind(payload)
+    .execute(pool)
+    .await;
+    match insert {
+        Ok(_) => true,
+        Err(e) => {
+            warn!(error = %e, event_type, "failed to write alert event (non-fatal)");
+            false
+        }
+    }
+}
+
 /// Compute per-signal health by comparing the 24h fire-rate to a 7d baseline (catches multi-day GRADUAL
 /// decay the scorecard's 3h-vs-24h check is blind to — the 24h baseline erodes with the signal), and
 /// PUSH it: journal a `signal_health_alert` event for any signal that has degraded/gone dormant from an
@@ -1780,47 +1830,30 @@ async fn load_and_alert_signal_health(pool: &sqlx::PgPool) -> serde_json::Value 
             }),
         );
         if health == "degraded" || health == "dormant" {
-            // Rate-limit: only journal if no same-(signal,status) alert in the last 6h.
-            let recent: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM journal.events
-                 WHERE event_type = 'signal_health_alert'
-                   AND payload->>'signal' = $1 AND payload->>'status' = $2
-                   AND created_at > now() - interval '6 hours'",
+            let payload = json!({
+                "signal": name,
+                "status": health,
+                "fire_rate_24h_pct": rate_24h.to_string(),
+                "fire_rate_7d_pct": rate_7d.to_string(),
+                "baseline_window_h": 168,
+                "reports_24h_total": t24,
+                "paper_only": true,
+                "note": "Signal fire-rate degraded vs its 7-day baseline (multi-day decay the 3h-vs-24h scorecard check misses). Rate-limited to once/6h per signal+status. Observability evidence; no trading effect.",
+            });
+            // Rate-limited per (signal, status) to once / 6h.
+            if maybe_journal_alert(
+                pool,
+                "signal_health_alert",
+                "hermes_signal_health",
+                if health == "dormant" { "warn" } else { "info" },
+                &[("signal", *name), ("status", health)],
+                "6 hours",
+                &payload,
             )
-            .bind(*name)
-            .bind(health)
-            .fetch_one(pool)
             .await
-            .unwrap_or(1); // on error, suppress (don't risk a spam loop)
-            if recent == 0 {
-                let payload = json!({
-                    "signal": name,
-                    "status": health,
-                    "fire_rate_24h_pct": rate_24h.to_string(),
-                    "fire_rate_7d_pct": rate_7d.to_string(),
-                    "baseline_window_h": 168,
-                    "reports_24h_total": t24,
-                    "paper_only": true,
-                    "note": "Signal fire-rate degraded vs its 7-day baseline (multi-day decay the 3h-vs-24h scorecard check misses). Rate-limited to once/6h per signal+status. Observability evidence; no trading effect.",
-                });
-                let insert = sqlx::query(
-                    "INSERT INTO journal.events (id, event_type, source, severity, payload)
-                     VALUES ($1, $2, $3, $4, $5)",
-                )
-                .bind(Uuid::new_v4())
-                .bind("signal_health_alert")
-                .bind("hermes_signal_health")
-                .bind(if health == "dormant" { "warn" } else { "info" })
-                .bind(&payload)
-                .execute(pool)
-                .await;
-                match insert {
-                    Ok(_) => {
-                        alerts_journaled += 1;
-                        warn!(signal = *name, status = health, fire_rate_24h = %rate_24h, fire_rate_7d = %rate_7d, "signal health alert journaled (multi-day decay)");
-                    }
-                    Err(e) => warn!(error = %e, "failed to write signal_health_alert (non-fatal)"),
-                }
+            {
+                alerts_journaled += 1;
+                warn!(signal = *name, status = health, fire_rate_24h = %rate_24h, fire_rate_7d = %rate_7d, "signal health alert journaled (multi-day decay)");
             }
         }
     }
@@ -2036,6 +2069,31 @@ async fn journal_llm_health(
     .await;
     if status != "ok" {
         warn!(status, provider, model, error = ?error, "LLM health: not OK");
+        // PUSH a rate-limited alert (distinct from the routine per-cycle llm_health event above, which
+        // is written every cycle and is mostly "ok" noise). Deduped per (status, likely_cause) to once
+        // /1h. Hermes falls back to local synthesis, so there's no trading effect — but AI-quality
+        // reflections/wiki proposals pause until the model is restored, which is worth surfacing.
+        let cause = error.map(classify_llm_error).unwrap_or("unknown");
+        let alert_payload = json!({
+            "status": status,
+            "provider": provider,
+            "model": model,
+            "configured": configured,
+            "likely_cause": cause,
+            "error": error,
+            "paper_only": true,
+            "note": "LLM/AI reflection synthesis is not OK (disabled or failing). Rate-limited to once/1h per status+cause. Hermes falls back to local synthesis — no trading effect — but AI-quality reflections and gated wiki proposals pause until the model is restored.",
+        });
+        maybe_journal_alert(
+            pool,
+            "llm_health_alert",
+            "hermes_llm",
+            "warn",
+            &[("status", status), ("likely_cause", cause)],
+            "1 hour",
+            &alert_payload,
+        )
+        .await;
     } else {
         info!(provider, model, "LLM health: ok");
     }
