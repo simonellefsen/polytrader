@@ -90,10 +90,14 @@ rate-limited.** That framing drives the tier ordering below.
   computes `days_to_resolution` into the snapshot; added to all attribution/scorecard/health signal
   lists (now 6). **Verified live:** the June-30 cluster fires correctly, e.g. mid 0.023 / 5.3d →
   score −0.148 (underdog_converges_down_avoid_target); far-horizon markets stay neutral.
-  - **Follow-up (optional):** the pipeline always targets the *cheaper* side, so theta's positive
-    "buy the converging favorite" case rarely surfaces (the favorite isn't the target). A fuller
-    generator that can target either side would unlock that; and the calibration finding (model
-    underconfident on high-conviction bets) suggests that's where the real convergence edge is.
+  - **Follow-up: either-side generator. ✅ BUILT, opt-in (2026-06-24, commit ac00f9c).** The 5-min DR
+    generator can now evaluate BOTH outcomes and target the higher-net-edge side
+    (`POLYTRADER_DR_EVAL_BOTH_SIDES=on`; **default OFF** = unchanged cheaper-side behavior, verified
+    inert post-deploy). This unlocks theta's positive "buy the converging favorite" case and lets the
+    book act on the calibration finding (high-conviction bets underpriced) — but only once enabled, a
+    paper-behavior change left to the operator. Same evaluation/fusion math both ways; external (metered
+    news) fetched once per market and shared across sides. To realize the value: set the flag and let
+    Hermes attribute/learn the favorite-side trades.
 - **Cross-market correlation** — related markets drifting out of line (extends the arb scanner from
   exact to *statistical* arb).
 - **Automated signal-health monitor. ✅ DONE (2026-06-23, commit 34b0a47).** The `/trades` scorecard now
@@ -322,6 +326,11 @@ unit-testable) and is the prerequisite:
 - **2026-06-24** — **Drawdown monitor + alert DONE** (Tier 4, observability half, commit bda857a).
   `drawdown` block in reflection metrics + rate-limited `drawdown_alert` on NAV fall from peak (threshold
   via HERMES_DRAWDOWN_ALERT_PCT, default 10%). Live max drawdown 1.01% → quiet.
+- **2026-06-24** — **Either-side DR generator BUILT, opt-in** (commit ac00f9c). The generator can now
+  target the higher-net-edge side instead of always the cheaper one (POLYTRADER_DR_EVAL_BOTH_SIDES,
+  default OFF, ships inert). Unlocks theta's favorite case + the calibration high-conviction edge when
+  enabled. The cheaper-side skeleton choice that had been flagged "arbitrary for limited wiring" since
+  the 5-min DR generator landed is now addressed (behind a flag).
 - **2026-06-24** — **Theta/convergence signal DONE** (Tier 2, commit 2486eae). First new FusionEngine
   processor since the external signals: a near-resolution convergence tilt. Required plumbing the gamma
   `endDate` through the ingester (+ fixing the upsert to refresh raw_json) into a `days_to_resolution`
