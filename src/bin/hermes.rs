@@ -1599,20 +1599,51 @@ async fn load_per_signal_realized_pnl(
         .filter_map(|(m, p)| Some((m?, p?)))
         .collect();
 
+    // Causal attribution (roadmap Tier 1.3): credit the signals in the ENTRY decision report — the
+    // report that actually triggered the position — NOT a sliding recent-N window. The old
+    // `ORDER BY created_at DESC LIMIT 20` took the 20 MOST RECENT reports, which for a market that keeps
+    // generating reports for days after entry are snapshots taken long AFTER the trade; as new reports
+    // arrive the window slides and re-splits the SAME realized P&L across different signal mixes, which
+    // made per-signal P&L swing cycle-to-cycle with ZERO new settlements. The entry report is the latest
+    // decision_report at or before the first paper fill that opened the position — stable and causally
+    // correct (the signal mix that caused the entry, frozen once the position exists).
     let mut dr_by_market: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
     for (m, _) in &settled {
         if dr_by_market.contains_key(m) {
             continue;
         }
-        let attrs: Vec<serde_json::Value> = sqlx::query_scalar(
-            "SELECT payload->'report'->'attribution' FROM journal.events
-             WHERE event_type = 'decision_report' AND payload->>'market_id' = $1
-             ORDER BY created_at DESC LIMIT 20",
+        let entry_report: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT dr.payload->'report'->'attribution'
+             FROM journal.events dr
+             WHERE dr.event_type = 'decision_report' AND dr.payload->>'market_id' = $1
+               AND dr.created_at <= (
+                   SELECT min(ex.created_at) FROM journal.events ex
+                   WHERE ex.event_type = 'autonomous_paper_execution'
+                     AND ex.payload->>'action' = 'filled'
+                     AND ex.payload->>'market_id' = $1)
+             ORDER BY dr.created_at DESC LIMIT 1",
         )
         .bind(m)
-        .fetch_all(pool)
+        .fetch_optional(pool)
         .await
-        .unwrap_or_default();
+        .ok()
+        .flatten()
+        .filter(|v: &serde_json::Value| v.is_object());
+        // Fallback (no entry fill recorded — e.g. a legacy position predating execution journaling): the
+        // EARLIEST report for the market, the closest available proxy for the entry decision. Still
+        // time-anchored to position open — never the latest sliding snapshot that caused the bug.
+        let attrs: Vec<serde_json::Value> = match entry_report {
+            Some(a) => vec![a],
+            None => sqlx::query_scalar(
+                "SELECT payload->'report'->'attribution' FROM journal.events
+                 WHERE event_type = 'decision_report' AND payload->>'market_id' = $1
+                 ORDER BY created_at ASC LIMIT 1",
+            )
+            .bind(m)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default(),
+        };
         dr_by_market.insert(m.clone(), attrs);
     }
 
@@ -1646,7 +1677,7 @@ async fn load_per_signal_realized_pnl(
         "per_signal_participation": participation_json,
         "per_signal_attribution_window_fire_rate": window_fire_rate_json,
         "unattributed_pnl": unattributed.to_string(),
-        "note": "Realized P&L attributed to signals by decision-report influence (|score×confidence| — intrinsic, no learned-weight feedback). Weight tuning uses the AVERAGE per market driven (per_signal_avg_per_market), not the cumulative sum, so ubiquitous signals aren't over-credited. per_signal_attribution_window_fire_rate is the fire-rate the P&L was earned at — weight tuning discounts a signal's boost/trim when its RECENT fire-rate has collapsed below it (stale attribution). Empty until positions resolve.",
+        "note": "Realized P&L attributed to signals by the ENTRY decision report's influence (|score×confidence| — intrinsic, no learned-weight feedback) — the report that triggered the position, not a sliding recent-N window, so attribution is causally correct and stable (no re-split as new reports arrive). Weight tuning uses the AVERAGE per market driven (per_signal_avg_per_market), not the cumulative sum, so ubiquitous signals aren't over-credited. per_signal_attribution_window_fire_rate is the fire-rate at those entry decisions — weight tuning discounts a signal's boost/trim when its RECENT fire-rate has collapsed below it (stale attribution). Empty until positions resolve.",
     });
     (summary, avg_per_signal, window_fire_rate)
 }
