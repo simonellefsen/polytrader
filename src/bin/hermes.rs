@@ -348,6 +348,10 @@ async fn do_reflection(
     // Calibration scorecard: is the model's entry win_prob_estimate trustworthy? Brier + reliability
     // buckets vs actual settled outcomes (entry-report anchored). Non-fatal; thin until markets resolve.
     let calibration = load_calibration(pool).await;
+
+    // Portfolio drawdown monitor + push alert on NAV fall from peak (observability only — does not pause
+    // trading). Non-fatal: a transient DB issue never drops the reflection.
+    let drawdown = load_and_alert_drawdown(pool).await;
     let settled_count = realized_pnl_summary
         .get("settled_positions")
         .and_then(|v| v.as_u64())
@@ -399,6 +403,7 @@ async fn do_reflection(
         "per_signal_realized_pnl": realized_pnl_summary,
         "signal_health": signal_health,
         "calibration": calibration,
+        "drawdown": drawdown,
         "processor_weight_tuning": processor_weight_tuning,
         "fills_in_window": fill_count,
         "total_fees_in_window": total_fees.to_string(),
@@ -1968,6 +1973,89 @@ async fn load_calibration(pool: &sqlx::PgPool) -> serde_json::Value {
     compute_calibration(&samples)
 }
 
+/// Pure: build the drawdown block + decide whether to alert. `current`/`peak` are account NAV
+/// (= virtual_usdc + total_locked + unrealized_pnl, matching the /trades equity definition);
+/// `max_dd_frac` is the worst peak-to-trough fraction over history; `threshold_pct` is the alert gate.
+/// Extracted for unit testing. Returns (metrics block, should_alert).
+fn compute_drawdown_block(
+    current: Decimal,
+    peak: Decimal,
+    max_dd_frac: Decimal,
+    threshold_pct: Decimal,
+) -> (serde_json::Value, bool) {
+    if peak <= dec!(0) {
+        return (
+            json!({"note": "No portfolio snapshots yet — drawdown undefined."}),
+            false,
+        );
+    }
+    let current_dd_pct = ((peak - current) / peak * dec!(100)).round_dp(2);
+    let max_dd_pct = (max_dd_frac * dec!(100)).round_dp(2);
+    let should_alert = current_dd_pct >= threshold_pct;
+    let block = json!({
+        "current_equity": current.round_dp(2).to_string(),
+        "peak_equity": peak.round_dp(2).to_string(),
+        "current_drawdown_pct": current_dd_pct.to_string(),
+        "max_drawdown_pct": max_dd_pct.to_string(),
+        "alert_threshold_pct": threshold_pct.to_string(),
+        "breaching": should_alert,
+        "note": "Account NAV = virtual_usdc + total_locked + unrealized_pnl (matches /trades equity). current_drawdown_pct = drop from the all-time peak; max_drawdown_pct = worst peak-to-trough over the full snapshot history. A breach journals a rate-limited drawdown_alert. OBSERVABILITY ONLY — does NOT pause execution (an auto-pause circuit-breaker is a separate, gated follow-up). Threshold via HERMES_DRAWDOWN_ALERT_PCT (default 10).",
+    });
+    (block, should_alert)
+}
+
+/// Compute portfolio drawdown from the equity snapshot series and PUSH a rate-limited `drawdown_alert`
+/// when the NAV has fallen more than the threshold from its peak. Observability only — never pauses
+/// trading. Non-fatal: a DB error degrades to an empty block.
+async fn load_and_alert_drawdown(pool: &sqlx::PgPool) -> serde_json::Value {
+    let threshold_pct: Decimal = std::env::var("HERMES_DRAWDOWN_ALERT_PCT")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(dec!(10));
+    // Server-side window aggregate (one row out): current NAV, all-time peak, worst peak-to-trough.
+    let row: Option<(Decimal, Decimal, Decimal)> = sqlx::query_as(
+        "WITH eq AS (
+           SELECT as_of, (virtual_usdc + total_locked + unrealized_pnl) AS equity
+           FROM paper_trading.virtual_portfolio_snapshots
+         ),
+         run AS (
+           SELECT as_of, equity,
+                  max(equity) OVER (ORDER BY as_of ROWS UNBOUNDED PRECEDING) AS peak
+           FROM eq
+         )
+         SELECT
+           COALESCE((SELECT equity FROM run ORDER BY as_of DESC LIMIT 1), 0),
+           COALESCE((SELECT max(peak) FROM run), 0),
+           COALESCE((SELECT max((peak - equity) / NULLIF(peak, 0)) FROM run), 0)",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let (current, peak, max_dd_frac) = row.unwrap_or((dec!(0), dec!(0), dec!(0)));
+    let (block, should_alert) = compute_drawdown_block(current, peak, max_dd_frac, threshold_pct);
+    if should_alert {
+        let mut payload = block.clone();
+        payload["kind"] = json!("portfolio_drawdown");
+        payload["paper_only"] = json!(true);
+        // One portfolio → dedup on event_type alone, rate-limited once / 6h.
+        if maybe_journal_alert(
+            pool,
+            "drawdown_alert",
+            "hermes_drawdown",
+            "warn",
+            &[],
+            "6 hours",
+            &payload,
+        )
+        .await
+        {
+            warn!(current_equity = %current, peak_equity = %peak, threshold_pct = %threshold_pct, "drawdown alert journaled (NAV below peak threshold)");
+        }
+    }
+    block
+}
+
 /// Load the most recent Hermes-written processor weights (for incremental adjustment).
 async fn load_prev_weights(pool: &sqlx::PgPool) -> BTreeMap<String, Decimal> {
     let latest: Option<serde_json::Value> = sqlx::query_scalar(
@@ -2368,13 +2456,41 @@ fn augment_wiki_proposal_if_gated(
 mod tests {
     use super::{
         aggregate_strategy_signal_attribution, augment_wiki_proposal_if_gated,
-        build_final_review_decision_boundary_coverage, compute_calibration,
+        build_final_review_decision_boundary_coverage, compute_calibration, compute_drawdown_block,
         compute_weight_adjustments, dec_from_json, signal_health,
     };
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn drawdown_block_breach_and_clear() {
+        let num = |v: &serde_json::Value, k: &str| -> Decimal {
+            v[k].as_str().unwrap().parse::<Decimal>().unwrap()
+        };
+        // No snapshots → undefined, no alert.
+        let (b0, a0) = compute_drawdown_block(dec!(0), dec!(0), dec!(0), dec!(10));
+        assert!(!a0);
+        assert!(b0.get("current_drawdown_pct").is_none());
+
+        // Peak 10000, now 9000 → 10% drawdown, threshold 10 → breach (>=).
+        let (b1, a1) = compute_drawdown_block(dec!(9000), dec!(10000), dec!(0.12), dec!(10));
+        assert!(a1, "10% drop must breach a 10% threshold");
+        assert_eq!(num(&b1, "current_drawdown_pct"), dec!(10));
+        assert_eq!(num(&b1, "max_drawdown_pct"), dec!(12)); // worst peak-to-trough 0.12
+        assert_eq!(b1["breaching"], json!(true));
+
+        // Peak 10000, now 9600 → 4% drawdown, threshold 10 → no breach.
+        let (b2, a2) = compute_drawdown_block(dec!(9600), dec!(10000), dec!(0.12), dec!(10));
+        assert!(!a2);
+        assert_eq!(num(&b2, "current_drawdown_pct"), dec!(4));
+        assert_eq!(b2["breaching"], json!(false));
+
+        // At peak → 0% drawdown.
+        let (b3, _) = compute_drawdown_block(dec!(10000), dec!(10000), dec!(0), dec!(10));
+        assert_eq!(num(&b3, "current_drawdown_pct"), dec!(0));
+    }
 
     #[test]
     fn calibration_brier_skill_and_buckets() {
