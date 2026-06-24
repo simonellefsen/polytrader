@@ -56,9 +56,24 @@ rate-limited.** That framing drives the tier ordering below.
    sample with the current strategy scope. Forks if more data is wanted: build sports-directional
    capability (new signal class, big), or accept slow data and do no-data-dependent work. **Do NOT stuff
    the bootstrap list with June-30 longshots.**
-3. **Fix attribution causality.** Anchor per-signal realized P&L to the **decision report at entry**
-   (the report that actually triggered the trade) instead of a sliding recent-20 window. Removes the
-   re-split noise source and makes Hermes attribution stable + causally correct.
+3. **Fix attribution causality. ✅ DONE (2026-06-24, commit 8944768).** `load_per_signal_realized_pnl`
+   now attributes each settled position's realized P&L to its **entry decision report** — the latest
+   `decision_report` at or before the first `autonomous_paper_execution`/`filled` that opened the
+   position — instead of the old `ORDER BY created_at DESC LIMIT 20` sliding window. The old window
+   took snapshots from days *after* entry and re-split the same P&L as new reports arrived (the
+   +$0.74→−$2.53 swing source). The entry report is frozen once the position exists, so attribution is
+   causally correct **and** stable. Falls back to the market's earliest report if no entry fill is
+   journaled (legacy positions), still time-anchored to open — never the sliding snapshot. **Validated:**
+   pre-deploy the entry-report scores differed materially from the latest-report scores the old code
+   used (sign flips, e.g. mkt 2262261 +0.40 entry vs −0.429 latest; signals that fired at entry but read
+   0 now, e.g. mkt 2508398 0.455→0); post-deploy two consecutive reflection cycles (04:01, 04:11)
+   produced **identical** per-signal attribution with no new settlements — swing noise gone. Pairs with
+   the recency-of-activity weight discount (commit 93268ff, 2026-06-24): that damps a stale boost from
+   the *firing* side, this removes re-split noise from the *attribution* side.
+   - **Follow-up (not done):** the airtight version journals the triggering report's id with each fill
+     in the execution path so attribution links by id, not timestamp. Temporal anchoring is robust here
+     (entry reports precede fills by ms; works retroactively on existing data) but an explicit link
+     would remove any reliance on clock ordering for future positions.
 
 ## Tier 2 — Signal quality (thin and momentum-dominated)
 
@@ -78,8 +93,12 @@ rate-limited.** That framing drives the tier ordering below.
 
 ## Tier 3 — Fusion, risk & validation
 
-- **Flip live to the strict gate (or make it adaptive).** Cheapest standalone win given the recurring
-  ~$29 vs ~$16 gap; confirm via the harness before flipping.
+- **Flip live to the strict gate. ❌ DROPPED 2026-06-24 — not a real edge (invalidated by Phase 2
+  backtest).** Originally proposed as the "cheapest standalone win" on a recurring live ~$29 vs ~$16
+  gap, but the sweep (Phase 2, commit d94d8dc) showed total P&L is **flat ~+93.2 across gate
+  thresholds 0.02..0.06** — the live gap was an artifact of that comparison's subset methodology, not
+  an edge-level effect (see Phase 2 findings below). Don't spend effort flipping the gate. (An
+  *adaptive* gate could still be explored later, but not motivated by the strict-vs-lenient gap.)
 - **Regime-conditional / per-category weights** — different weights in calm vs volatile, or
   news-heavy for geopolitics vs momentum for sports. Needs Tier 1 data first.
 - **Generalize the shadow framework** — run N parallel shadow configs so any proposed change is
@@ -216,3 +235,15 @@ unit-testable) and is the prerequisite:
   equity curve; realistic fills in the sweep). **Natural next focus:** back to the broader roadmap —
   Tier 1.2 (faster-resolving market universe, to fatten the settled sample) or Tier 2 (new signals:
   calibration / theta / cross-market), both of which the harness can now validate.
+- **2026-06-24** — **Hermes weight-tuning hardening (two Tier-1-adjacent fixes).**
+  (1) *Recency-of-activity discount* (commit 93268ff): `compute_weight_adjustments` scaled a signal's
+  realized-P&L boost/trim by `min(1, recent_fire_rate / attribution_window_fire_rate)`, so a signal
+  that earned credit while active but has since gone quiet drifts back toward neutral instead of staying
+  over-trusted on stale evidence (e.g. `news_sentiment`). Ratio not absolute floor, so consistently-
+  selective signals aren't penalized; doesn't regress 32e1edd (dormant-by-design signals are handled
+  separately). (2) *Attribution causality* (commit 8944768, **Tier 1.3 done**): anchored per-signal
+  realized P&L to the entry decision report instead of the sliding recent-20 window — kills the re-split
+  swing noise; two consecutive post-deploy cycles produced identical attribution.
+- **2026-06-24** — **Tier 3 strict-gate flip DROPPED.** Reconciled the "cheapest standalone win" bullet
+  with the Phase 2 finding that gate threshold barely moves total P&L (~+93.2 flat across 0.02..0.06);
+  the live strict-vs-lenient gap was a subset-methodology artifact, not an edge. Not worth flipping.
