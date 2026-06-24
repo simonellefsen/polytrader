@@ -340,6 +340,10 @@ async fn do_reflection(
     // once present, it drives P&L-based weight boosting (net-winners >1.0) instead of trim-only.
     let (realized_pnl_summary, realized_pnl_map, attr_window_fire_rate) =
         load_per_signal_realized_pnl(pool).await;
+
+    // Per-signal health vs a 7d baseline + push alerts on multi-day decay (closes the loop on the
+    // scorecard's pull-only 7d monitor). Non-fatal: a transient DB issue never drops the reflection.
+    let signal_health = load_and_alert_signal_health(pool).await;
     let settled_count = realized_pnl_summary
         .get("settled_positions")
         .and_then(|v| v.as_u64())
@@ -389,6 +393,7 @@ async fn do_reflection(
         "active_markets": active_markets,
         "strategy_signal_attribution": strategy_signal_attribution.clone(),
         "per_signal_realized_pnl": realized_pnl_summary,
+        "signal_health": signal_health,
         "processor_weight_tuning": processor_weight_tuning,
         "fills_in_window": fill_count,
         "total_fees_in_window": total_fees.to_string(),
@@ -1682,6 +1687,153 @@ async fn load_per_signal_realized_pnl(
     (summary, avg_per_signal, window_fire_rate)
 }
 
+/// Classify a fusion signal's health by comparing a `recent` fire-rate to a `baseline` (window-agnostic).
+/// Mirrors `server::signal_health` exactly — bins don't share the main binary's modules, so this is
+/// duplicated intentionally (like `clamp_weight`); keep the two in sync. Returns "insufficient_data"
+/// (too few recent reports), "elevated" (recent notably above baseline / a quiet signal woke up),
+/// "dormant" (an active signal went silent), "degraded" (fire-rate more than halved), or "ok".
+fn signal_health(baseline_pct: Decimal, recent_pct: Decimal, recent_n: i64) -> &'static str {
+    if recent_n < 20 {
+        return "insufficient_data";
+    }
+    if baseline_pct < dec!(5) {
+        return if recent_pct > dec!(15) {
+            "elevated"
+        } else {
+            "ok"
+        };
+    }
+    if recent_pct <= dec!(1) {
+        return "dormant";
+    }
+    if recent_pct < baseline_pct / dec!(2) {
+        return "degraded";
+    }
+    if recent_pct > baseline_pct * dec!(2) {
+        return "elevated";
+    }
+    "ok"
+}
+
+/// Per-signal slim count-only fire-rate aggregate (total reports + per-signal fired count, in SIGNALS
+/// order) over the given interval. "fired" = the score string contains a 1-9 digit (cast-free mirror of
+/// `!Decimal::is_zero()`; can't throw on a stray non-numeric score). Returns (total, [fired; 5]).
+async fn signal_fire_counts(pool: &sqlx::PgPool, interval: &str) -> (i64, [i64; 5]) {
+    // interval is a fixed internal literal ('24 hours' / '7 days'), never user input.
+    let sql = format!(
+        "SELECT count(*)::bigint,
+           count(*) FILTER (WHERE payload->'report'->'attribution'->'orderbook_momentum'->>'score' ~ '[1-9]')::bigint,
+           count(*) FILTER (WHERE payload->'report'->'attribution'->'spike_divergence'->>'score' ~ '[1-9]')::bigint,
+           count(*) FILTER (WHERE payload->'report'->'attribution'->'overreaction_fade'->>'score' ~ '[1-9]')::bigint,
+           count(*) FILTER (WHERE payload->'report'->'attribution'->'yahoo_finance'->>'score' ~ '[1-9]')::bigint,
+           count(*) FILTER (WHERE payload->'report'->'attribution'->'news_sentiment'->>'score' ~ '[1-9]')::bigint
+         FROM journal.events
+         WHERE event_type = 'decision_report' AND created_at > now() - interval '{interval}'"
+    );
+    let row: Option<(i64, i64, i64, i64, i64, i64)> = sqlx::query_as(&sql)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    match row {
+        Some((t, a, b, c, d, e)) => (t, [a, b, c, d, e]),
+        None => (0, [0; 5]),
+    }
+}
+
+/// Compute per-signal health by comparing the 24h fire-rate to a 7d baseline (catches multi-day GRADUAL
+/// decay the scorecard's 3h-vs-24h check is blind to — the 24h baseline erodes with the signal), and
+/// PUSH it: journal a `signal_health_alert` event for any signal that has degraded/gone dormant from an
+/// active weekly baseline. Rate-limited per (signal, status) to once / 6h so a sustained-bad signal
+/// doesn't spam an alert every reflection cycle. Returns a JSON block for the reflection metrics.
+/// Append-only observability evidence (no trading effect); non-fatal — degrades to an empty block.
+async fn load_and_alert_signal_health(pool: &sqlx::PgPool) -> serde_json::Value {
+    const SIGNALS: [&str; 5] = [
+        "orderbook_momentum",
+        "spike_divergence",
+        "overreaction_fade",
+        "yahoo_finance",
+        "news_sentiment",
+    ];
+    let pct = |fired: i64, total: i64| -> Decimal {
+        if total > 0 {
+            (Decimal::from(fired) / Decimal::from(total) * dec!(100)).round_dp(1)
+        } else {
+            Decimal::ZERO
+        }
+    };
+    let (t24, f24) = signal_fire_counts(pool, "24 hours").await;
+    let (t7d, f7d) = signal_fire_counts(pool, "7 days").await;
+
+    let mut rows = serde_json::Map::new();
+    let mut alerts_journaled = 0i64;
+    for (i, name) in SIGNALS.iter().enumerate() {
+        let rate_24h = pct(f24[i], t24);
+        let rate_7d = pct(f7d[i], t7d);
+        let health = signal_health(rate_7d, rate_24h, t24);
+        rows.insert(
+            name.to_string(),
+            json!({
+                "fire_rate_24h_pct": rate_24h.to_string(),
+                "fire_rate_7d_pct": rate_7d.to_string(),
+                "health_24h_vs_7d": health,
+            }),
+        );
+        if health == "degraded" || health == "dormant" {
+            // Rate-limit: only journal if no same-(signal,status) alert in the last 6h.
+            let recent: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM journal.events
+                 WHERE event_type = 'signal_health_alert'
+                   AND payload->>'signal' = $1 AND payload->>'status' = $2
+                   AND created_at > now() - interval '6 hours'",
+            )
+            .bind(*name)
+            .bind(health)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(1); // on error, suppress (don't risk a spam loop)
+            if recent == 0 {
+                let payload = json!({
+                    "signal": name,
+                    "status": health,
+                    "fire_rate_24h_pct": rate_24h.to_string(),
+                    "fire_rate_7d_pct": rate_7d.to_string(),
+                    "baseline_window_h": 168,
+                    "reports_24h_total": t24,
+                    "paper_only": true,
+                    "note": "Signal fire-rate degraded vs its 7-day baseline (multi-day decay the 3h-vs-24h scorecard check misses). Rate-limited to once/6h per signal+status. Observability evidence; no trading effect.",
+                });
+                let insert = sqlx::query(
+                    "INSERT INTO journal.events (id, event_type, source, severity, payload)
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(Uuid::new_v4())
+                .bind("signal_health_alert")
+                .bind("hermes_signal_health")
+                .bind(if health == "dormant" { "warn" } else { "info" })
+                .bind(&payload)
+                .execute(pool)
+                .await;
+                match insert {
+                    Ok(_) => {
+                        alerts_journaled += 1;
+                        warn!(signal = *name, status = health, fire_rate_24h = %rate_24h, fire_rate_7d = %rate_7d, "signal health alert journaled (multi-day decay)");
+                    }
+                    Err(e) => warn!(error = %e, "failed to write signal_health_alert (non-fatal)"),
+                }
+            }
+        }
+    }
+    json!({
+        "comparison": "24h_vs_7d_baseline",
+        "reports_24h_total": t24,
+        "reports_7d_total": t7d,
+        "alerts_journaled": alerts_journaled,
+        "rows": rows,
+        "note": "Per-signal health comparing the 24h fire-rate to a 7d baseline — catches multi-day GRADUAL decay the /trades scorecard's 3h-vs-24h check is blind to (the 24h baseline erodes with the signal). Degraded/dormant signals journal a rate-limited (once/6h per signal+status) signal_health_alert event for push consumption. Counts are a slim cast-free aggregate (no payloads loaded).",
+    })
+}
+
 /// Load the most recent Hermes-written processor weights (for incremental adjustment).
 async fn load_prev_weights(pool: &sqlx::PgPool) -> BTreeMap<String, Decimal> {
     let latest: Option<serde_json::Value> = sqlx::query_scalar(
@@ -2058,11 +2210,31 @@ mod tests {
     use super::{
         aggregate_strategy_signal_attribution, augment_wiki_proposal_if_gated,
         build_final_review_decision_boundary_coverage, compute_weight_adjustments, dec_from_json,
+        signal_health,
     };
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn signal_health_alert_classification_matches_server() {
+        // Mirror of server::signal_health (kept in sync; bins don't share modules). The alert path
+        // journals on "degraded"/"dormant" — these cases drive that, so lock the classification here.
+        let d = Decimal::from;
+        // 7d baseline ~20%, 24h ~2% → multi-day decay → degraded (the news-style slow slide).
+        assert_eq!(signal_health(d(20), d(2), 200), "degraded");
+        // Active weekly baseline, fully silent over 24h → dormant.
+        assert_eq!(signal_health(d(20), d(0), 200), "dormant");
+        // Dormant-by-design (quiet both windows) must NOT alert.
+        assert_eq!(signal_health(d(0), d(0), 200), "ok");
+        // Steady over the week → ok.
+        assert_eq!(signal_health(d(20), d(19), 200), "ok");
+        // Too few 24h reports to judge → no alert.
+        assert_eq!(signal_health(d(20), d(0), 5), "insufficient_data");
+        // A quiet signal waking up → elevated (not an alert).
+        assert_eq!(signal_health(d(2), d(25), 200), "elevated");
+    }
 
     #[test]
     fn weight_tuning_holds_silent_signal_and_recovers_floored_one() {
