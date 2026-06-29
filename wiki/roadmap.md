@@ -28,6 +28,32 @@ Almost every observed weakness traces back to **~12–16 settled markets**. Conc
 **Until settlement throughput rises (or we learn offline from history), every downstream improvement is
 rate-limited.** That framing drives the tier ordering below.
 
+## ⚠️ The real open question: does the strategy have any edge? (added 2026-06-29)
+
+After the full Phase 0–3 harness + Tier 2/4 tooling, the **underlying strategy is not demonstrating
+durable edge**, and this — not tooling — is now the central question:
+
+- **Genuine track record: +$1.21 realized over 16 settled markets, 5W/11L (31% hit-rate).** Thin and
+  weak. (The displayed +$5.41 includes ~$4.20 of frozen phantom from the 2026-06-24 resolved-market
+  re-trade incident — to be cleared by a paper reset.)
+- **Unrealized marks mean-revert to cost.** On 2026-06-26 unrealized was +$9.39; by 2026-06-29 it had
+  bled to **+$0.03** with zero settlements — the apparent gains were noise, not captured edge.
+- **Phase 2 sweep already showed we're at a thin local optimum** — the gate threshold doesn't move P&L,
+  Hermes's weights are ~neutral-optimal, and `orderbook_momentum` (a 93%-fire, ~0.05-score baseline
+  signal) is load-bearing. There's no obvious lever left to pull within the current signal set.
+- **The book is structurally long-dated** (most positions resolve Q4-2026 → 2028-11; only ~2 resolve at
+  any near-term date), so live confirmation of edge will take months regardless.
+
+**Investigation to run (the priority over more knobs):** establish whether this approach makes money at
+all, and if not, where edge could come from. Concretely: (1) use the backtest harness to measure
+realized + marked P&L per *signal* and per *market category* over the full history — is any signal
+net-positive after fees, or is it all momentum-churn? (2) compute the calibration/Brier already wired
+(commit bd77832) on the settled set — are the win-prob estimates better than the market mid? (3) if no
+edge is found in the current geopolitics-heavy, slow-resolving universe, the honest conclusion may be
+that **edge requires a different market class** (e.g. the sports markets we currently only arb — a new
+signal class) rather than more tuning of the existing processors. Treat a negative result as a valid,
+important outcome.
+
 ## Other standing observations (motivate specific items)
 
 - `orderbook_momentum` fires **~93% of reports with avg |score| ≈ 0.065** — a weak, ubiquitous signal
