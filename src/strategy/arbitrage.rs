@@ -117,13 +117,20 @@ impl ArbitrageScanner {
     ) -> Result<(Vec<ArbitrageOpportunity>, ArbDiagnostics)> {
         // Fetch the latest YES and NO snapshots for every active market in one query.
         // LATERAL ensures we get exactly the newest row per (market, outcome) pair.
-        let rows: Vec<(String, String, String, serde_json::Value, serde_json::Value)> =
-            sqlx::query_as(
-                r#"
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            Option<Decimal>,
+            serde_json::Value,
+            serde_json::Value,
+        )> = sqlx::query_as(
+            r#"
                 SELECT
                     m.gamma_id,
                     COALESCE(m.slug, '') AS slug,
                     m.question,
+                    m.taker_fee_rate,
                     yes_snap.asks  AS yes_asks,
                     no_snap.asks   AS no_asks
                 FROM market_data.markets m
@@ -143,9 +150,9 @@ impl ArbitrageScanner {
                 ) no_snap ON true
                 WHERE m.active = true AND NOT m.closed
                 "#,
-            )
-            .fetch_all(pool)
-            .await?;
+        )
+        .fetch_all(pool)
+        .await?;
 
         let mut opportunities = Vec::new();
         let mut diag = ArbDiagnostics {
@@ -154,7 +161,7 @@ impl ArbitrageScanner {
         };
         let mut best_total_cost: Option<(Decimal, String)> = None;
 
-        for (market_id, slug, question, yes_asks, no_asks) in rows {
+        for (market_id, slug, question, stored_fee_rate, yes_asks, no_asks) in rows {
             let (ask_yes, depth_yes) = best_ask(&yes_asks);
             let (ask_no, depth_no) = best_ask(&no_asks);
 
@@ -188,10 +195,11 @@ impl ArbitrageScanner {
             }
             diag.sub_dollar_books += 1;
 
-            // Per-leg taker fee via Polymarket's real per-category model (shares × rate × p × (1−p);
-            // geopolitics is free). Per share-pair = one share of each leg.
-            let combined_fee = crate::polymarket_taker_fee(&slug, ask_yes, Decimal::ONE)
-                + crate::polymarket_taker_fee(&slug, ask_no, Decimal::ONE);
+            // Per-leg taker fee via Polymarket's real model (shares × rate × p × (1−p); geopolitics is
+            // free). Prefer the per-market rate synced from Gamma; fall back to the category default.
+            let rate = stored_fee_rate.unwrap_or_else(|| crate::polymarket_taker_fee_rate(&slug));
+            let combined_fee = crate::polymarket_fee(rate, ask_yes, Decimal::ONE)
+                + crate::polymarket_fee(rate, ask_no, Decimal::ONE);
             let net_profit = gross_profit - combined_fee;
 
             if net_profit < MIN_NET_PROFIT {

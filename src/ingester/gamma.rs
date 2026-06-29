@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use reqwest::Client;
+use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -26,6 +27,12 @@ pub struct Market {
     /// theta/convergence signal's days-to-resolution. Serialized into `raw_json` as `end_date`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_date: Option<String>,
+    /// Polymarket taker fee RATE from Gamma's `feeSchedule.rate` (0 when `feesEnabled` is false, e.g.
+    /// geopolitics). The effective fee is `shares × rate × price × (1 − price)`. None when the fields
+    /// are absent — callers fall back to the category default. Stored per-market so historical P&L
+    /// reflects the fee schedule in force.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taker_fee_rate: Option<Decimal>,
 }
 
 #[derive(Clone)]
@@ -90,6 +97,20 @@ impl GammaClient {
                 .and_then(|d| d.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string()),
+            taker_fee_rate: {
+                // feesEnabled=false ⇒ fee-free (0). Otherwise take feeSchedule.rate. Absent ⇒ None.
+                let enabled = v.get("feesEnabled").and_then(|b| b.as_bool());
+                let rate = v
+                    .get("feeSchedule")
+                    .and_then(|f| f.get("rate"))
+                    .and_then(|r| r.as_f64())
+                    .and_then(Decimal::from_f64_retain);
+                match (enabled, rate) {
+                    (Some(false), _) => Some(Decimal::ZERO),
+                    (_, Some(r)) => Some(r),
+                    _ => None,
+                }
+            },
         }
     }
 

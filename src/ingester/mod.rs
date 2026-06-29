@@ -74,8 +74,8 @@ pub async fn ingest_tick(
         // Upsert market (resolution fields refreshed on conflict so closes are captured).
         sqlx::query(
             r#"INSERT INTO market_data.markets
-               (gamma_id, slug, question, outcomes, clob_token_ids, active, closed, updated_at, raw_json, outcome_prices, resolved_outcome)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10)
+               (gamma_id, slug, question, outcomes, clob_token_ids, active, closed, updated_at, raw_json, outcome_prices, resolved_outcome, taker_fee_rate)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11)
                ON CONFLICT (gamma_id) DO UPDATE SET
                  slug = EXCLUDED.slug,
                  question = EXCLUDED.question,
@@ -84,6 +84,8 @@ pub async fn ingest_tick(
                  outcome_prices = EXCLUDED.outcome_prices,
                  resolved_outcome = COALESCE(EXCLUDED.resolved_outcome, market_data.markets.resolved_outcome),
                  raw_json = EXCLUDED.raw_json,
+                 -- refresh the fee rate when Gamma reports one; keep the last known value if absent
+                 taker_fee_rate = COALESCE(EXCLUDED.taker_fee_rate, market_data.markets.taker_fee_rate),
                  updated_at = now()"#,
         )
         .bind(&m.id)
@@ -96,6 +98,7 @@ pub async fn ingest_tick(
         .bind(serde_json::json!(&m)) // raw for now
         .bind(prices_j)
         .bind(&resolved_outcome)
+        .bind(m.taker_fee_rate)
         .execute(pool)
         .await?;
 

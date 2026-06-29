@@ -292,17 +292,19 @@ impl PaperTradingEngine {
         // - Net edge (gross - fees - gas - slip) is the *primary* signal for deliberate tier.
         // - Always journal fills with full context so Hermes can attribute fee drag vs signals.
         // - Paper only: no real money impact. Over-estimating fees protects learning capital.
-        // Fee model: Polymarket's REAL per-category taker fee (shares × rate × p × (1−p); geopolitics
-        // is fee-free) — see crate::polymarket_taker_fee. Replaces the old flat paper_fee_bps × notional,
-        // which materially over-charged geopolitics (the bulk of the book) and mis-shaped the rest. The
-        // market's slug (→ category) is looked up once here; empty slug ⇒ "Other" rate.
-        let market_slug: String = sqlx::query_scalar(
-            "SELECT COALESCE(slug, '') FROM market_data.markets WHERE gamma_id = $1",
+        // Fee model: Polymarket's REAL taker fee (shares × rate × p × (1−p); geopolitics is fee-free) —
+        // see crate::polymarket_fee. Replaces the old flat paper_fee_bps × notional. The per-market rate
+        // synced from Gamma (`taker_fee_rate`) is preferred; the category default is the fallback. Rate
+        // and slug are looked up once per order.
+        let (market_slug, stored_fee_rate): (String, Option<Decimal>) = sqlx::query_as(
+            "SELECT COALESCE(slug, ''), taker_fee_rate FROM market_data.markets WHERE gamma_id = $1",
         )
         .bind(&order.market_id)
         .fetch_optional(&self.pool)
         .await?
         .unwrap_or_default();
+        let fee_rate =
+            stored_fee_rate.unwrap_or_else(|| crate::polymarket_taker_fee_rate(&market_slug));
         let mut remaining = order.size;
         let mut fills = vec![];
         let now = chrono::Utc::now();
@@ -404,7 +406,7 @@ impl PaperTradingEngine {
             }
 
             let gross = exec_price * take;
-            let fee = crate::polymarket_taker_fee(&market_slug, exec_price, take);
+            let fee = crate::polymarket_fee(fee_rate, exec_price, take);
             let slippage_bps = if let Some(m) = base_mid {
                 // rough vs mid
                 ((exec_price - m).abs() / m * dec!(10000))
@@ -439,7 +441,7 @@ impl PaperTradingEngine {
             } else {
                 base - base * impact
             };
-            let fee = crate::polymarket_taker_fee(&market_slug, synth_price, remaining);
+            let fee = crate::polymarket_fee(fee_rate, synth_price, remaining);
             fills.push(PaperFill {
                 id: uuid::Uuid::new_v4(),
                 order_id: order.id,

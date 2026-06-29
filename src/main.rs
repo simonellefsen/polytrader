@@ -1709,16 +1709,29 @@ fn polymarket_taker_fee_rate(slug: &str) -> rust_decimal::Decimal {
     }
 }
 
-/// Polymarket taker fee for one fill: `shares × rate × price × (1 − price)`. The `price × (1 − price)`
-/// shape peaks at p=0.50 and is zero at the extremes, and is symmetric (a fill at 0.30 costs the same
-/// as at 0.70). Source: docs.polymarket.com/trading/fees. Replaces the old flat `paper_fee_bps × notional`
-/// model — that materially over-charged geopolitics (which is actually free) and mis-shaped the rest.
+/// Polymarket taker fee for one fill given an explicit per-market `rate`:
+/// `shares × rate × price × (1 − price)`. The `price × (1 − price)` shape peaks at p=0.50, is zero at
+/// the extremes, and is symmetric (a fill at 0.30 costs the same as at 0.70). Source:
+/// docs.polymarket.com/trading/fees. Prefer the per-market `taker_fee_rate` synced from Gamma; fall back
+/// to [`polymarket_taker_fee_rate`] (category default) when none is stored.
+fn polymarket_fee(
+    rate: rust_decimal::Decimal,
+    price: rust_decimal::Decimal,
+    shares: rust_decimal::Decimal,
+) -> rust_decimal::Decimal {
+    rate * shares * price * (rust_decimal::Decimal::ONE - price)
+}
+
+/// Fee using the CATEGORY-default rate (the fallback when no per-market rate is available). Prod paths
+/// resolve the rate explicitly (stored `taker_fee_rate` else category) and call [`polymarket_fee`]; this
+/// convenience is used by tests and as a reference.
+#[allow(dead_code)]
 fn polymarket_taker_fee(
     slug: &str,
     price: rust_decimal::Decimal,
     shares: rust_decimal::Decimal,
 ) -> rust_decimal::Decimal {
-    polymarket_taker_fee_rate(slug) * shares * price * (rust_decimal::Decimal::ONE - price)
+    polymarket_fee(polymarket_taker_fee_rate(slug), price, shares)
 }
 
 /// News context for a market via newsdata.io, with aggressive credit economy (free plan = 200/day).
