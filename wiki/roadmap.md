@@ -159,6 +159,13 @@ important outcome.
 
 ## Tier 4 — Ops polish
 
+- **Make the backtest fidelity anchor reset-aware** (follow-up to the 2026-06-29 paper reset). A
+  `POST /paper/reset` zeroes the portfolio snapshot but PRESERVES the journal, so `realized_from_settlements`
+  (which sums all `paper_position_settled` events, +$5.41 incl. the 2026-06-24 phantom) no longer matches
+  the live portfolio realized (now 0) → the anchor reads MISMATCH. Fix: `load_settlements` should only
+  count settlements after the latest paper-reset boundary (there's a reset journal event to anchor on),
+  matching how the live portfolio reconciles post-reset.
+
 Drawdown circuit-breaker (auto-pause execution on equity drop), push-alerts for anomalies currently
 caught by hand (WAL archiving flip, LLM health, signal drift), calibration dashboard.
 
