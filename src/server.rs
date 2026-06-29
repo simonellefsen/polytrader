@@ -1311,16 +1311,35 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
         .filter_map(|p| p["unrealized_pnl"].as_str()?.parse::<Decimal>().ok())
         .sum();
 
+    // Outstanding-position + exposure counters for the top view. There is no hard COUNT cap on open
+    // positions/arbs — the binding limit is the total-exposure cap (max_total_exposure_pct of
+    // virtual_usdc+locked, the same denominator the risk gate uses). Surface the count plus how much of
+    // that exposure budget is used, so the operator can see headroom at a glance.
+    let open_positions = positions.len();
+    let risk_cfg = crate::risk::RiskConfig::from_env();
     let portfolio_json = match portfolio {
-        Some((usdc, locked, _unreal, realized, as_of)) => serde_json::json!({
-            "virtual_usdc": usdc.round_dp(2).to_string(),
-            "total_locked": locked.round_dp(2).to_string(),
-            "realized_pnl": realized.round_dp(2).to_string(),
-            "live_unrealized_pnl": total_unrealized.round_dp(2).to_string(),
-            "equity": (usdc + locked + total_unrealized).round_dp(2).to_string(),
-            "as_of": as_of.to_rfc3339(),
-        }),
-        None => serde_json::json!({}),
+        Some((usdc, locked, _unreal, realized, as_of)) => {
+            let total_value = usdc + locked;
+            let max_total_exposure = (total_value * risk_cfg.max_total_exposure_pct).round_dp(2);
+            let exposure_pct = if total_value > Decimal::ZERO {
+                (locked / total_value * Decimal::from(100)).round_dp(1)
+            } else {
+                Decimal::ZERO
+            };
+            serde_json::json!({
+                "virtual_usdc": usdc.round_dp(2).to_string(),
+                "total_locked": locked.round_dp(2).to_string(),
+                "realized_pnl": realized.round_dp(2).to_string(),
+                "live_unrealized_pnl": total_unrealized.round_dp(2).to_string(),
+                "equity": (usdc + locked + total_unrealized).round_dp(2).to_string(),
+                "open_positions": open_positions,
+                "max_total_exposure": max_total_exposure.to_string(),
+                "exposure_pct": exposure_pct.to_string(),
+                "max_position_usdc": risk_cfg.max_position_usdc.to_string(),
+                "as_of": as_of.to_rfc3339(),
+            })
+        }
+        None => serde_json::json!({ "open_positions": open_positions }),
     };
 
     // Real-trading shadow orders (fail-closed) + the latest go-live gate, for the readiness panel.
@@ -2290,12 +2309,14 @@ async function load() {
     ["Locked", "$" + fmt(p.total_locked)],
     ["Realized P&L", "$" + fmt(p.realized_pnl)],
     ["Unrealized P&L", "$" + fmt(p.live_unrealized_pnl)],
+    ["Open positions", (p.open_positions ?? "—") + "", "≤ $" + fmt(p.max_position_usdc) + " each"],
+    ["Exposure used", (p.exposure_pct ?? "0") + "%", "$" + fmt(p.total_locked) + " / $" + fmt(p.max_total_exposure) + " cap"],
   ];
   if (ra && ra.balance != null) {
     cards.push(["REAL " + fmt(ra.collateral_token||"PUSD"), "$" + fmt(ra.balance)]);
   }
   document.getElementById("cards").innerHTML = cards
-    .map(([l,v]) => `<div class="card"><div class="label">${l}</div><div class="val">${v}</div></div>`).join("");
+    .map(([l,v,sub]) => `<div class="card"><div class="label">${l}</div><div class="val">${v}</div>${sub?`<div style="font-size:11px;color:#8b949e;margin-top:3px">${sub}</div>`:""}</div>`).join("");
   document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
 
   window.__lastTrades = d;
