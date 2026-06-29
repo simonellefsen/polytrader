@@ -38,7 +38,8 @@ pub use external::{
     fetch_newsdata_news, fetch_yahoo_context, newsdata_query, NewsSentimentProcessor,
     YahooFinanceProcessor,
 };
-pub use overreaction::OverreactionProcessor;
+// OverreactionProcessor retired 2026-06-29 (no longer wired into the fusion engine); the impl remains
+// in overreaction.rs for reference. Re-export removed so the unused processor doesn't warn.
 pub use theta::ThetaConvergenceProcessor;
 pub use weights::{clamp_weight, load_processor_weights};
 
@@ -322,7 +323,10 @@ impl FusionEngine {
             processors: vec![
                 Box::new(OrderbookMomentumProcessor),
                 Box::new(SpikeDivergenceProcessor),
-                Box::new(OverreactionProcessor),
+                // overreaction_fade RETIRED 2026-06-29: edge-validation found it drove the directional
+                // losses (it faded the real June-2026 Iran ceasefire — 7 of 8 single-side losers were it
+                // buying "No" on markets that resolved Yes). Unwired from the fusion engine; the impl
+                // (overreaction.rs) is kept for reference but no longer trades.
                 // Time-decay convergence tilt near resolution (dormant far out; low confidence).
                 Box::new(ThetaConvergenceProcessor),
                 // External advisory signals (low confidence; risk gate still governs; Hermes learns weights).

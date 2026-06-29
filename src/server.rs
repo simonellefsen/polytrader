@@ -1606,10 +1606,11 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     // Hermes currently weights them, and (once positions settle) the realized P&L attributed to each.
     // Fire-rate/influence are available now; realized P&L stays empty until settlements exist — the
     // same data-gate that pauses Hermes weight tuning.
-    const SIGNALS: [&str; 6] = [
+    // overreaction_fade retired 2026-06-29 (unwired from the fusion engine) — excluded from the
+    // scorecard so the UI doesn't show a permanently-dead row.
+    const SIGNALS: [&str; 5] = [
         "orderbook_momentum",
         "spike_divergence",
-        "overreaction_fade",
         "theta_convergence",
         "yahoo_finance",
         "news_sentiment",
@@ -2553,10 +2554,11 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
         .map(|(m, o, s, a)| (m, (o, s, a)))
         .collect();
 
-    const SIGNALS: [&str; 6] = [
+    // overreaction_fade retired 2026-06-29 (unwired from the fusion engine) — excluded from the
+    // scorecard so the UI doesn't show a permanently-dead row.
+    const SIGNALS: [&str; 5] = [
         "orderbook_momentum",
         "spike_divergence",
-        "overreaction_fade",
         "theta_convergence",
         "yahoo_finance",
         "news_sentiment",

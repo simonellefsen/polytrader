@@ -1505,14 +1505,185 @@ async fn execute_arb_opportunity(
     Ok(())
 }
 
-/// Whether a market slug is in the arb-only set (POLYTRADER_ARB_ONLY_MARKETS) — sports / World Cup.
-/// The directional executor skips these; only execute_arb_opportunity may trade them.
+/// Whether a market is arb-only — the directional executor skips it; only execute_arb_opportunity
+/// (risk-free YES+NO) may trade it. True if the slug is in the explicit `POLYTRADER_ARB_ONLY_MARKETS`
+/// override list OR it matches a broad arb-eligible category.
+///
+/// EXPANDED 2026-06-29 from sports-only to the categories below. Edge-validation found the directional
+/// engine net-NEGATIVE (−$77, 1W/7L over the clean settled set) while the only profitable structure
+/// was a both-sides quasi-arb; so we route these categories away from directional prediction. (NOTE:
+/// the arb scanner already scans ALL markets, so this does not widen arb's reach — it stops the
+/// directional engine bleeding on markets where it has no demonstrated edge.)
 fn is_arb_only_market(slug: &str) -> bool {
-    std::env::var("POLYTRADER_ARB_ONLY_MARKETS")
+    let explicit = std::env::var("POLYTRADER_ARB_ONLY_MARKETS")
         .unwrap_or_default()
         .split(',')
-        .map(|s| s.trim())
-        .any(|s| !s.is_empty() && s == slug)
+        .map(|s| s.trim().to_string())
+        .any(|s| !s.is_empty() && s == slug);
+    explicit || arb_category(slug).is_some()
+}
+
+/// Classify a market slug into an arbitrage-eligible category, or None if it matches none (those few
+/// stay on the directional path). Slug-based, deliberately broad, first-match-wins. Covers: sports,
+/// esports, crypto, finance, economy, tech, geopolitics, elections, culture, weather.
+fn arb_category(slug: &str) -> Option<&'static str> {
+    let s = slug.to_lowercase();
+    let has = |w: &[&str]| w.iter().any(|x| s.contains(x));
+    if has(&[
+        "world-cup",
+        "fifa",
+        "fifwc",
+        "nba",
+        "nfl",
+        "nhl",
+        "mlb",
+        "super-bowl",
+        "-ufc",
+        "soccer",
+        "knicks",
+        "-vs-",
+        "champion",
+        "playoff",
+        "grand-prix",
+        "premier-league",
+        "-open-",
+    ]) {
+        Some("sports")
+    } else if has(&[
+        "esports",
+        "league-of-legends",
+        "-dota",
+        "valorant",
+        "counter-strike",
+        "-cs2",
+        "overwatch",
+        "starcraft",
+        "rocket-league",
+    ]) {
+        Some("esports")
+    } else if has(&[
+        "bitcoin", "ethereum", "-btc-", "-eth-", "crypto", "solana", "dogecoin", "-xrp", "cardano",
+        "memecoin", "-nft",
+    ]) {
+        Some("crypto")
+    } else if has(&[
+        "s-p-500",
+        "sp500",
+        "nasdaq",
+        "-dow-",
+        "stock",
+        "share-price",
+        "market-cap",
+        "largest-company",
+        "earnings",
+        "-ipo",
+        "treasury-yield",
+    ]) {
+        Some("finance")
+    } else if has(&[
+        "fed-rate",
+        "rate-cut",
+        "rate-hike",
+        "interest-rate",
+        "inflation",
+        "recession",
+        "-gdp",
+        "unemployment",
+        "jobs-report",
+        "-cpi",
+        "no-fed-rate",
+    ]) {
+        Some("economy")
+    } else if has(&[
+        "openai",
+        "-gpt",
+        "anthropic",
+        "claude",
+        "-grok",
+        "nvidia",
+        "-apple-",
+        "google",
+        "spacex",
+        "semiconductor",
+        "-chip",
+        "ai-model",
+        "-agi-",
+        "self-driving",
+    ]) {
+        Some("tech")
+    } else if has(&[
+        "iran",
+        "israel",
+        "russia",
+        "ukraine",
+        "china",
+        "taiwan",
+        "gaza",
+        "hormuz",
+        "-war-",
+        "ceasefire",
+        "peace-deal",
+        "nuclear",
+        "sanction",
+        "blockade",
+        "tariff",
+        "-nato",
+        "north-korea",
+        "hezbollah",
+        "netanyahu",
+        "putin",
+        "zelensky",
+    ]) {
+        Some("geopolitics")
+    } else if has(&[
+        "election",
+        "-president",
+        "prime-minister",
+        "midterm",
+        "nominee",
+        "nomination",
+        "-senate",
+        "-house-",
+        "governor",
+        "parliament",
+        "ballot",
+        "referendum",
+        "balance-of-power",
+        "democratic",
+        "republican",
+    ]) {
+        Some("elections")
+    } else if has(&[
+        "oscar",
+        "grammy",
+        "emmy",
+        "box-office",
+        "-movie",
+        "-album",
+        "spotify",
+        "celebrity",
+        "time-person",
+        "met-gala",
+        "rotten-tomatoes",
+        "billboard",
+    ]) {
+        Some("culture")
+    } else if has(&[
+        "temperature",
+        "hurricane",
+        "rainfall",
+        "-snow",
+        "heat-wave",
+        "weather",
+        "climate",
+        "el-nino",
+        "-degrees",
+        "wildfire",
+    ]) {
+        Some("weather")
+    } else {
+        None
+    }
 }
 
 /// News context for a market via newsdata.io, with aggressive credit economy (free plan = 200/day).
@@ -1663,8 +1834,35 @@ async fn fetch_latest_book(
 
 #[cfg(test)]
 mod tests {
-    use super::{drawdown_breaker_tripped, settlement_payout_and_pnl};
+    use super::{arb_category, drawdown_breaker_tripped, settlement_payout_and_pnl};
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn arb_category_routes_real_bootstrap_slugs() {
+        // Representative live slugs land in the expected arb categories (directional executor will skip).
+        assert_eq!(
+            arb_category("us-iran-nuclear-deal-by-june-30"),
+            Some("geopolitics")
+        );
+        assert_eq!(
+            arb_category("will-bitcoin-hit-150k-by-june-30-2026"),
+            Some("crypto")
+        );
+        assert_eq!(
+            arb_category("will-france-win-the-2026-fifa-world-cup-924"),
+            Some("sports")
+        );
+        assert_eq!(
+            arb_category("will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568"),
+            Some("elections")
+        );
+        assert_eq!(
+            arb_category("will-no-fed-rate-cuts-happen-in-2026"),
+            Some("economy")
+        );
+        // A truly uncategorized slug stays directional.
+        assert_eq!(arb_category("will-some-obscure-thing-happen"), None);
+    }
 
     #[test]
     fn drawdown_breaker_gating_and_threshold() {
