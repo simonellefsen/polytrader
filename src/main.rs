@@ -1447,10 +1447,19 @@ async fn execute_arb_opportunity(
         return Ok(());
     }
 
-    // Pairs to buy: bounded by depth (max_size_usdc / total_cost) and a $20 notional cap.
-    const ARB_NOTIONAL_CAP: rust_decimal::Decimal = dec!(20);
+    // Pairs to buy: bounded by available depth and a notional cap. Arbitrage is RISK-FREE on price
+    // (one of YES/NO always resolves to $1), so it should NOT wear the directional per-position cap
+    // ($20) — that throttled real arbs badly (e.g. a 2026-06-19 $0.90 book offered ~$27 of risk-free
+    // profit at $270 depth, but the $20 cap captured only ~$2). Default raised to $250, env-tunable.
+    // CAVEAT for any future REAL trading: snapshot-based legs can mis-fill (one leg fills, the other
+    // doesn't), turning a "risk-free" arb into a directional position — so a large real-money cap needs
+    // simultaneous-fill (WebSocket) execution first. Paper-only here; fills are deterministic.
+    let arb_notional_cap = std::env::var("POLYTRADER_ARB_NOTIONAL_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<rust_decimal::Decimal>().ok())
+        .unwrap_or(dec!(250));
     let depth_pairs = opp.max_size_usdc / opp.total_cost;
-    let cap_pairs = ARB_NOTIONAL_CAP / opp.total_cost;
+    let cap_pairs = arb_notional_cap / opp.total_cost;
     let pairs = depth_pairs.min(cap_pairs).round_dp(2);
     if pairs <= dec!(0) {
         return Ok(());
