@@ -44,15 +44,32 @@ durable edge**, and this — not tooling — is now the central question:
 - **The book is structurally long-dated** (most positions resolve Q4-2026 → 2028-11; only ~2 resolve at
   any near-term date), so live confirmation of edge will take months regardless.
 
-**Investigation to run (the priority over more knobs):** establish whether this approach makes money at
-all, and if not, where edge could come from. Concretely: (1) use the backtest harness to measure
-realized + marked P&L per *signal* and per *market category* over the full history — is any signal
-net-positive after fees, or is it all momentum-churn? (2) compute the calibration/Brier already wired
-(commit bd77832) on the settled set — are the win-prob estimates better than the market mid? (3) if no
-edge is found in the current geopolitics-heavy, slow-resolving universe, the honest conclusion may be
-that **edge requires a different market class** (e.g. the sports markets we currently only arb — a new
-signal class) rather than more tuning of the existing processors. Treat a negative result as a valid,
-important outcome.
+**✅ INVESTIGATION DONE (2026-06-29) — verdict: no positive directional edge; it is NEGATIVE on the only
+clean data.** Decomposed the 16 clean pre-incident settlements (12 markets, all Iran-ceasefire cluster):
+- **Directional single-side bets: −$77.00 (1W / 7L).** The actual signal-driven decisions LOST money.
+  The losers are almost entirely `overreaction_fade` buying "No" (fading the Iran peace/ceasefire/nuclear
+  markets) — which then resolved **Yes** (a real June-2026 catalyst). The fade bet against a genuine
+  event and was wrong 7 of 8 times. This is exactly [[feedback-overreaction-naive-on-correct-extremes]].
+- **Both-sides quasi-arb: +$78.21 (4 markets).** The ONLY source of profit was accidentally holding
+  Yes+No on markets where the combined price was <$1 — a structural quasi-arbitrage, NOT signal edge.
+  **It no longer happens** (disabled by the one-position-per-market guard), so going forward the strategy
+  is purely directional → expected to lose on this evidence.
+- **Net +$1.21** = the quasi-arb (+78) barely covering the directional losses (−77). The headline "profit"
+  was an artifact of a now-removed quirk.
+
+**Caveats:** tiny (12 markets) and entirely one correlated event (Iran ceasefire), so not statistically
+conclusive — but there is *zero* evidence of positive directional edge and clear evidence of loss.
+
+**Implications for direction (these matter more than any remaining knob):**
+1. **`overreaction_fade` is the prime suspect** — it drove the directional losses by fading real
+   catalysts. Either gate it much harder (only fade with strong volatility/no-catalyst evidence) or
+   retire it. Re-examine whether the other directional signals add anything once it's removed.
+2. **The accidental profit came from arb-like structure, not signals.** The one real money-maker was a
+   sub-$1 both-sides position. That points toward **leaning into actual arbitrage** (the YES+NO scanner)
+   over directional prediction — possibly the only place edge has shown up at all.
+3. **A different market class may be required** (e.g. the sports markets we currently only arb), since
+   the geopolitics-directional thesis is unproven-to-negative. This is the honest, important conclusion:
+   the tooling is excellent; the directional alpha is not there.
 
 ## Other standing observations (motivate specific items)
 
