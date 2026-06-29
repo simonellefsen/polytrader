@@ -1695,6 +1695,32 @@ fn arb_category(slug: &str) -> Option<&'static str> {
     }
 }
 
+/// Polymarket taker fee RATE for a market, by category (makers are never charged). Source:
+/// docs.polymarket.com/trading/fees. **Geopolitics is fee-free.** The fee is NOT a flat % of notional —
+/// see [`polymarket_taker_fee`] for the formula. Unclassified markets default to the "Other" rate.
+fn polymarket_taker_fee_rate(slug: &str) -> rust_decimal::Decimal {
+    match arb_category(slug) {
+        Some("geopolitics") => dec!(0),
+        Some("sports") | Some("esports") => dec!(0.03),
+        Some("crypto") => dec!(0.07),
+        Some("finance") | Some("tech") | Some("elections") => dec!(0.04),
+        Some("economy") | Some("culture") | Some("weather") => dec!(0.05),
+        _ => dec!(0.05), // Other / General
+    }
+}
+
+/// Polymarket taker fee for one fill: `shares × rate × price × (1 − price)`. The `price × (1 − price)`
+/// shape peaks at p=0.50 and is zero at the extremes, and is symmetric (a fill at 0.30 costs the same
+/// as at 0.70). Source: docs.polymarket.com/trading/fees. Replaces the old flat `paper_fee_bps × notional`
+/// model — that materially over-charged geopolitics (which is actually free) and mis-shaped the rest.
+fn polymarket_taker_fee(
+    slug: &str,
+    price: rust_decimal::Decimal,
+    shares: rust_decimal::Decimal,
+) -> rust_decimal::Decimal {
+    polymarket_taker_fee_rate(slug) * shares * price * (rust_decimal::Decimal::ONE - price)
+}
+
 /// News context for a market via newsdata.io, with aggressive credit economy (free plan = 200/day).
 ///
 /// Strategy: cache each market's news in `journal.events` (event_type `news_cache`) with a 2h TTL.
@@ -1843,8 +1869,36 @@ async fn fetch_latest_book(
 
 #[cfg(test)]
 mod tests {
-    use super::{arb_category, drawdown_breaker_tripped, settlement_payout_and_pnl};
+    use super::{
+        arb_category, drawdown_breaker_tripped, polymarket_taker_fee, settlement_payout_and_pnl,
+    };
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn polymarket_fee_matches_published_tables() {
+        let shares = dec!(100);
+        // Per docs.polymarket.com/trading/fees (100-share tables, peak at p=0.50):
+        // Crypto $1.75, Sports $0.75, Geopolitics free.
+        assert_eq!(
+            polymarket_taker_fee("will-bitcoin-hit-150k", dec!(0.50), shares),
+            dec!(1.75)
+        );
+        let sport = "will-france-win-the-fifa-world-cup";
+        assert_eq!(polymarket_taker_fee(sport, dec!(0.50), shares), dec!(0.75));
+        assert_eq!(
+            polymarket_taker_fee("us-iran-nuclear-deal-by-june-30", dec!(0.50), shares),
+            dec!(0)
+        );
+        // Symmetric around 0.50, and 0.30 < the 0.50 peak.
+        assert_eq!(
+            polymarket_taker_fee(sport, dec!(0.30), shares),
+            polymarket_taker_fee(sport, dec!(0.70), shares)
+        );
+        assert!(
+            polymarket_taker_fee(sport, dec!(0.30), shares)
+                < polymarket_taker_fee(sport, dec!(0.50), shares)
+        );
+    }
 
     #[test]
     fn arb_category_routes_real_bootstrap_slugs() {

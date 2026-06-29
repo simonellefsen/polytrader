@@ -292,10 +292,17 @@ impl PaperTradingEngine {
         // - Net edge (gross - fees - gas - slip) is the *primary* signal for deliberate tier.
         // - Always journal fills with full context so Hermes can attribute fee drag vs signals.
         // - Paper only: no real money impact. Over-estimating fees protects learning capital.
-        // Legacy note (Fix Round 1): fill.fee uses flat paper_fee_bps for exact compat with Phase 0-2 verified paths.
-        // FeeModel (with its full pessimistic + maker/gas) used only for pre-trade estimates. Future unification
-        // tracked in wiki/log (see Issue 7 suggestion + reconciliation note added below).
-        let fee_rate = Decimal::from(self.paper_fee_bps) / dec!(10000);
+        // Fee model: Polymarket's REAL per-category taker fee (shares × rate × p × (1−p); geopolitics
+        // is fee-free) — see crate::polymarket_taker_fee. Replaces the old flat paper_fee_bps × notional,
+        // which materially over-charged geopolitics (the bulk of the book) and mis-shaped the rest. The
+        // market's slug (→ category) is looked up once here; empty slug ⇒ "Other" rate.
+        let market_slug: String = sqlx::query_scalar(
+            "SELECT COALESCE(slug, '') FROM market_data.markets WHERE gamma_id = $1",
+        )
+        .bind(&order.market_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or_default();
         let mut remaining = order.size;
         let mut fills = vec![];
         let now = chrono::Utc::now();
@@ -397,7 +404,7 @@ impl PaperTradingEngine {
             }
 
             let gross = exec_price * take;
-            let fee = gross * fee_rate;
+            let fee = crate::polymarket_taker_fee(&market_slug, exec_price, take);
             let slippage_bps = if let Some(m) = base_mid {
                 // rough vs mid
                 ((exec_price - m).abs() / m * dec!(10000))
@@ -432,8 +439,7 @@ impl PaperTradingEngine {
             } else {
                 base - base * impact
             };
-            let gross = synth_price * remaining;
-            let fee = gross * fee_rate;
+            let fee = crate::polymarket_taker_fee(&market_slug, synth_price, remaining);
             fills.push(PaperFill {
                 id: uuid::Uuid::new_v4(),
                 order_id: order.id,

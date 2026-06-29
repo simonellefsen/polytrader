@@ -28,8 +28,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::warn;
 
-/// Minimum net profit per unit to include in results.
-const MIN_NET_PROFIT: Decimal = dec!(0.005); // 0.5 % after fees
+/// Minimum net profit per share-pair to include in results. Lowered 2026-06-29 from 0.5% to 0.2%:
+/// with the corrected per-category fee model (geopolitics is fee-free; see `polymarket_taker_fee`),
+/// thin sub-$1 arbs are genuinely risk-free profit and worth capturing.
+const MIN_NET_PROFIT: Decimal = dec!(0.002);
 
 /// A risk-free arbitrage opportunity detected in the orderbook snapshots.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,25 +87,21 @@ pub struct ArbDiagnostics {
     pub best_total_cost_market: Option<String>,
 }
 
-pub struct ArbitrageScanner {
-    taker_bps: Decimal,
-}
+/// Stateless: fees are looked up PER MARKET (Polymarket's per-category taker fee via
+/// `crate::polymarket_taker_fee`), not a single rate, so the scanner carries no fee field.
+#[derive(Default)]
+pub struct ArbitrageScanner;
 
 impl ArbitrageScanner {
-    pub fn new(taker_bps: Decimal) -> Self {
-        Self { taker_bps }
-    }
-
-    /// Default: 0.5 % taker (typical Polymarket low-volume rate; conservative for net).
     pub fn with_default_fees() -> Self {
-        Self::new(dec!(50))
+        Self
     }
 
     /// Scan all active markets for YES + NO best-ask arb.
     ///
-    /// Uses the latest stored orderbook snapshot for each outcome. Returns only
-    /// opportunities where net profit per unit ≥ MIN_NET_PROFIT (0.5 %).
-    /// Sorted best-first by net_profit_per_unit.
+    /// Uses the latest stored orderbook snapshot for each outcome. Returns only opportunities where
+    /// net profit per share-pair ≥ MIN_NET_PROFIT (0.2%), net of Polymarket's real per-category taker
+    /// fee (geopolitics is free). Sorted best-first by net_profit_per_unit.
     ///
     /// RISK (paper-only): Snapshot delay means prices shown may no longer be
     /// achievable. Do not treat this as executable signal without live feeds.
@@ -119,10 +117,12 @@ impl ArbitrageScanner {
     ) -> Result<(Vec<ArbitrageOpportunity>, ArbDiagnostics)> {
         // Fetch the latest YES and NO snapshots for every active market in one query.
         // LATERAL ensures we get exactly the newest row per (market, outcome) pair.
-        let rows: Vec<(String, String, serde_json::Value, serde_json::Value)> = sqlx::query_as(
-            r#"
+        let rows: Vec<(String, String, String, serde_json::Value, serde_json::Value)> =
+            sqlx::query_as(
+                r#"
                 SELECT
                     m.gamma_id,
+                    COALESCE(m.slug, '') AS slug,
                     m.question,
                     yes_snap.asks  AS yes_asks,
                     no_snap.asks   AS no_asks
@@ -143,11 +143,10 @@ impl ArbitrageScanner {
                 ) no_snap ON true
                 WHERE m.active = true AND NOT m.closed
                 "#,
-        )
-        .fetch_all(pool)
-        .await?;
+            )
+            .fetch_all(pool)
+            .await?;
 
-        let fee_rate = self.taker_bps / dec!(10000);
         let mut opportunities = Vec::new();
         let mut diag = ArbDiagnostics {
             markets_scanned: rows.len(),
@@ -155,7 +154,7 @@ impl ArbitrageScanner {
         };
         let mut best_total_cost: Option<(Decimal, String)> = None;
 
-        for (market_id, question, yes_asks, no_asks) in rows {
+        for (market_id, slug, question, yes_asks, no_asks) in rows {
             let (ask_yes, depth_yes) = best_ask(&yes_asks);
             let (ask_no, depth_no) = best_ask(&no_asks);
 
@@ -189,8 +188,10 @@ impl ArbitrageScanner {
             }
             diag.sub_dollar_books += 1;
 
-            // Fee: taker fill on each leg; fee base is the price paid per leg.
-            let combined_fee = (ask_yes + ask_no) * fee_rate * dec!(2);
+            // Per-leg taker fee via Polymarket's real per-category model (shares × rate × p × (1−p);
+            // geopolitics is free). Per share-pair = one share of each leg.
+            let combined_fee = crate::polymarket_taker_fee(&slug, ask_yes, Decimal::ONE)
+                + crate::polymarket_taker_fee(&slug, ask_no, Decimal::ONE);
             let net_profit = gross_profit - combined_fee;
 
             if net_profit < MIN_NET_PROFIT {
