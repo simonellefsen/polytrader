@@ -414,3 +414,14 @@ unit-testable) and is the prerequisite:
   arb is execution realism (simultaneous WebSocket fills), a large investment likely not worth it given
   scarcity. **Net strategic state: neither directional nor top-of-book arb shows capturable edge on the
   current geopolitics-heavy universe; a different market class remains the open structural question.**
+- **2026-06-29 — corrected the fee model to Polymarket's real per-category schedule** (commit 367c957,
+  prompted by the operator finding docs.polymarket.com/trading/fees). The codebase used a flat 50bps of
+  notional; the real fee is `shares × feeRate × p × (1−p)` (peaks at p=0.5, zero at extremes, symmetric)
+  with a **per-category rate, and Geopolitics is FEE-FREE** (the bulk of our book). New
+  `polymarket_taker_fee[_rate]` (rates: geo 0, sports 0.03, crypto 0.07, finance/tech/politics 0.04,
+  econ/culture/weather/other 0.05) unit-tested against the published 100-share tables. Wired into the
+  **arb scanner** (per-leg real fee; MIN_NET_PROFIT lowered 0.5%→0.2% since zero-fee thin arbs are real
+  risk-free profit) and the **paper engine** (per-fill, so executed arbs aren't mis-charged). Effect:
+  thin sub-$1 geopolitics arbs the old assumption wrongly rejected now qualify, and the paper sim stops
+  over-charging fee-free markets. **Minor follow-up:** the DR generator's `FeeContext` (flat 50bps) for
+  directional net-edge is still flat — low priority since directional is now arb-only/muted.
