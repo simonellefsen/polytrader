@@ -394,3 +394,23 @@ unit-testable) and is the prerequisite:
   unaffected. Follows the gated-autonomous-feature pattern so no behavior change ships until enabled.
   Tier 4 ops items (signal-health, LLM-health, drawdown) are now complete; remaining roadmap work is
   Tier 2 structural signals.
+- **2026-06-29 — strategy pivot acted on the edge verdict** (commits 3d42474, 5477051):
+  (1) **Retired `overreaction_fade`** (drove the directional losses by fading the real Iran ceasefire);
+  unwired from the engine, dropped from the scorecard (now 5 signals).
+  (2) **Expanded arb-only** from sports to a broad `arb_category` classifier (crypto/esports/finance/
+  economy/tech/geopolitics/elections/culture/weather/sports) → directional executor skips ~all markets.
+  **Nuance:** the arb scanner already scans ALL markets, so this only stops the net-negative directional
+  engine — it doesn't widen arb reach.
+  (3) **Investigated the arb threshold/margin** — the binding constraint is **not** the threshold.
+  Over 3,569 scans only **5 (0.14%) had a sub-$1 book** (efficient market; avg best total cost $1.0009);
+  the real arbs that appeared ($0.90 on 06-19 w/ $270 depth, ~$27 risk-free profit; $0.98 on 06-24)
+  cleared the threshold easily, while the two thin near-misses ($0.997, $0.999) fail on *gross* margin
+  too small to beat fees (lowering the threshold wouldn't help). The actual throttle was the
+  **$20 arb notional cap** (shared with the directional executor) — it captured ~$2 of that $27.
+  **Fixed (commit 5477051):** arb is risk-free on price, so the cap is now $250 (env
+  `POLYTRADER_ARB_NOTIONAL_CAP`), bounded by depth. **Honest conclusion:** arb on this efficient, slow
+  market set is RARE + execution-limited (only 1 arb ever filled in 10 days; snapshot legs can mis-fill)
+  — this captures the edge that *exists* but is **not a new profit engine**. The deeper lever for real
+  arb is execution realism (simultaneous WebSocket fills), a large investment likely not worth it given
+  scarcity. **Net strategic state: neither directional nor top-of-book arb shows capturable edge on the
+  current geopolitics-heavy universe; a different market class remains the open structural question.**
