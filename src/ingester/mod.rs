@@ -102,6 +102,14 @@ pub async fn ingest_tick(
         .execute(pool)
         .await?;
 
+        // Closed/resolved markets have no live orderbook — their CLOB books return errors every cycle
+        // (was ~29% of all book fetches: 16 of 50 tracked markets are closed, each failing 2 tokens ×
+        // 12 cycles/h = the "CLOB orderbook fetch failed" log flood). We've already captured their
+        // resolution from the Gamma market above, so skip the dead book fetch entirely.
+        if m.closed {
+            continue;
+        }
+
         // For each outcome token, fetch book + mid, store snapshot, update market mids
         for (i, token) in m.clob_token_ids.iter().enumerate() {
             let outcome = m
