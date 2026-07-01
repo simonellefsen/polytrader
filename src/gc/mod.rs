@@ -23,6 +23,9 @@ const SNAPSHOT_RAW_HOURS: i64 = 48;
 const REPORT_RAW_DAYS: i64 = 30;
 /// Keep pure per-cycle telemetry (llm_health / real_account_balance) this recent; older is dropped.
 const TELEMETRY_DAYS: i64 = 14;
+/// Keep full-granularity (5-min) portfolio equity snapshots this recent (1D/1W chart); older
+/// mark-to-market snapshots are thinned to 1/hour (fills/settlements/resets are always kept).
+const PORTFOLIO_RAW_DAYS: i64 = 7;
 /// Rows deleted per batch (bounds lock time / WAL per statement).
 const BATCH: i64 = 10_000;
 
@@ -45,6 +48,7 @@ pub struct GcStats {
     pub signal_days_rolled: u64,
     pub reports_deleted: u64,
     pub telemetry_deleted: u64,
+    pub portfolio_snapshots_deleted: u64,
 }
 
 /// Run one full GC pass: roll up, then prune. Non-fatal per step — a failure in one is logged and the
@@ -71,6 +75,10 @@ pub async fn run_gc(pool: &PgPool) -> GcStats {
     match prune_telemetry(pool).await {
         Ok(n) => s.telemetry_deleted = n,
         Err(e) => tracing::warn!(error = %e, "gc: telemetry prune failed"),
+    }
+    match prune_portfolio_snapshots(pool).await {
+        Ok(n) => s.portfolio_snapshots_deleted = n,
+        Err(e) => tracing::warn!(error = %e, "gc: portfolio snapshot prune failed"),
     }
     tracing::info!(?s, "gc pass complete");
     s
@@ -152,6 +160,28 @@ async fn prune_telemetry(pool: &PgPool) -> Result<u64> {
            SELECT id FROM journal.events
            WHERE event_type IN ('llm_health', 'real_account_balance')
              AND created_at < now() - interval '{TELEMETRY_DAYS} days'
+           LIMIT {BATCH})"
+    );
+    delete_in_batches(pool, &q).await
+}
+
+/// Downsample the portfolio equity curve: beyond the raw window, thin the 5-min `mark_to_market`
+/// snapshots to one per hour (enough granularity for the wide 1M/1Y/ALL P&L charts). Event-marker
+/// snapshots (fills / settlements / resets) are ALWAYS kept — they mark real P&L step-changes — as is
+/// everything within the raw window. Batched.
+async fn prune_portfolio_snapshots(pool: &PgPool) -> Result<u64> {
+    let q = format!(
+        "DELETE FROM paper_trading.virtual_portfolio_snapshots
+         WHERE id IN (
+           SELECT id FROM paper_trading.virtual_portfolio_snapshots v
+           WHERE v.as_of < now() - interval '{PORTFOLIO_RAW_DAYS} days'
+             AND v.snapshot_reason = 'mark_to_market'
+             AND v.id NOT IN (
+               SELECT DISTINCT ON (date_trunc('hour', as_of)) id
+               FROM paper_trading.virtual_portfolio_snapshots
+               WHERE as_of < now() - interval '{PORTFOLIO_RAW_DAYS} days'
+                 AND snapshot_reason = 'mark_to_market'
+               ORDER BY date_trunc('hour', as_of), as_of DESC)
            LIMIT {BATCH})"
     );
     delete_in_batches(pool, &q).await
