@@ -387,11 +387,21 @@ unit-testable) and is the prerequisite:
   stalling). (5) *7d signal-health aggregate ~1.6s, polled every 15s* — reads ~21k decision_report
   payloads (no index helps); wrapped in a 5-min process cache (`health_7d_baseline_cache`) → ~95% fewer
   runs. (I under-measured this one earlier as "fine warm" in an isolated session — it's genuinely slow
-  under prod load.) **Open follow-ups:** *(a)* `orderbook_snapshots` grows unbounded (850MB) — a
-  retention job keeping recent + latest-per-(market,outcome) would cap it. *(b)* a flaky CLOB test
+  under prod load.) **Remaining follow-ups:** *(b)* a flaky CLOB test
   (`place_limit_order_bails_early_on_non_limit`) fails only under parallel `cargo test`, passes single-
   threaded/in isolation. *(c)* stale failed `postgres-backup-retention` Job records (~13d old, pre-WAL-fix)
   clutter `kubectl get` — cosmetic, backups are healthy.
+- **2026-07-01 — DB retention / GC DONE** (commits 2808d0e + 87328fe). The DB was ~1.13GB growing
+  ~60MB/day, unbounded. Root cause: two fat append-only tables (orderbook_snapshots 863MB, decision_report
+  payloads 162MB) whose *useful* signal is thin. New daily in-app GC (`src/gc`, spawned from main ~2min
+  after boot then 24h) with **hot/warm/cold tiering + rollups**: (1) orderbook mids >48h → hourly
+  `market_data.price_history`, prune raw keeping latest-per-(market,outcome); (2) decision_reports >30d →
+  per-day per-signal `journal.signal_daily`, prune raw; (3) telemetry (llm_health/real_account_balance)
+  >14d dropped; (4) portfolio equity snapshots >7d downsampled to 1/hour (event-markers always kept). All
+  deletes batched (10k); rollups idempotent; journals a `gc_run` event. **Result: first pass deleted
+  274k stale snapshots + 2.7k old marks; VACUUM FULL → 1.13GB → 372MB (−67%), and now BOUNDED at
+  ~370MB steady-state** (orderbook ~94MB @48h + events ~270MB @30d; autovacuum reclaims daily deletes,
+  no recurring VACUUM FULL). price_history (3MB) + signal_daily preserve the price/signal history compactly.
 - **2026-06-24** — **Calibration scorecard DONE** (commit bd77832, Tier 3). Brier + reliability buckets
   on entry `win_prob_estimate` vs outcomes, in Hermes reflection metrics. First live read: skill +0.28,
   model underconfident on high-conviction bets. Pure `compute_calibration` unit-tested; join is
