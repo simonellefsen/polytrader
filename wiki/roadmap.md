@@ -366,9 +366,19 @@ unit-testable) and is the prerequisite:
   helper. **WAL-archiving alerting deliberately NOT built into Hermes** — investigation showed
   `pg_stat_archiver` is per-instance and misleading on replicas (replica froze at 45k failures / last
   archive 06-17 while the primary archived healthily in real time); it belongs in primary-aware CNPG
-  monitoring. Noted the 7d signal-health aggregate is a seq scan (warm ~420ms, cold ~2.67s); a partial
-  index `events(created_at) WHERE event_type='decision_report'` would help but is a schema migration
-  (deferred — warm perf is acceptable for the 10-min cycle / on-demand dashboard).
+  monitoring.
+- **2026-06-30/07-01 — ops diagnostics from the periodic checks.** (1) *CLOB fetch flood fixed* (commit
+  bf2db16): ~352 "CLOB orderbook fetch failed" WARNs/hr were the ingester fetching dead books for the 16
+  closed/resolved markets (of 50 tracked); skip book-fetch when `m.closed` → 0. (2) *Slow-statement WARNs
+  root-caused + fixed* (commit 9b64f35): the chronic ~1.3s/183-per-hour query was NOT the 7d
+  signal-health aggregate (that's an index scan, ~350ms warm; its earlier WARNs were cold-cache after
+  restarts) — it was the /board's "latest decision_report/news per market", a DISTINCT ON over all ~92k
+  decision_reports with a 41MB external-merge disk sort. Fixed with `idx_events_type_market_created`
+  (event_type, (payload->>'market_id'), created_at DESC) + rewriting to a markets-driven LATERAL LIMIT-1
+  (~1.3s → 0.5ms; WARNs 183/hr → ~0). *Correction to the note above: DISTINCT ON couldn't use a plain
+  index (reads all rows to dedup); the LATERAL rewrite is what unlocks per-market index seeks.* (3)
+  *Remaining benign:* ~33/hr "bootstrap slug delisted" (stale watchlist — resolved Iran slugs gone from
+  Gamma; harmless), the 8 redeploy-artifact directional positions (long-dated, ~−$5 drift).
 - **2026-06-24** — **Calibration scorecard DONE** (commit bd77832, Tier 3). Brier + reliability buckets
   on entry `win_prob_estimate` vs outcomes, in Hermes reflection metrics. First live read: skill +0.28,
   model underconfident on high-conviction bets. Pure `compute_calibration` unit-tested; join is
