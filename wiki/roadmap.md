@@ -379,6 +379,19 @@ unit-testable) and is the prerequisite:
   index (reads all rows to dedup); the LATERAL rewrite is what unlocks per-market index seeks.* (3)
   *Remaining benign:* ~33/hr "bootstrap slug delisted" (stale watchlist — resolved Iran slugs gone from
   Gamma; harmless), the 8 redeploy-artifact directional positions (long-dated, ~−$5 drift).
+- **2026-07-01 (2nd check) — two more slow queries fixed** (commit 39acc06). (4) *Arb scanner ~17s PER
+  CYCLE* — the core query of the arb-only strategy: `orderbook_snapshots` (316k rows / 850MB) was only
+  indexed on `token_id`, but the arb scanner / `fetch_latest_book` / `recent_move` all look up the latest
+  book by (market_id, outcome, fetched_at DESC) → ~100 parallel-sort-scans per scan. New
+  `idx_obs_market_outcome_fetched` → 17s → **1ms** (also un-blocks the 5-min loop the 17s scan was
+  stalling). (5) *7d signal-health aggregate ~1.6s, polled every 15s* — reads ~21k decision_report
+  payloads (no index helps); wrapped in a 5-min process cache (`health_7d_baseline_cache`) → ~95% fewer
+  runs. (I under-measured this one earlier as "fine warm" in an isolated session — it's genuinely slow
+  under prod load.) **Open follow-ups:** *(a)* `orderbook_snapshots` grows unbounded (850MB) — a
+  retention job keeping recent + latest-per-(market,outcome) would cap it. *(b)* a flaky CLOB test
+  (`place_limit_order_bails_early_on_non_limit`) fails only under parallel `cargo test`, passes single-
+  threaded/in isolation. *(c)* stale failed `postgres-backup-retention` Job records (~13d old, pre-WAL-fix)
+  clutter `kubectl get` — cosmetic, backups are healthy.
 - **2026-06-24** — **Calibration scorecard DONE** (commit bd77832, Tier 3). Brier + reliability buckets
   on entry `win_prob_estimate` vs outcomes, in Hermes reflection metrics. First live read: skill +0.28,
   model underconfident on high-conviction bets. Pure `compute_calibration` unit-tested; join is
