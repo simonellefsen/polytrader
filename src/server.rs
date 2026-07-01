@@ -2516,32 +2516,36 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
     .await
     .unwrap_or_default();
 
-    // Latest decision report, news cache, and open position per market.
-    let dr_rows: Vec<(Option<String>, serde_json::Value)> = sqlx::query_as(
-        "SELECT DISTINCT ON (payload->>'market_id') payload->>'market_id', payload
-         FROM journal.events WHERE event_type = 'decision_report'
-         ORDER BY payload->>'market_id', created_at DESC",
+    // Latest decision report, news cache, and open position per market. Driven from the ~50-row markets
+    // table with a LATERAL LIMIT-1 lookup (backed by idx_events_type_market_created) instead of a
+    // DISTINCT ON scan over all ~92k decision_reports — ~1.3s external-merge sort → ~0.5ms.
+    let dr_rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        "SELECT m.gamma_id, latest.payload
+         FROM market_data.markets m
+         CROSS JOIN LATERAL (
+             SELECT payload FROM journal.events
+             WHERE event_type = 'decision_report' AND payload->>'market_id' = m.gamma_id
+             ORDER BY created_at DESC LIMIT 1
+         ) latest",
     )
     .fetch_all(pool)
     .await
     .unwrap_or_default();
-    let dr_map: HashMap<String, serde_json::Value> = dr_rows
-        .into_iter()
-        .filter_map(|(m, p)| Some((m?, p)))
-        .collect();
+    let dr_map: HashMap<String, serde_json::Value> = dr_rows.into_iter().collect();
 
-    let news_rows: Vec<(Option<String>, serde_json::Value)> = sqlx::query_as(
-        "SELECT DISTINCT ON (payload->>'market_id') payload->>'market_id', payload->'news'
-         FROM journal.events WHERE event_type = 'news_cache'
-         ORDER BY payload->>'market_id', created_at DESC",
+    let news_rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        "SELECT m.gamma_id, latest.news
+         FROM market_data.markets m
+         CROSS JOIN LATERAL (
+             SELECT payload->'news' AS news FROM journal.events
+             WHERE event_type = 'news_cache' AND payload->>'market_id' = m.gamma_id
+             ORDER BY created_at DESC LIMIT 1
+         ) latest",
     )
     .fetch_all(pool)
     .await
     .unwrap_or_default();
-    let news_map: HashMap<String, serde_json::Value> = news_rows
-        .into_iter()
-        .filter_map(|(m, p)| Some((m?, p)))
-        .collect();
+    let news_map: HashMap<String, serde_json::Value> = news_rows.into_iter().collect();
 
     let pos_rows: Vec<(String, String, Decimal, Decimal)> = sqlx::query_as(
         "SELECT market_id, outcome, shares, avg_entry_price FROM paper_trading.paper_positions WHERE shares > 0",
