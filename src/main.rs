@@ -23,6 +23,7 @@ mod ui; // Dioxus UI (Phase 2: rsx App now SSR-rendered source + client fetch re
 // No behavior change to any existing path; unused in this increment (full wiring in follow-ups). #[allow] inside strategy/mod.rs for clean clippy.
 mod backtest; // offline replay harness (read-only; `polytrader backtest` subcommand) — reuses risk+strategy pure cores
 mod clob; // gated real/authenticated CLOB client (foundation for future order placement using derived L2 creds)
+mod gc; // daily DB garbage collection: roll fat raw data into compact summaries, prune beyond retention windows
 mod risk;
 mod strategy;
 
@@ -169,6 +170,30 @@ async fn main() -> Result<()> {
         });
         // TODO (post-Phase 0 / when submit exercised): use tokio::select! + cancellation token or JoinHandle::abort
         // for clean shutdown of the ingestion task (current fire-and-forget is acceptable for bootstrap).
+    }
+
+    // Daily DB garbage collection: roll fat raw data (orderbook books, decision_report payloads) into
+    // compact summaries + prune beyond the retention windows so the DB stays bounded (~60MB/day growth).
+    // Runs ~2 min after boot (drains the initial backlog) then every 24h. Journals a `gc_run` event.
+    {
+        let pool = pool.clone();
+        let journal = journal.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            loop {
+                let stats = gc::run_gc(&pool).await;
+                let _ = journal
+                    .record_journal_event(
+                        "gc_run",
+                        "polytrader_gc",
+                        "info",
+                        serde_json::to_value(&stats).unwrap_or(serde_json::json!({})),
+                    )
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+            }
+        });
+        info!("Daily DB garbage-collection task spawned (rollup + prune; retention: 48h books / 30d reports)");
     }
     info!(
         "Background ingestion task spawned (Gamma + CLOB public, {}s interval, rate-limited)",
