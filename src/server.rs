@@ -1212,6 +1212,17 @@ fn signal_health(baseline_pct: Decimal, recent_pct: Decimal, recent_n: usize) ->
     "ok"
 }
 
+/// Process-wide 5-minute cache for the expensive 7-day signal-health baseline. That aggregate reads
+/// ~21k decision_report payloads (~1.6s) and is polled on every /trades/data hit (dashboard, 15s); it's
+/// a slow-moving multi-day trend, so serving a ≤5-min-old value is fine and cuts the DB load ~95%.
+#[allow(clippy::type_complexity)]
+fn health_7d_baseline_cache(
+) -> &'static std::sync::Mutex<Option<(std::time::Instant, (i64, [i64; 6]))>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, (i64, [i64; 6]))>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 /// JSON backing the /trades visualization: portfolio summary, open positions with live unrealized
 /// P&L (current mid vs avg entry), and the recent autonomous execution feed. Read-only, paper-only.
 async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1642,24 +1653,44 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     // against a 7d baseline surfaces the slow slide. "fired" = the score string contains a 1-9 digit
     // (any nonzero decimal does; "0"/"-0"/"0.00"/absent do not) — a cast-free, robust mirror of
     // `!Decimal::is_zero()` that can't throw on a stray non-numeric score. Columns follow SIGNALS order.
-    let long_baseline: Option<(i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
-        "SELECT count(*)::bigint,
-           count(*) FILTER (WHERE payload->'report'->'attribution'->'orderbook_momentum'->>'score' ~ '[1-9]')::bigint,
-           count(*) FILTER (WHERE payload->'report'->'attribution'->'spike_divergence'->>'score' ~ '[1-9]')::bigint,
-           count(*) FILTER (WHERE payload->'report'->'attribution'->'overreaction_fade'->>'score' ~ '[1-9]')::bigint,
-           count(*) FILTER (WHERE payload->'report'->'attribution'->'theta_convergence'->>'score' ~ '[1-9]')::bigint,
-           count(*) FILTER (WHERE payload->'report'->'attribution'->'yahoo_finance'->>'score' ~ '[1-9]')::bigint,
-           count(*) FILTER (WHERE payload->'report'->'attribution'->'news_sentiment'->>'score' ~ '[1-9]')::bigint
-         FROM journal.events
-         WHERE event_type = 'decision_report' AND created_at > now() - interval '7 days'",
-    )
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-    let (baseline_7d_total, baseline_7d_fired): (i64, [i64; 6]) = match long_baseline {
-        Some((t, a, b, c, d, e, f)) => (t, [a, b, c, d, e, f]),
-        None => (0, [0; 6]),
+    let (baseline_7d_total, baseline_7d_fired): (i64, [i64; 6]) = {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(300);
+        let cache = health_7d_baseline_cache();
+        let cached = cache.lock().ok().and_then(|g| {
+            g.as_ref()
+                .filter(|(t, _)| t.elapsed() < TTL)
+                .map(|(_, v)| *v)
+        });
+        if let Some(v) = cached {
+            v
+        } else {
+            let computed: Option<(i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
+                "SELECT count(*)::bigint,
+                   count(*) FILTER (WHERE payload->'report'->'attribution'->'orderbook_momentum'->>'score' ~ '[1-9]')::bigint,
+                   count(*) FILTER (WHERE payload->'report'->'attribution'->'spike_divergence'->>'score' ~ '[1-9]')::bigint,
+                   count(*) FILTER (WHERE payload->'report'->'attribution'->'overreaction_fade'->>'score' ~ '[1-9]')::bigint,
+                   count(*) FILTER (WHERE payload->'report'->'attribution'->'theta_convergence'->>'score' ~ '[1-9]')::bigint,
+                   count(*) FILTER (WHERE payload->'report'->'attribution'->'yahoo_finance'->>'score' ~ '[1-9]')::bigint,
+                   count(*) FILTER (WHERE payload->'report'->'attribution'->'news_sentiment'->>'score' ~ '[1-9]')::bigint
+                 FROM journal.events
+                 WHERE event_type = 'decision_report' AND created_at > now() - interval '7 days'",
+            )
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+            let v = match computed {
+                Some((t, a, b, c, d, e, f)) => (t, [a, b, c, d, e, f]),
+                None => (0, [0; 6]),
+            };
+            // Only cache a real (successful) computation, not a DB-error fallback of zeros.
+            if computed.is_some() {
+                if let Ok(mut g) = cache.lock() {
+                    *g = Some((std::time::Instant::now(), v));
+                }
+            }
+            v
+        }
     };
     // Latest Hermes weights + per-signal realized P&L (if any).
     let latest_weights: Option<serde_json::Value> = sqlx::query_scalar(
