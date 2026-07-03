@@ -186,6 +186,16 @@ conclusive — but there is *zero* evidence of positive directional edge and cle
   queries now filter `created_at >= COALESCE((SELECT max(as_of) FROM …snapshots WHERE snapshot_reason =
   'manual_paper_reset'), '-infinity')`. Verified live: panel now shows **0/0/$0** (reconciles with
   portfolio realized 0) and the backtest **ANCHOR: PASS** (0 == 0). Self-limiting for future resets.
+  - **THIRD site of the same bug, found 2026-07-03 ~1h after the arb-activation reset (image
+    local-1783112138):** the CASH recompute in `write_mark_to_market_snapshot` (main.rs) and the
+    `post_fill_tx` snapshot (paper/engine.rs) both computed `virtual_usdc = 10000 − locked − SUM(all
+    fills' fees) + realized`. `SUM(fee)` was LIFETIME, but a reset preserves fills for audit — so the
+    first mark after a reset re-subtracted the pre-reset fee total from the fresh $10k seed, silently
+    clawing the balance back to the pre-reset EQUITY. Observed: reset wrote $10,000 at 19:41, the 19:45
+    mark overwrote it with **$9,953.20 = exactly pre-reset cash $9,818.01 + locked $135.19**. (This also
+    means the 06-29 reset's "$9,947 clean baseline" was never really $10k — same bug.) Fix: both fee sums
+    now carry the `manual_paper_reset` boundary filter. Self-corrected live to **$10,000** on the next
+    mark (0 post-reset fills ⇒ fees 0). Delta-based cash path (engine.rs ~L576) was already reset-safe.
 
 - **Arb activation — DONE 2026-07-03 (image local-1783107611).** Investigated the "arb threshold/margin"
   lever and PROVED it a dead end: over 1,883 scans/7d the market was efficient (~$1.001) in 1,882; the

@@ -351,11 +351,20 @@ async fn write_mark_to_market_snapshot(pool: &sqlx::PgPool) -> Result<()> {
     .fetch_one(pool)
     .await
     .unwrap_or(dec!(0));
-    let fees: rust_decimal::Decimal =
-        sqlx::query_scalar("SELECT COALESCE(SUM(fee), 0) FROM paper_trading.paper_fills")
-            .fetch_one(pool)
-            .await
-            .unwrap_or(dec!(0));
+    // Fees SINCE THE LAST PAPER RESET only. `POST /paper/reset` re-baselines cash to the $10k seed but
+    // PRESERVES fills for audit — so counting lifetime fees here would permanently re-subtract pre-reset
+    // fees from the fresh seed, silently clawing the reset back toward the pre-reset equity (the bug that
+    // made this snapshot recompute $10,000 → $9,953.20 right after the 2026-07-03 reset). Reset-boundary
+    // filter mirrors the settlements fix; `realized` is already reset-aware (reads the latest snapshot).
+    let fees: rust_decimal::Decimal = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(fee), 0) FROM paper_trading.paper_fills
+         WHERE created_at >= COALESCE(
+           (SELECT max(as_of) FROM paper_trading.virtual_portfolio_snapshots
+            WHERE snapshot_reason = 'manual_paper_reset'), '-infinity'::timestamptz)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(dec!(0));
     let usdc = (dec!(10000) - locked - fees + realized).max(dec!(0));
 
     sqlx::query(

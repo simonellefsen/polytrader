@@ -178,10 +178,17 @@ impl PaperTradingEngine {
         )
         .fetch_one(&mut *tx)
         .await?;
-        let total_fees_agg: Decimal =
-            sqlx::query_scalar("SELECT COALESCE(SUM(fee), 0) FROM paper_trading.paper_fills")
-                .fetch_one(&mut *tx)
-                .await?;
+        // Fees SINCE THE LAST PAPER RESET only (see write_mark_to_market_snapshot): the reset preserves
+        // fills for audit but re-baselines cash, so lifetime fees would permanently re-subtract pre-reset
+        // fees from the fresh $10k seed. Reset-boundary filter keeps the post-fill cash consistent.
+        let total_fees_agg: Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(fee), 0) FROM paper_trading.paper_fills
+             WHERE created_at >= COALESCE(
+               (SELECT max(as_of) FROM paper_trading.virtual_portfolio_snapshots
+                WHERE snapshot_reason = 'manual_paper_reset'), '-infinity'::timestamptz)",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         // Carry forward cumulative realized P&L from settlements (do NOT reset to 0 on each fill,
         // else a fill after a settlement would wipe realized P&L — the input the "proven" gate needs).
         let realized_agg: Decimal = sqlx::query_scalar(
