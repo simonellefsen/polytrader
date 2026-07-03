@@ -193,7 +193,7 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
             }
         });
-        info!("Daily DB garbage-collection task spawned (rollup + prune; retention: 48h books / 30d reports)");
+        info!("Daily DB garbage-collection task spawned (rollup + prune; retention: 48h books / 14d reports)");
     }
     info!(
         "Background ingestion task spawned (Gamma + CLOB public, {}s interval, rate-limited)",
@@ -1460,15 +1460,22 @@ async fn execute_arb_opportunity(
     if opp.total_cost <= dec!(0) {
         return Ok(());
     }
-    // No pyramiding: skip if we already hold any leg of this market.
-    let held: rust_decimal::Decimal = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(shares), 0) FROM paper_trading.paper_positions WHERE market_id = $1 AND shares > 0",
+    // No pyramiding the SAME arb: skip only if we already hold BOTH legs (a complete YES+NO pair) —
+    // that's an arb we already captured, and re-buying it every scan cycle while the book stays
+    // mispriced would pyramid. A DIRECTIONAL single-side hold must NOT block a risk-free arb, though:
+    // the incremental YES+NO pair is guaranteed-profitable on top of whatever else we hold. (This was
+    // the bug that made us skip the 2026-07-01 0.968 arb on market 616902 because we held a legacy
+    // directional No there.)
+    let (yes_held, no_held): (rust_decimal::Decimal, rust_decimal::Decimal) = sqlx::query_as(
+        "SELECT COALESCE(SUM(shares) FILTER (WHERE outcome = 'Yes'), 0),
+                COALESCE(SUM(shares) FILTER (WHERE outcome = 'No'), 0)
+         FROM paper_trading.paper_positions WHERE market_id = $1 AND shares > 0",
     )
     .bind(&opp.market_id)
     .fetch_one(pool)
     .await
-    .unwrap_or(dec!(0));
-    if held > dec!(0) {
+    .unwrap_or((dec!(0), dec!(0)));
+    if yes_held > dec!(0) && no_held > dec!(0) {
         return Ok(());
     }
 

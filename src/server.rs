@@ -1401,16 +1401,23 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     };
 
     // Settlements: resolved positions → realized P&L (ground truth on strategy performance).
-    // ALL settlements (not a LIMIT-25 window): the realized-P&L aggregates below (the settlements card
-    // AND the dual-gate simulation) must reconcile with the AUTHORITATIVE cumulative portfolio realized
-    // P&L in virtual_portfolio_snapshots, which is the running sum of every paper_position_settled
-    // event. Summing only the most-recent 25 events under-/over-counted wildly — e.g. when a resolved
-    // market was being re-settled every cycle, 21 of the last 25 events were phantom duplicates, which
-    // crowded out the real (mostly losing) settlements and reported settled_realized ≈ −$84 against a
-    // true portfolio realized of +$5. The display list is capped to the 25 most recent separately.
+    // ALL settlements SINCE THE LAST PAPER RESET (not a LIMIT-25 window): the realized-P&L aggregates
+    // below (the settlements card AND the dual-gate simulation) must reconcile with the AUTHORITATIVE
+    // cumulative portfolio realized P&L in virtual_portfolio_snapshots, which is the running sum of every
+    // paper_position_settled event. Summing only the most-recent 25 events under-/over-counted wildly —
+    // e.g. when a resolved market was being re-settled every cycle, 21 of the last 25 events were phantom
+    // duplicates, which crowded out the real (mostly losing) settlements and reported settled_realized ≈
+    // −$84 against a true portfolio realized of +$5. The display list is capped to the 25 most recent
+    // separately. RESET-BOUNDARY: `POST /paper/reset` zeroes the portfolio (writes a `manual_paper_reset`
+    // snapshot) but PRESERVES the journal, so pre-reset settlements (incl. the 2026-06-24 re-settlement
+    // phantoms) must be excluded here or the panel reports stale wins against a post-reset realized of 0.
     let settle_rows: Vec<(serde_json::Value, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         "SELECT payload, created_at FROM journal.events
-         WHERE event_type = 'paper_position_settled' ORDER BY created_at DESC",
+         WHERE event_type = 'paper_position_settled'
+           AND created_at >= COALESCE(
+             (SELECT max(as_of) FROM paper_trading.virtual_portfolio_snapshots
+              WHERE snapshot_reason = 'manual_paper_reset'), '-infinity'::timestamptz)
+         ORDER BY created_at DESC",
     )
     .fetch_all(pool)
     .await
@@ -1725,9 +1732,14 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     // score) in ANY of that market's recent decision reports (not just the final one). Overlapping by
     // design (each signal keeps its own record), so this is a count-based win-rate, not a P&L split
     // (Hermes does the P&L split).
+    // Reset-boundary filter (same rationale as the settlements card above): only settlements since the
+    // last paper reset, so the per-signal hit-rate reflects the CURRENT run, not stale pre-reset history.
     let settled_rows: Vec<(Option<String>, Option<Decimal>)> = sqlx::query_as(
         "SELECT payload->>'market_id', (payload->>'realized_pnl')::numeric
-         FROM journal.events WHERE event_type = 'paper_position_settled'",
+         FROM journal.events WHERE event_type = 'paper_position_settled'
+           AND created_at >= COALESCE(
+             (SELECT max(as_of) FROM paper_trading.virtual_portfolio_snapshots
+              WHERE snapshot_reason = 'manual_paper_reset'), '-infinity'::timestamptz)",
     )
     .fetch_all(pool)
     .await

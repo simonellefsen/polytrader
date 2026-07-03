@@ -24,22 +24,82 @@ pub async fn ingest_tick(
     pool: &PgPool,
     bootstrap: &[String],
 ) -> Result<()> {
-    // When a bootstrap allowlist is configured, fetch those markets by slug directly (guaranteed
-    // to retrieve them). Otherwise fall back to generic active-market discovery.
-    let candidates = if bootstrap.is_empty() {
+    // Build the scan universe, deduped by gamma id:
+    //   (1) curated bootstrap slugs (or generic active discovery when no allowlist), PLUS
+    //   (2) volume-ranked arb-discovery markets (opt-in via POLYTRADER_ARB_DISCOVERY_LIMIT) — breadth
+    //       is the arb frequency lever: dislocations are rare per-market but scale with books watched, PLUS
+    //   (3) every market we currently hold a position in — a CORRECTNESS guarantee: a held market that
+    //       rotates out of the top-N discovery list must still be re-ingested so it resolves/settles
+    //       (never go blind; same class of bug as the 2026-06-17 settlement blocker).
+    let discovery_limit = std::env::var("POLYTRADER_ARB_DISCOVERY_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+
+    let mut candidates: Vec<gamma::Market> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // (1) curated bootstrap (or generic active discovery when no allowlist).
+    let base_markets = if bootstrap.is_empty() {
         gamma.list_active_markets().await?
     } else {
         gamma.fetch_markets_by_slugs(bootstrap).await?
     };
+    for m in base_markets {
+        if !m.id.is_empty() && seen.insert(m.id.clone()) {
+            candidates.push(m);
+        }
+    }
+
+    // (2) volume-ranked arb discovery (opt-in). Non-fatal: bootstrap still ingests on failure.
+    if discovery_limit > 0 {
+        match gamma.discover_arb_markets(discovery_limit).await {
+            Ok(ms) => {
+                for m in ms {
+                    if seen.insert(m.id.clone()) {
+                        candidates.push(m);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "arb-discovery fetch failed; continuing with bootstrap only")
+            }
+        }
+    }
+
+    // (3) held-position markets not already in the universe (settlement-tracking guarantee).
+    let held_slugs: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT m.slug FROM paper_trading.paper_positions p
+         JOIN market_data.markets m ON m.gamma_id = p.market_id
+         WHERE p.shares > 0 AND COALESCE(m.slug, '') <> ''",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let missing_held: Vec<String> = held_slugs
+        .into_iter()
+        .filter(|s| !candidates.iter().any(|m| &m.slug == s))
+        .collect();
+    if !missing_held.is_empty() {
+        for m in gamma
+            .fetch_markets_by_slugs(&missing_held)
+            .await
+            .unwrap_or_default()
+        {
+            if seen.insert(m.id.clone()) {
+                candidates.push(m);
+            }
+        }
+    }
+
+    tracing::info!(
+        universe = candidates.len(),
+        discovery_limit,
+        "ingest universe built"
+    );
     let mut processed = 0usize;
 
     for m in candidates {
-        // Defensive: with the slug path this always matches; kept so discovery mode + any stray
-        // results are still constrained to the allowlist.
-        if !bootstrap.is_empty() && !bootstrap.iter().any(|b| b == &m.id || b == &m.slug) {
-            continue;
-        }
-
         let outcomes_j = serde_json::to_value(&m.outcomes)?;
         let tokens_j = serde_json::to_value(&m.clob_token_ids)?;
         let prices_j = serde_json::to_value(&m.outcome_prices)?;

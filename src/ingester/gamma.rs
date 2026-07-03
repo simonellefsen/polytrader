@@ -33,6 +33,11 @@ pub struct Market {
     /// reflects the fee schedule in force.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub taker_fee_rate: Option<Decimal>,
+    /// Gamma `enableOrderBook` — whether the market has a live CLOB order book. Used to filter the
+    /// volume-ranked arb-discovery universe down to markets that actually have books to arb (skipping
+    /// order-book-less markets avoids a wasted CLOB fetch + error every tick). Defaults false.
+    #[serde(default)]
+    pub enable_order_book: bool,
 }
 
 #[derive(Clone)]
@@ -111,7 +116,41 @@ impl GammaClient {
                     _ => None,
                 }
             },
+            enable_order_book: v
+                .get("enableOrderBook")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false),
         }
+    }
+
+    /// Discover the top active binary markets by 24h volume that have a live order book — the
+    /// volume-ranked arb-scan universe. ONE batched Gamma call (unlike the per-slug bootstrap path),
+    /// filtered client-side to 2-outcome (Yes/No) order-book markets since the YES+NO<$1 arb needs
+    /// exactly two complementary books. Breadth is the point: real arbs are rare per-market but
+    /// scale with the number of books watched. Failure is caller-non-fatal.
+    pub async fn discover_arb_markets(&self, limit: usize) -> Result<Vec<Market>> {
+        let url = format!(
+            "{}/markets?active=true&closed=false&order=volume24hr&ascending=false&limit={}",
+            self.base, limit
+        );
+        let resp: Vec<Value> = self.http.get(&url).send().await?.json().await?;
+        let out: Vec<Market> = resp
+            .iter()
+            .map(Self::parse_market)
+            .filter(|m| {
+                !m.closed
+                    && m.enable_order_book
+                    && m.outcomes.len() == 2
+                    && m.clob_token_ids.len() == 2
+            })
+            .collect();
+        tracing::info!(
+            returned = resp.len(),
+            usable = out.len(),
+            limit,
+            "gamma arb-discovery markets"
+        );
+        Ok(out)
     }
 
     /// Fetch specific markets by slug (public Gamma /markets?slug=...).

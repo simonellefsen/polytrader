@@ -886,10 +886,18 @@ type ReportQueryRow = (
 );
 
 async fn load_settlements(pool: &sqlx::PgPool) -> anyhow::Result<Vec<SettlementRow>> {
+    // RESET-BOUNDARY: the fidelity anchor must reproduce the LIVE portfolio realized, which a
+    // `POST /paper/reset` zeroes (writing a `manual_paper_reset` snapshot) while PRESERVING the journal.
+    // So only settlements at/after the latest reset count — otherwise pre-reset events (incl. the
+    // 2026-06-24 re-settlement phantoms, +$5.41) are summed against a post-reset live realized of 0 and
+    // the anchor reads a false MISMATCH. Mirrors the /trades settlements panel filter.
     let rows: Vec<SettlementQueryRow> = sqlx::query_as(
         "SELECT payload->>'won', payload->>'shares', payload->>'cost_basis', payload->>'realized_pnl'
          FROM journal.events
          WHERE event_type = 'paper_position_settled'
+           AND created_at >= COALESCE(
+             (SELECT max(as_of) FROM paper_trading.virtual_portfolio_snapshots
+              WHERE snapshot_reason = 'manual_paper_reset'), '-infinity'::timestamptz)
          ORDER BY created_at ASC",
     )
     .fetch_all(pool)

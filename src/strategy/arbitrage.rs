@@ -138,6 +138,7 @@ impl ArbitrageScanner {
                     SELECT asks
                     FROM market_data.orderbook_snapshots
                     WHERE market_id = m.gamma_id AND outcome = 'Yes'
+                      AND fetched_at > now() - interval '30 minutes'
                     ORDER BY fetched_at DESC
                     LIMIT 1
                 ) yes_snap ON true
@@ -145,6 +146,7 @@ impl ArbitrageScanner {
                     SELECT asks
                     FROM market_data.orderbook_snapshots
                     WHERE market_id = m.gamma_id AND outcome = 'No'
+                      AND fetched_at > now() - interval '30 minutes'
                     ORDER BY fetched_at DESC
                     LIMIT 1
                 ) no_snap ON true

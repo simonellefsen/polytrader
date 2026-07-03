@@ -18,9 +18,10 @@ use sqlx::PgPool;
 /// Keep full orderbook snapshots this recent (covers `recent_move`'s 3h window + buffer + recent
 /// backtests). Older raw snapshots are rolled to hourly `price_history` then deleted.
 const SNAPSHOT_RAW_HOURS: i64 = 48;
-/// Keep raw decision_reports this recent (24h scorecard, 7d health, ~30d of harness backtest). Older
-/// are rolled to daily `signal_daily` then deleted.
-const REPORT_RAW_DAYS: i64 = 30;
+/// Keep raw decision_reports this recent (24h scorecard, 7d health, ~14d of harness backtest attribution).
+/// Older are rolled to daily `signal_daily` then deleted. Was 30d; lowered to 14d on 2026-07-02 to cap the
+/// events table (~5.2k reports/day × ~1.7KB was trending to ~270MB @30d) — see wiki/roadmap retention note.
+const REPORT_RAW_DAYS: i64 = 14;
 /// Keep pure per-cycle telemetry (llm_health / real_account_balance) this recent; older is dropped.
 const TELEMETRY_DAYS: i64 = 14;
 /// Keep full-granularity (5-min) portfolio equity snapshots this recent (1D/1W chart); older

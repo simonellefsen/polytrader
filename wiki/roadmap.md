@@ -176,12 +176,41 @@ conclusive — but there is *zero* evidence of positive directional edge and cle
 
 ## Tier 4 — Ops polish
 
-- **Make the backtest fidelity anchor reset-aware** (follow-up to the 2026-06-29 paper reset). A
-  `POST /paper/reset` zeroes the portfolio snapshot but PRESERVES the journal, so `realized_from_settlements`
-  (which sums all `paper_position_settled` events, +$5.41 incl. the 2026-06-24 phantom) no longer matches
-  the live portfolio realized (now 0) → the anchor reads MISMATCH. Fix: `load_settlements` should only
-  count settlements after the latest paper-reset boundary (there's a reset journal event to anchor on),
-  matching how the live portfolio reconciles post-reset.
+- **Reset-boundary awareness for settlements — DONE 2026-07-03.** A `POST /paper/reset` zeroes the
+  portfolio snapshot (writes a `manual_paper_reset` snapshot) but PRESERVES the journal, so any code that
+  summed ALL `paper_position_settled` events reconciled against a stale, pre-reset baseline. Two sites
+  carried this bug: (1) the **backtest fidelity anchor** (`load_settlements`) read a false MISMATCH
+  (+$5.41 recomputed vs 0 live); (2) the **`/trades` dashboard** (`trades_data_handler` settlements card +
+  per-signal realized hit-rate) reported **37 settled / 26 wins / +$5.41** — 22 of them the 06-24
+  money-pump phantom (net −$14.06) — against a true post-reset realized of 0. Fix: all three settlement
+  queries now filter `created_at >= COALESCE((SELECT max(as_of) FROM …snapshots WHERE snapshot_reason =
+  'manual_paper_reset'), '-infinity')`. Verified live: panel now shows **0/0/$0** (reconciles with
+  portfolio realized 0) and the backtest **ANCHOR: PASS** (0 == 0). Self-limiting for future resets.
+
+- **Arb activation — DONE 2026-07-03 (image local-1783107611).** Investigated the "arb threshold/margin"
+  lever and PROVED it a dead end: over 1,883 scans/7d the market was efficient (~$1.001) in 1,882; the
+  cost distribution is BIMODAL (either ~$1.001 or a rare genuine dislocation), so there is NO continuum of
+  near-misses below $1 for a lower `MIN_NET_PROFIT` to catch — and trading the $1.001 near-misses is
+  buying a guaranteed loss. Left `MIN_NET_PROFIT` at 0.2%. The REAL findings + fixes:
+  1. **Missed-arb bug:** real arbs DO appear (~1/wk, gross 2–3%; e.g. a 0.968 book on 616902/Fed on 07-01)
+     but only ONE ever executed (06-19). Cause: the no-pyramiding guard skipped any market where we held
+     ANY shares — and the 8 legacy directional holds (from the 06-29 pre-routing window) sat in exactly the
+     arb-eligible markets, sterilizing them. Fix (main.rs `execute_arb_opportunity`): skip only if we hold
+     BOTH legs (an existing arb pair); a directional single-side hold no longer blocks a risk-free arb.
+  2. **Frequency lever = breadth, not threshold.** New `POLYTRADER_ARB_DISCOVERY_LIMIT` (=150 in manifest):
+     each ingest tick now ALSO pulls the top-N active binary order-book markets by 24h volume
+     (`GammaClient::discover_arb_markets`, filtered to `enableOrderBook` + 2 outcomes), deduped with the
+     bootstrap slugs AND every held-position market (settlement-tracking guarantee — a held market that
+     rotates out of top-N is still re-ingested). Live: scannable universe **32 → 100 active markets**, 0
+     CLOB-error flood (enableOrderBook filter), scanner query still 0.58ms. NOTE: **Gamma caps a page at
+     100**, so limit=150 is effectively 100 — going wider needs offset pagination (the next breadth lever).
+  3. **Freshness bound:** the scanner LATERAL now requires a book `fetched_at > now()-30min`, so a market
+     that rotates out of the universe isn't arb'd on a stale phantom book (matters with 100 rotating mkts).
+  4. **Clean reset:** cleared the 8 legacy directional holds (−$9 unrealized, net-negative strategy) → fresh
+     $10k arb-only baseline; those markets are now free for arb. Fills/orders preserved for audit.
+  **Honest expectation:** even at 100 markets, arb is modest — dislocations are small (that 0.968 was ~$0.80
+  on $48 depth, economy fee ate half) and rare. ~3× the books ≈ ~3× the shots (~a few/wk). Next breadth
+  lever if wanted: paginate discovery past Gamma's 100-cap. Directional stays retired (arb-only routing).
 
 Drawdown circuit-breaker (auto-pause execution on equity drop), push-alerts for anomalies currently
 caught by hand (WAL archiving flip, LLM health, signal drift), calibration dashboard.
@@ -399,9 +428,29 @@ unit-testable) and is the prerequisite:
   per-day per-signal `journal.signal_daily`, prune raw; (3) telemetry (llm_health/real_account_balance)
   >14d dropped; (4) portfolio equity snapshots >7d downsampled to 1/hour (event-markers always kept). All
   deletes batched (10k); rollups idempotent; journals a `gc_run` event. **Result: first pass deleted
-  274k stale snapshots + 2.7k old marks; VACUUM FULL → 1.13GB → 372MB (−67%), and now BOUNDED at
-  ~370MB steady-state** (orderbook ~94MB @48h + events ~270MB @30d; autovacuum reclaims daily deletes,
-  no recurring VACUUM FULL). price_history (3MB) + signal_daily preserve the price/signal history compactly.
+  274k stale snapshots + 2.7k old marks; VACUUM FULL → 1.13GB → 372MB (−67%), and now BOUNDED
+  steady-state** (orderbook ~140MB @48h + events @30d; autovacuum reclaims daily deletes, no recurring
+  VACUUM FULL). price_history (3MB) + signal_daily preserve the price/signal history compactly.
+  - **2026-07-02 revised plateau estimate:** the original "~370MB" undercounted `journal.events` — at
+    observed ~5,200 `decision_report`/day × ~1.7KB, decision_reports *alone* trend to ~270MB at the 30d
+    window (172MB at 19 days on 07-02), so the real steady-state is **~450–480MB**. Still bounded and
+    self-limiting: oldest report is 2026-06-13, so the 30d prune+rollup first fires ~2026-07-13, after
+    which events plateaus. **APPLIED 2026-07-02: dropped `REPORT_RAW_DAYS` 30→14** to bring the plateau
+    down to ~300MB (halves the report table to ~130MB). The daily `signal_daily` rollup still preserves
+    the per-day fire-count history; the only tradeoff is the backtest harness now has ~14d (not 30d) of
+    raw attribution to replay. First deploy's GC pass will prune the 14–19d-old reports (rolling them to
+    `signal_daily` first), reclaimed by autovacuum over the following day.
+  - **2026-07-02 — latent rollup-permission bug found & fixed while applying the above.** The 30→14 change
+    triggered the *first-ever* report prune (prior passes had `reports_deleted: 0`), which exposed that
+    **both rollup tables (`market_data.price_history`, `journal.signal_daily`) were owned by `postgres`,
+    not the app role `polytrader`** — created out-of-band as superuser during the retention build. So the
+    app (connecting as `polytrader`) got `permission denied` on every rollup INSERT: the rollups had been
+    silently failing since 07-01 while the prunes (on `polytrader`-owned `events`/`orderbook_snapshots`)
+    succeeded. Net damage small — only today's June 13–17 report batch was pruned before being summarized
+    (5 days of fire-counts, low value). Fix: `ALTER TABLE … OWNER TO polytrader` on both (now consistent
+    with every other app table; `has_table_privilege` INSERT = t/t), and backfilled `signal_daily` for the
+    current boundary. Won't recur: ownership is persistent, and a fresh cluster runs sqlx migrations as
+    `polytrader` so the tables are owned correctly there.
 - **2026-06-24** — **Calibration scorecard DONE** (commit bd77832, Tier 3). Brier + reliability buckets
   on entry `win_prob_estimate` vs outcomes, in Hermes reflection metrics. First live read: skill +0.28,
   model underconfident on high-conviction bets. Pure `compute_calibration` unit-tested; join is
