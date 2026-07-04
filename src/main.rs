@@ -23,8 +23,10 @@ mod ui; // Dioxus UI (Phase 2: rsx App now SSR-rendered source + client fetch re
 // No behavior change to any existing path; unused in this increment (full wiring in follow-ups). #[allow] inside strategy/mod.rs for clean clippy.
 mod backtest; // offline replay harness (read-only; `polytrader backtest` subcommand) — reuses risk+strategy pure cores
 mod clob; // gated real/authenticated CLOB client (foundation for future order placement using derived L2 creds)
+mod exits; // autonomous position exits (TP/SL/time-stop/signal-flip): bounded round-trips instead of hold-to-resolution
 mod gc; // daily DB garbage collection: roll fat raw data into compact summaries, prune beyond retention windows
 mod risk;
+mod rotation; // directional market rotation: keeps the directional-eligible universe fresh (short-dated, liquid, non-sports)
 mod strategy;
 
 use crate::config::Config;
@@ -73,7 +75,6 @@ async fn main() -> Result<()> {
     eprintln!("=== CONFIG LOADED SUCCESSFULLY ===");
     info!(
         mode = %cfg.mode,
-        fee_bps = cfg.paper_fee_bps,
         ingest_interval = cfg.ingest_interval_secs,
         bootstrap = ?cfg.bootstrap_market_list(),
         arb_only = ?cfg.arb_only_market_list(),
@@ -135,11 +136,9 @@ async fn main() -> Result<()> {
 
     // === JOURNAL + ENGINE (shared) ===
     let journal = Arc::new(JournalWriter::new(pool.clone()));
-    let engine = Arc::new(PaperTradingEngine::new(
-        pool.clone(),
-        journal.clone(),
-        cfg.paper_fee_bps,
-    ));
+    // Fees are per-market (Polymarket's real taker model, resolved per fill from the stored
+    // Gamma rate) — the engine takes no flat rate.
+    let engine = Arc::new(PaperTradingEngine::new(pool.clone(), journal.clone()));
     info!("PaperTradingEngine + JournalWriter initialized (Decimal-only math, full journaling)");
 
     // === INGESTER CLIENTS (public only) ===
@@ -194,6 +193,38 @@ async fn main() -> Result<()> {
             }
         });
         info!("Daily DB garbage-collection task spawned (rollup + prune; retention: 48h books / 14d reports)");
+    }
+
+    // Directional market rotation: keeps the directional-eligible universe fresh by promoting
+    // short-dated, liquid, non-sports markets and demoting resolved ones (the hand-curated bootstrap
+    // list decays as its markets resolve — see wiki/roadmap). Runs ~3 min after boot (first ingest
+    // tick has landed) then every 6h. Journals a `directional_rotation` event. No-op when
+    // POLYTRADER_ROTATION_LIMIT is unset/0 (demotes only, so a drained set stays clean).
+    {
+        let pool = pool.clone();
+        let journal = journal.clone();
+        let gamma = GammaClient::new();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(180)).await;
+            loop {
+                match rotation::run_rotation(&pool, &gamma, is_arb_only_market).await {
+                    Ok(stats) => {
+                        tracing::info!(?stats, "directional rotation pass complete");
+                        let _ = journal
+                            .record_journal_event(
+                                "directional_rotation",
+                                "polytrader_rotation",
+                                "info",
+                                serde_json::to_value(&stats).unwrap_or(serde_json::json!({})),
+                            )
+                            .await;
+                    }
+                    Err(e) => tracing::warn!(error = %e, "directional rotation pass failed"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+            }
+        });
+        info!("Directional market-rotation task spawned (6h cadence; promote short-dated liquid non-sports, demote resolved)");
     }
     info!(
         "Background ingestion task spawned (Gamma + CLOB public, {}s interval, rate-limited)",
@@ -253,6 +284,9 @@ async fn main() -> Result<()> {
                 if let Err(e) = settle_resolved_positions(&pool, &journal).await {
                     warn!(error = %e, "periodic settlement pass failed (will retry)");
                 }
+                // Autonomous exits AFTER the DR pass (signal-flip reads this cycle's fresh report)
+                // and BEFORE mark-to-market (the chart point reflects the post-exit portfolio).
+                exits::evaluate_exits(&pool, &engine, &journal).await;
                 if let Err(e) = write_mark_to_market_snapshot(&pool).await {
                     warn!(error = %e, "periodic mark-to-market snapshot failed (will retry)");
                 }
@@ -438,13 +472,21 @@ async fn evaluate_dr_side(
     external: &serde_json::Value,
     days_to_resolution: Option<rust_decimal::Decimal>,
     ctx: &serde_json::Value,
-    fee_ctx: &FeeContext,
+    taker_fee_rate: rust_decimal::Decimal,
     notional: rust_decimal::Decimal,
 ) -> Option<SideEval> {
     if !(mid >= dec!(0) && mid <= dec!(1)) {
         warn!(market = %gamma_id, outcome, mid = %mid, "invalid mid; skipping side (robust)");
         return None;
     }
+    // Real Polymarket taker fee for THIS side: per-market rate + this side's price (the fee shape
+    // p × (1−p) makes the cost side-dependent — a 0.10 side costs rate×0.90 of notional, a 0.90
+    // side only rate×0.10). Makers pay nothing; we always cross, so taker is the right side.
+    let fee_ctx = FeeContext {
+        taker_fee_rate,
+        price: mid,
+        est_gas_usdc: dec!(0.01),
+    };
     let recent_move_signed = compute_recent_move_signed(pool, gamma_id, outcome, mid).await;
     let recent_move = recent_move_signed.abs();
     let (book_bids, book_asks) = fetch_latest_book(pool, gamma_id, outcome).await;
@@ -463,7 +505,7 @@ async fn evaluate_dr_side(
     if let Some(d) = days_to_resolution {
         snapshot["days_to_resolution"] = serde_json::json!(d.to_string());
     }
-    match engine.fuse_net(&snapshot, ctx, Some(fee_ctx), notional) {
+    match engine.fuse_net(&snapshot, ctx, Some(&fee_ctx), notional) {
         Ok((gross, net, attr)) => Some(SideEval {
             outcome,
             mid,
@@ -487,17 +529,28 @@ async fn produce_5min_decision_report(
     // defers full ranked opportunities + risk/goal filters + change detection/rate limit per market to next when
     // "fuller generator active"). Hardcoded LIMIT + FeeContext + stub processors ok for limited wiring (can yield
     // sparse/zero DRs some ticks, as intended for skeleton; see strategy skeleton + non-overclaim in log/wiki).
-    // Cover the full curated bootstrap set (was 3 — too few once we hold >10 markets).
-    const DR_MARKET_LIMIT: i64 = 20;
+    // Cover the full directional-eligible set (bootstrap + rotation) with headroom for discovery.
+    const DR_MARKET_LIMIT: i64 = 40;
     // Active markets with mids; slug drives arb-only routing + the newsdata query.
-    // (gamma_id, slug, last_mid_yes, last_mid_no, end_date_iso)
+    // (gamma_id, slug, last_mid_yes, last_mid_no, end_date_iso, taker_fee_rate)
     type DrMarketRow = (
         String,
         String,
         Option<rust_decimal::Decimal>,
         Option<rust_decimal::Decimal>,
         Option<String>,
+        Option<rust_decimal::Decimal>,
     );
+    // Directional-eligible slugs (bootstrap env + active rotation rows) rank FIRST. Without this,
+    // ORDER BY updated_at alone is a lottery: every ingest tick refreshes the whole ~140-market
+    // universe within seconds, so the ~20 DR slots fill with arbitrary arb-only discovery markets
+    // and the markets the executor is actually allowed to trade never get a decision report.
+    let bootstrap_slugs: Vec<String> = std::env::var("POLYTRADER_BOOTSTRAP_MARKETS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     let markets: Vec<DrMarketRow> = sqlx::query_as(
         // resolved_outcome IS NULL: never generate a DR for an already-resolved market. Without this a
         // resolved-but-still-`active` market is re-entered every cycle and `settle_resolved_positions`
@@ -506,16 +559,20 @@ async fn produce_5min_decision_report(
         // at +$0.20.) closed = false is the belt-and-suspenders companion: a market that has closed but
         // is not yet UMA-resolved still isn't tradeable, so it should never produce a DR or be entered
         // either (Polymarket leaves both `active=true` after a market closes/resolves).
-        "SELECT gamma_id, slug, last_mid_yes, last_mid_no, raw_json->>'end_date'
-         FROM market_data.markets
+        "SELECT gamma_id, slug, last_mid_yes, last_mid_no, raw_json->>'end_date', taker_fee_rate
+         FROM market_data.markets m
          WHERE active = true
            AND resolved_outcome IS NULL
            AND closed = false
            AND (last_mid_yes IS NOT NULL OR last_mid_no IS NOT NULL)
-         ORDER BY updated_at DESC
+         ORDER BY (m.slug = ANY($2)
+                   OR EXISTS (SELECT 1 FROM market_data.directional_universe du
+                               WHERE du.slug = m.slug AND du.demoted_at IS NULL)) DESC,
+                  updated_at DESC
          LIMIT $1",
     )
     .bind(DR_MARKET_LIMIT)
+    .bind(&bootstrap_slugs)
     .fetch_all(pool)
     .await?;
 
@@ -536,12 +593,10 @@ async fn produce_5min_decision_report(
         .build()
         .ok();
 
-    let fee_ctx = FeeContext {
-        taker_bps: dec!(50), // conservative (see fees wiki; server uses env paper_fee_bps); DR_TAKER_BPS const for future alignment
-        maker_bps: dec!(20),
-        est_gas_usdc: dec!(0.01),
-        rewards_offset_bps: dec!(10),
-    };
+    // Fee context is built PER SIDE inside the loop (evaluate_dr_side): the real Polymarket taker
+    // fee needs the per-market rate (stored from Gamma; geopolitics FREE, crypto 0.07…) and the
+    // side's price p (fee shape = rate × p × (1−p)). The old single flat-50bps context both mis-
+    // priced categories AND (via a unit bug in fuse_net) over-penalized every DR ~10×.
 
     // Realistic fixed small virtual USD notional for costing (fixes notional misuse bug: target_mid is price ~[0,1],
     // not position size; passing it yielded only tiny fees ~0.01 instead of meaningful "net after fees" for
@@ -561,7 +616,9 @@ async fn produce_5min_decision_report(
         .map(|v| v.trim().eq_ignore_ascii_case("on"))
         .unwrap_or(false);
 
-    for (gamma_id, slug, my, mn, end_date_iso) in markets {
+    for (gamma_id, slug, my, mn, end_date_iso, stored_fee_rate) in markets {
+        // Per-market taker fee rate: stored Gamma feeSchedule rate, else the category default.
+        let taker_fee_rate = stored_fee_rate.unwrap_or_else(|| polymarket_taker_fee_rate(&slug));
         // External advisory context: Yahoo spot (free, every cycle) + newsdata.io news (metered —
         // 200 credits/day, so cached per market with a daily budget cap). Market-level (same for both
         // outcomes) — fetched ONCE and reused across sides so both-sides eval doesn't double news spend.
@@ -628,7 +685,7 @@ async fn produce_5min_decision_report(
                 &external,
                 days_to_resolution,
                 &ctx,
-                &fee_ctx,
+                taker_fee_rate,
                 realistic_notional,
             )
             .await
@@ -840,17 +897,19 @@ async fn maybe_execute_opportunity(
         tracing::debug!(slug = %slug, "arb-only market; directional executor skips");
         return Ok(());
     }
-    // Directional executor trades ONLY the curated bootstrap markets. Every market pulled in by the
-    // volume-ranked arb-discovery universe (POLYTRADER_ARB_DISCOVERY_LIMIT) is ARB-ONLY by default: the
-    // retired, net-negative directional strategy must not trade the uncurated discovery set just because
-    // a slug dodged the arb_category keyword classifier (e.g. NBA player markets like 2645374 that the
-    // "sports" keywords miss). Curated slugs stay directional-eligible; discovery = arb-only, robustly.
+    // Directional executor trades ONLY the curated universe: the bootstrap env allowlist PLUS the
+    // rotation job's active promotions (market_data.directional_universe — short-dated, liquid,
+    // non-sports, demoted on resolution). Every OTHER market pulled in by the volume-ranked
+    // arb-discovery universe (POLYTRADER_ARB_DISCOVERY_LIMIT) is ARB-ONLY by default: the directional
+    // strategy must not trade the uncurated discovery set just because a slug dodged the arb_category
+    // keyword classifier (e.g. NBA player markets like 2645374 that the "sports" keywords miss).
     let is_curated = std::env::var("POLYTRADER_BOOTSTRAP_MARKETS")
         .unwrap_or_default()
         .split(',')
-        .any(|s| s.trim() == slug);
+        .any(|s| s.trim() == slug)
+        || rotation::is_active(pool, slug).await;
     if !is_curated {
-        tracing::debug!(slug = %slug, "non-bootstrap discovery market; directional executor skips (arb-only)");
+        tracing::debug!(slug = %slug, "non-curated discovery market; directional executor skips (arb-only)");
         return Ok(());
     }
     if sizing.recommended_usdc <= dec!(0) || target_mid <= dec!(0) {
@@ -1263,9 +1322,14 @@ async fn real_trading_precondition(pool: &sqlx::PgPool) -> serde_json::Value {
     .ok()
     .flatten()
     .unwrap_or(dec!(0));
-    // Settled positions = resolved-and-realized (paper_position_settled events).
+    // Settled positions = resolved-and-realized (paper_position_settled events). RESET-BOUNDARY:
+    // reset preserves the journal, so a lifetime count would let pre-reset settlements (incl. the
+    // 2026-06-24 phantoms) satisfy MIN_SETTLED against a post-reset track record that proved nothing.
     let settled: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM journal.events WHERE event_type = 'paper_position_settled'",
+        "SELECT COUNT(*) FROM journal.events WHERE event_type = 'paper_position_settled'
+           AND created_at >= COALESCE(
+             (SELECT max(as_of) FROM paper_trading.virtual_portfolio_snapshots
+              WHERE snapshot_reason = 'manual_paper_reset'), '-infinity'::timestamptz)",
     )
     .fetch_one(pool)
     .await
@@ -1455,18 +1519,171 @@ async fn produce_arb_scan_journal(
 
     // Execute the best few arbs (gated). Arbitrage is risk-free on price and applies to ANY market,
     // including the arb-only sports markets the directional executor skips.
-    if std::env::var("POLYTRADER_AUTONOMOUS_PAPER_EXECUTION")
+    let autonomous = std::env::var("POLYTRADER_AUTONOMOUS_PAPER_EXECUTION")
         .unwrap_or_default()
         .trim()
         .to_lowercase()
-        == "on"
-    {
+        == "on";
+    if autonomous {
         for opp in opps.iter().take(3) {
             if let Err(e) = execute_arb_opportunity(pool, journal, paper_engine, opp).await {
                 warn!(error = %e, market = %opp.market_id, "arb execution error (paper-only; continue)");
             }
         }
     }
+
+    // NegRisk EVENT-level scan: buy-all-No baskets across a mutually-exclusive event (at most one
+    // member resolves Yes ⇒ k No-shares pay ≥ k−1). This is where real dislocations live — the
+    // single-market Yes+No scan above was measured structurally dead (best cost pinned at $1.001).
+    match crate::strategy::negrisk::scan_negrisk(pool).await {
+        Ok((nopps, ndiag)) => {
+            tracing::info!(
+                events_scanned = ndiag.events_scanned,
+                member_books = ndiag.member_books,
+                net_arbs = ndiag.net_arb_events,
+                best_implied_yes_sum = ?ndiag.best_implied_yes_sum,
+                "negrisk arb scan diagnostics"
+            );
+            let payload = serde_json::json!({
+                "strategy": "negrisk_event_arbitrage",
+                "opportunity_count": nopps.len(),
+                "best_net_profit_per_unit": nopps.first().map(|o| o.net_profit_per_unit.to_string()),
+                "top_opportunities": nopps.iter().take(3).collect::<Vec<_>>(),
+                "diagnostics": ndiag,
+                "paper_only": true,
+                "real_orders_enabled": false,
+                "note": "Event-level negRisk scan (buy No across k mutually-exclusive members pays >= k-1; arb when implied Yes probs sum over 100%). Works on partial event coverage, so it scans the books the universe already ingests. best_implied_yes_sum is the closest approach to the 1.00 arb line."
+            });
+            let _ = journal
+                .record_journal_event(
+                    "negrisk_arb_scan",
+                    "polytrader_arb_scanner",
+                    "info",
+                    payload,
+                )
+                .await;
+            if autonomous {
+                for opp in nopps.iter().take(2) {
+                    if let Err(e) =
+                        execute_negrisk_opportunity(pool, journal, paper_engine, opp).await
+                    {
+                        warn!(error = %e, event = %opp.event_id, "negrisk arb execution error (paper-only; continue)");
+                    }
+                }
+            }
+        }
+        Err(e) => warn!(error = %e, "negrisk arb scan failed (will retry next cycle)"),
+    }
+    Ok(())
+}
+
+/// Execute a NegRisk buy-all-No basket in paper: buy `units` No shares in every leg. At most one
+/// member of the event resolves Yes, so the basket pays at least (legs−1)×units at resolution —
+/// risk-free on price, same snapshot caveats as the two-leg arb. Paper-only; journaled.
+async fn execute_negrisk_opportunity(
+    pool: &sqlx::PgPool,
+    journal: &Arc<JournalWriter>,
+    engine: &Arc<PaperTradingEngine>,
+    opp: &crate::strategy::negrisk::NegRiskOpportunity,
+) -> anyhow::Result<()> {
+    if opp.total_cost <= dec!(0) || opp.legs.len() < 2 {
+        return Ok(());
+    }
+    // No pyramiding the same basket: if EVERY leg already holds No shares we already own (at least)
+    // one complete basket for this event — re-buying each scan cycle while the books stay mispriced
+    // would pyramid. A partial hold does NOT block: the incremental complete basket is still
+    // guaranteed-profitable on top of whatever we hold (mirrors the two-leg guard's logic).
+    let market_ids: Vec<String> = opp.legs.iter().map(|l| l.market_id.clone()).collect();
+    let held_no_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM paper_trading.paper_positions
+         WHERE market_id = ANY($1) AND outcome = 'No' AND shares > 0",
+    )
+    .bind(&market_ids)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    if held_no_count as usize == opp.legs.len() {
+        return Ok(());
+    }
+
+    // Units bounded by the thinnest leg's depth and the arb notional cap (shared with the two-leg
+    // executor: risk-free trades wear the arb cap, not the $20 directional cap).
+    let arb_notional_cap = std::env::var("POLYTRADER_ARB_NOTIONAL_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<rust_decimal::Decimal>().ok())
+        .unwrap_or(dec!(250));
+    let units = opp
+        .max_units
+        .min(arb_notional_cap / opp.total_cost)
+        .round_dp(2);
+    if units <= dec!(0) {
+        return Ok(());
+    }
+
+    let mut filled_legs = 0usize;
+    let mut total_filled_cost = dec!(0);
+    for leg in &opp.legs {
+        let order = crate::paper::PaperOrder {
+            id: uuid::Uuid::new_v4(),
+            market_id: leg.market_id.clone(),
+            outcome: "No".to_string(),
+            side: crate::paper::OrderSide::Buy,
+            order_type: crate::paper::OrderType::Limit,
+            limit_price: Some(leg.ask_no),
+            size: units,
+            status: crate::paper::OrderStatus::Open,
+            created_at: chrono::Utc::now(),
+            decision_context: Some(serde_json::json!({
+                "source": "autonomous_negrisk_arb_executor",
+                "strategy": "negrisk_event_arbitrage",
+                "event_id": opp.event_id,
+                "basket_legs": opp.legs.len(),
+                "basket_total_cost": opp.total_cost.to_string(),
+                "net_profit_per_unit": opp.net_profit_per_unit.to_string(),
+                "paper_only": true,
+                "real_orders_enabled": false,
+            })),
+        };
+        match engine.submit_order(order).await {
+            Ok(fills) if !fills.is_empty() => {
+                filled_legs += 1;
+                total_filled_cost += fills
+                    .iter()
+                    .map(|f| f.price * f.size)
+                    .sum::<rust_decimal::Decimal>();
+            }
+            Ok(_) => {
+                warn!(event = %opp.event_id, market = %leg.market_id, "negrisk leg unfilled (stale/thin book)");
+            }
+            Err(e) => {
+                warn!(event = %opp.event_id, market = %leg.market_id, error = %e, "negrisk leg submit failed");
+            }
+        }
+    }
+    let complete = filled_legs == opp.legs.len();
+    info!(event = %opp.event_id, legs = opp.legs.len(), filled_legs, %units, complete,
+        "autonomous negrisk arb executed (paper-only)");
+    let _ = journal
+        .record_journal_event(
+            "autonomous_negrisk_arb_execution",
+            "polytrader_arb_executor",
+            "info",
+            serde_json::json!({
+                "action": if complete { "basket_filled" } else { "basket_partial_or_unfilled" },
+                "event_id": opp.event_id,
+                "legs": opp.legs.len(),
+                "filled_legs": filled_legs,
+                "units": units.to_string(),
+                "basket_total_cost": opp.total_cost.to_string(),
+                "total_filled_cost": total_filled_cost.to_string(),
+                "min_payout_per_unit": opp.min_payout.to_string(),
+                "net_profit_per_unit": opp.net_profit_per_unit.to_string(),
+                "note": "Buy-all-No negRisk basket. A partial fill (filled_legs < legs) weakens the >= legs-1 payout floor toward filled_legs-1 — flagged via action; still bounded loss (paper).",
+                "paper_only": true,
+                "real_orders_enabled": false,
+            }),
+        )
+        .await;
     Ok(())
 }
 
@@ -1592,7 +1809,15 @@ fn is_arb_only_market(slug: &str) -> bool {
 fn arb_category(slug: &str) -> Option<&'static str> {
     let s = slug.to_lowercase();
     let has = |w: &[&str]| w.iter().any(|x| s.contains(x));
-    if has(&[
+    // Prefix-only patterns: Polymarket's scheduled-game/match markets use league-prefixed slugs
+    // ("wta-eala-swiatek-2026-07-03", "cs2-big5-nip-...", "val-rrq1-edg1-..."). These MUST be
+    // prefix-anchored — as substrings they'd false-positive ("oval-office" contains "val-").
+    // Added 2026-07-04 after the rotation job promoted 13 tennis/esports match markets that the
+    // substring keywords missed (and the Pegula/Wimbledon market leaked a directional fill AGAIN).
+    let pre = |w: &[&str]| w.iter().any(|x| s.starts_with(x));
+    if pre(&[
+        "wta-", "atp-", "mlb-", "nba-", "nhl-", "nfl-", "ufc-", "epl-", "ucl-",
+    ]) || has(&[
         "world-cup",
         "fifa",
         "fifwc",
@@ -1610,19 +1835,24 @@ fn arb_category(slug: &str) -> Option<&'static str> {
         "grand-prix",
         "premier-league",
         "-open-",
+        "wimbledon",
+        "tennis",
+        "grand-slam",
     ]) {
         Some("sports")
-    } else if has(&[
-        "esports",
-        "league-of-legends",
-        "-dota",
-        "valorant",
-        "counter-strike",
-        "-cs2",
-        "overwatch",
-        "starcraft",
-        "rocket-league",
-    ]) {
+    } else if pre(&["cs2-", "csgo-", "val-", "lol-", "dota2-", "dota-", "ow-"])
+        || has(&[
+            "esports",
+            "league-of-legends",
+            "-dota",
+            "valorant",
+            "counter-strike",
+            "-cs2",
+            "overwatch",
+            "starcraft",
+            "rocket-league",
+        ])
+    {
         Some("esports")
     } else if has(&[
         "bitcoin", "ethereum", "-btc-", "-eth-", "crypto", "solana", "dogecoin", "-xrp", "cardano",
@@ -1717,6 +1947,15 @@ fn arb_category(slug: &str) -> Option<&'static str> {
     ]) {
         Some("elections")
     } else if has(&[
+        // Polymarket "Mentions" category (0.04 fee tier): will-X-say-Y / tweet-count markets.
+        "-say-",
+        "of-tweets",
+        "-tweets-",
+        "tweet-count",
+        "-mention",
+    ]) {
+        Some("mentions")
+    } else if has(&[
         "oscar",
         "grammy",
         "emmy",
@@ -1757,7 +1996,7 @@ fn polymarket_taker_fee_rate(slug: &str) -> rust_decimal::Decimal {
         Some("geopolitics") => dec!(0),
         Some("sports") | Some("esports") => dec!(0.03),
         Some("crypto") => dec!(0.07),
-        Some("finance") | Some("tech") | Some("elections") => dec!(0.04),
+        Some("finance") | Some("tech") | Some("elections") | Some("mentions") => dec!(0.04),
         Some("economy") | Some("culture") | Some("weather") => dec!(0.05),
         _ => dec!(0.05), // Other / General
     }
@@ -1990,6 +2229,22 @@ mod tests {
             arb_category("will-no-fed-rate-cuts-happen-in-2026"),
             Some("economy")
         );
+        // Prefix-anchored league/match slugs (the 2026-07-04 rotation leak): tennis + esports
+        // game markets whose substring keywords missed.
+        assert_eq!(arb_category("wta-eala-swiatek-2026-07-03"), Some("sports"));
+        assert_eq!(
+            arb_category("atp-khachan-cobolli-2026-07-04"),
+            Some("sports")
+        );
+        assert_eq!(
+            arb_category("will-jessica-pegula-be-the-2026-womens-wimbledon-winner"),
+            Some("sports")
+        );
+        assert_eq!(arb_category("cs2-big5-nip-2026-07-04"), Some("esports"));
+        assert_eq!(arb_category("val-rrq1-edg1-2026-07-04"), Some("esports"));
+        assert_eq!(arb_category("lol-blg-t1-2026-07-04"), Some("esports"));
+        // Prefixes must not fire as substrings ("oval-office" contains "val-").
+        assert_eq!(arb_category("will-trump-leave-the-oval-office-early"), None);
         // A truly uncategorized slug stays directional.
         assert_eq!(arb_category("will-some-obscure-thing-happen"), None);
     }

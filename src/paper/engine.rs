@@ -24,16 +24,11 @@ use std::sync::Arc;
 pub struct PaperTradingEngine {
     pool: PgPool,
     journal: Arc<JournalWriter>,
-    paper_fee_bps: u16,
 }
 
 impl PaperTradingEngine {
-    pub fn new(pool: PgPool, journal: Arc<JournalWriter>, paper_fee_bps: u16) -> Self {
-        Self {
-            pool,
-            journal,
-            paper_fee_bps,
-        }
+    pub fn new(pool: PgPool, journal: Arc<JournalWriter>) -> Self {
+        Self { pool, journal }
     }
 
     /// Submit paper order. Loads latest book snapshot from DB for the (market, outcome).
@@ -131,19 +126,23 @@ impl PaperTradingEngine {
         let total_gross: Decimal = fills.iter().map(|f| f.price * f.size).sum();
 
         let new_shares = old_shares + delta_shares;
-        let new_avg = if new_shares > dec!(0) {
-            if old_shares > dec!(0) {
-                (old_shares * old_avg
-                    + (total_gross
-                        / if delta_shares != dec!(0) {
-                            delta_shares
-                        } else {
-                            dec!(1)
-                        }))
-                    / new_shares
-            } else {
-                fills.first().map(|f| f.price).unwrap_or(dec!(0.5))
-            }
+        let new_avg = if new_shares <= dec!(0) {
+            dec!(0)
+        } else if matches!(order.side, OrderSide::Sell) {
+            // A sale never changes the cost basis of what remains — only buys re-average. (The old
+            // buy formula applied to a negative delta corrupted avg_entry on partial sells.)
+            old_avg
+        } else if old_shares > dec!(0) {
+            (old_shares * old_avg + total_gross) / new_shares
+        } else {
+            fills.first().map(|f| f.price).unwrap_or(dec!(0.5))
+        };
+        // Realized P&L from closing shares at market (exit path): proceeds vs cost basis, per fill.
+        // Without this the sale's P&L evaporates — the cash identity below only returns the freed
+        // cost basis (locked drops by shares×avg), so selling at 0.80 what we bought at 0.50 would
+        // credit cash 0.50/share. Fees stay in total_fees_agg (they are cash-model-wide).
+        let realized_delta: Decimal = if matches!(order.side, OrderSide::Sell) {
+            fills.iter().map(|f| (f.price - old_avg) * f.size).sum()
         } else {
             dec!(0)
         };
@@ -190,14 +189,16 @@ impl PaperTradingEngine {
         .fetch_one(&mut *tx)
         .await?;
         // Carry forward cumulative realized P&L from settlements (do NOT reset to 0 on each fill,
-        // else a fill after a settlement would wipe realized P&L — the input the "proven" gate needs).
-        let realized_agg: Decimal = sqlx::query_scalar(
+        // else a fill after a settlement would wipe realized P&L — the input the "proven" gate needs),
+        // plus any P&L this order just realized by selling at market (autonomous exits).
+        let realized_agg: Decimal = sqlx::query_scalar::<_, Decimal>(
             "SELECT realized_pnl FROM paper_trading.virtual_portfolio_snapshots ORDER BY as_of DESC LIMIT 1",
         )
         .fetch_optional(&mut *tx)
         .await?
-        .unwrap_or(dec!(0));
-        // Buy-only paper model: cash = seed − open cost basis − fees + realized P&L from settlements.
+        .unwrap_or(dec!(0))
+            + realized_delta;
+        // Cash identity: seed − open cost basis − fees + realized P&L (settlements + market exits).
         let new_usdc = (Decimal::from(10000u64) - total_locked_agg - total_fees_agg + realized_agg)
             .max(dec!(0));
         sqlx::query(
@@ -290,10 +291,6 @@ impl PaperTradingEngine {
         order: &mut PaperOrder,
         book_opt: Option<&OrderbookSnapshot>,
     ) -> Result<Vec<PaperFill>> {
-        // Legacy flat rate kept for exact fill fee calc (minimal diff). The first-class FeeModel
-        // (built in ctor from paper_fee_bps + conservative maker/gas/rewards) is used for
-        // pre-trade net edge estimates (see estimate_net... below) and will drive future
-        // fee-aware matching / opportunity filtering.
         // RISK (per AGENTS.md + fees-tax-latency-and-execution-tiers.md for $150 capital):
         // - This fee_rate + model must be pessimistic; real taker fees + gas can vary.
         // - Net edge (gross - fees - gas - slip) is the *primary* signal for deliberate tier.

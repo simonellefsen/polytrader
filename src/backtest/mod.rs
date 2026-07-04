@@ -452,13 +452,13 @@ pub struct Level {
 /// (`limit = min(mid × 1.20, 0.99)`, shares = approved_usdc / limit).
 const SLIPPAGE_CAP: Decimal = dec!(1.20);
 const MAX_LIMIT: Decimal = dec!(0.99);
-/// Taker fee rate for realistic fills — mirrors the deployed `paper_fee_bps = 50` (0.50%).
-const FEE_RATE: Decimal = dec!(0.005);
-
 /// Walk `asks` best-first (ascending) for a LIMIT buy: fill up to `target_shares`, only at prices
-/// ≤ `limit_price`. Mirrors the production `match_against_book` buy/limit path. Returns
-/// `(filled_shares, gross_cost, fee)` where `fee = round(gross_cost · fee_rate, 6)`. A thin/expensive
-/// book (best ask > limit) yields a zero fill — exactly the live "no_fill_at_limit" outcome.
+/// ≤ `limit_price`. Mirrors the production `match_against_book` buy/limit path, including its
+/// REAL Polymarket taker fee per level: `shares × rate × p × (1−p)` (`fee_rate` is the per-market
+/// RATE — geopolitics 0, crypto 0.07, … — not a flat % of notional; the old flat 0.5%-of-cost
+/// both charged fee-free geopolitics and underpriced crypto). Returns
+/// `(filled_shares, gross_cost, fee)`. A thin/expensive book (best ask > limit) yields a zero
+/// fill — exactly the live "no_fill_at_limit" outcome.
 pub fn walk_asks_limit_buy(
     asks: &[Level],
     limit_price: Decimal,
@@ -470,6 +470,7 @@ pub fn walk_asks_limit_buy(
     let mut remaining = target_shares;
     let mut filled = dec!(0);
     let mut cost = dec!(0);
+    let mut fee = dec!(0);
     for lvl in sorted {
         if remaining <= dec!(0) {
             break;
@@ -483,10 +484,10 @@ pub fn walk_asks_limit_buy(
         }
         filled += take;
         cost += lvl.price * take;
+        fee += crate::polymarket_fee(fee_rate, lvl.price, take);
         remaining -= take;
     }
-    let fee = (cost * fee_rate).round_dp(6);
-    (filled, cost, fee)
+    (filled, cost, fee.round_dp(6))
 }
 
 /// Phase-3 realistic re-pricing: take the fill DECISIONS from a counterfactual (which markets/outcomes
@@ -501,7 +502,7 @@ pub fn reprice_realistic(
     books: &[Option<Vec<Level>>],
     resolutions: &[Resolution],
     marks: &Marks,
-    fee_rate: Decimal,
+    fee_rates: &BTreeMap<String, Decimal>,
 ) -> SimResult {
     let mut sim = SimPortfolio::new();
     let mut total_fees = dec!(0);
@@ -513,7 +514,9 @@ pub fn reprice_realistic(
             continue;
         }
         let target_shares = (d.approved_usdc / limit).round_dp(2);
-        let (filled, cost, fee) = walk_asks_limit_buy(asks, limit, target_shares, fee_rate);
+        // Per-market Polymarket taker rate (geopolitics 0 …); unmapped markets use the Other rate.
+        let rate = fee_rates.get(&d.market_id).copied().unwrap_or(dec!(0.05));
+        let (filled, cost, fee) = walk_asks_limit_buy(asks, limit, target_shares, rate);
         if filled <= dec!(0) {
             continue; // book too thin/expensive — no fill (matches live)
         }
@@ -622,16 +625,25 @@ fn apply_resolution(
 }
 
 /// The per-decision fee the live DR generator baked into `net_edge_after_fees`, read back from the
-/// stored `attribution.fee_impact.est_fees_and_gas` (so the counterfactual subtracts the same fee the
-/// report did). Falls back to 0 when absent (then `gross == net`).
+/// stored attribution (so the counterfactual subtracts the same fee the report did). Prefers
+/// `fee_impact.fee_cost_frac` (the correctly-unit'd fraction-of-notional written since the
+/// 2026-07-04 fee overhaul); falls back to the historical `est_fees_and_gas` key (which pre-overhaul
+/// reports subtracted directly — replaying the same number preserves what the live gate actually
+/// saw at the time). 0 when absent (then `gross == net`).
 fn report_fee(attribution: &serde_json::Value) -> Decimal {
-    attribution
-        .get("fee_impact")
-        .and_then(|f| f.get("est_fees_and_gas"))
-        .and_then(|v| match v {
-            serde_json::Value::String(s) => s.parse::<Decimal>().ok(),
-            serde_json::Value::Number(n) => n.to_string().parse::<Decimal>().ok(),
-            _ => None,
+    let fee_impact = attribution.get("fee_impact");
+    let parse = |v: &serde_json::Value| match v {
+        serde_json::Value::String(s) => s.parse::<Decimal>().ok(),
+        serde_json::Value::Number(n) => n.to_string().parse::<Decimal>().ok(),
+        _ => None,
+    };
+    fee_impact
+        .and_then(|f| f.get("fee_cost_frac"))
+        .and_then(parse)
+        .or_else(|| {
+            fee_impact
+                .and_then(|f| f.get("est_fees_and_gas"))
+                .and_then(parse)
         })
         .unwrap_or(dec!(0))
 }
@@ -742,7 +754,10 @@ pub async fn run(pool: &sqlx::PgPool, args: &[String]) -> anyhow::Result<()> {
         books.push(load_book_at(pool, &d.market_id, &d.outcome, d.at).await);
     }
     let with_book = books.iter().filter(|b| b.is_some()).count();
-    let real = reprice_realistic(&res.fill_log, &books, &resolutions, &marks, FEE_RATE);
+    // Per-market Polymarket taker rates (stored Gamma rate, else category default) — mirrors the
+    // live engine's per-fill fee exactly (geopolitics free, crypto 0.07, …).
+    let fee_rates = load_fee_rates(pool).await.unwrap_or_default();
+    let real = reprice_realistic(&res.fill_log, &books, &resolutions, &marks, &fee_rates);
     println!(
         "  [book-walk] realized: {}   unrealized: {}   fees: {}   total_pnl: {}   ({} of {} fills had a book snapshot)",
         real.realized.round_dp(2),
@@ -753,9 +768,9 @@ pub async fn run(pool: &sqlx::PgPool, args: &[String]) -> anyhow::Result<()> {
         res.fill_log.len(),
     );
     println!(
-        "  NOTE: book-walk re-prices the at-mid fill DECISIONS at the real ask + {}bps taker fee",
-        FEE_RATE * dec!(10000)
+        "  NOTE: book-walk re-prices the at-mid fill DECISIONS at the real ask + Polymarket's real"
     );
+    println!("        per-market taker fee (shares × rate × p × (1−p); geopolitics fee-free)");
     println!(
         "        (a credible backtest of THIS strategy). It is still a different strategy than the"
     );
@@ -990,6 +1005,24 @@ async fn load_slug_map(pool: &sqlx::PgPool) -> anyhow::Result<BTreeMap<String, S
     Ok(rows
         .into_iter()
         .filter_map(|(g, s)| Some((g, s?)))
+        .collect())
+}
+
+/// Per-market Polymarket taker fee RATE map for realistic-fill repricing: the stored Gamma
+/// `taker_fee_rate` when synced, else the category default from the slug — the same resolution
+/// order the live paper engine uses per fill.
+async fn load_fee_rates(pool: &sqlx::PgPool) -> anyhow::Result<BTreeMap<String, Decimal>> {
+    let rows: Vec<(String, Option<String>, Option<Decimal>)> =
+        sqlx::query_as("SELECT gamma_id, slug, taker_fee_rate FROM market_data.markets")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(g, slug, rate)| {
+            let r = rate
+                .unwrap_or_else(|| crate::polymarket_taker_fee_rate(slug.as_deref().unwrap_or("")));
+            (g, r)
+        })
         .collect())
 }
 
@@ -1314,17 +1347,25 @@ mod tests {
         // Asks deliberately out of order; best (cheapest) must fill first, stop above the limit.
         let asks = vec![lvl("0.52", "100"), lvl("0.50", "10"), lvl("0.51", "10")];
         // limit 0.55, want 25 shares: take 10@0.50 + 10@0.51 + 5@0.52 = 25 shares.
-        let (filled, cost, fee) = walk_asks_limit_buy(&asks, dec!(0.55), dec!(25), dec!(0.005));
+        // Fee = Polymarket real model per level at rate 0.04:
+        //   10×.04×.50×.50 + 10×.04×.51×.49 + 5×.04×.52×.48 = 0.1 + 0.09996 + 0.04992 = 0.24988
+        let (filled, cost, fee) = walk_asks_limit_buy(&asks, dec!(0.55), dec!(25), dec!(0.04));
         assert_eq!(filled, dec!(25));
-        // cost = 5.0 + 5.1 + 2.6 = 12.70 ; fee = 12.70 * 0.005 = 0.0635
         assert_eq!(cost, dec!(12.70));
-        assert_eq!(fee, dec!(0.0635));
+        assert_eq!(fee, dec!(0.24988));
+    }
+
+    #[test]
+    fn walk_asks_fee_free_geopolitics_rate_charges_nothing() {
+        let asks = vec![lvl("0.50", "100")];
+        let (filled, cost, fee) = walk_asks_limit_buy(&asks, dec!(0.55), dec!(10), dec!(0));
+        assert_eq!((filled, cost, fee), (dec!(10), dec!(5.00), dec!(0)));
     }
 
     #[test]
     fn walk_asks_no_fill_when_book_above_limit() {
         let asks = vec![lvl("0.80", "100")];
-        let (filled, cost, fee) = walk_asks_limit_buy(&asks, dec!(0.60), dec!(10), dec!(0.005));
+        let (filled, cost, fee) = walk_asks_limit_buy(&asks, dec!(0.60), dec!(10), dec!(0.04));
         assert_eq!((filled, cost, fee), (dec!(0), dec!(0), dec!(0)));
     }
 
@@ -1345,14 +1386,19 @@ mod tests {
             winning_outcome: "Yes".into(),
             at: Some(ts(10)),
         }];
-        let res = reprice_realistic(&fill_log, &books, &resolutions, &Marks::new(), dec!(0.005));
+        let rates: BTreeMap<String, Decimal> = [("m1".to_string(), dec!(0.04))].into();
+        let res = reprice_realistic(&fill_log, &books, &resolutions, &Marks::new(), &rates);
         // shares = 16.67 ; cost = 16.67*0.55 = 9.1685 ; won ⇒ payout 16.67, realized = (16.67 − 9.1685)
         // rounded to 2dp by the production settlement formula = 7.50.
         assert_eq!(res.fills, 1);
         assert_eq!(res.settled_positions, 1);
         assert_eq!(res.wins, 1);
         assert_eq!(res.realized, dec!(7.50));
-        assert_eq!(res.fees, (dec!(9.1685) * dec!(0.005)).round_dp(6));
+        // fee = 16.67 × 0.04 × 0.55 × 0.45 (real model), rounded to 6dp.
+        assert_eq!(
+            res.fees,
+            (dec!(16.67) * dec!(0.04) * dec!(0.55) * dec!(0.45)).round_dp(6)
+        );
     }
 
     #[test]
@@ -1365,7 +1411,7 @@ mod tests {
             target_mid: dec!(0.50),
         }];
         let books = vec![None]; // no snapshot for this fill
-        let res = reprice_realistic(&fill_log, &books, &[], &Marks::new(), dec!(0.005));
+        let res = reprice_realistic(&fill_log, &books, &[], &Marks::new(), &BTreeMap::new());
         assert_eq!(res.fills, 0);
         assert_eq!(res.realized, dec!(0));
     }

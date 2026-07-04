@@ -38,15 +38,18 @@ spec:
           env:
             - name: POLYTRADER_MODE
               value: "paper"
-            # Bootstrap market slugs across Geopolitics / Breaking / Finance + Sports (World Cup, NBA).
+            # Bootstrap market slugs across Geopolitics / Breaking / Finance + Sports (World Cup).
             # Sports are arbitrage-only (see POLYTRADER_ARB_ONLY_MARKETS). Uncertain Finance/Tech
             # markets are scarce on Polymarket right now, so the directional set is geopolitics-heavy.
+            # 2026-07-04: pruned 26 resolved/eliminated slugs (all June/July/Aug/Dec Iran-Hormuz
+            # deadline variants — resolved early with the June deal — plus NBA finals and eliminated
+            # WC teams). They only produced closed=true fallback churn each ingest tick.
             - name: POLYTRADER_BOOTSTRAP_MARKETS
-              value: "us-x-iran-permanent-peace-deal-by-june-30-2026-837-641-896-877-363-892-537-597,strait-of-hormuz-traffic-returns-to-normal-by-end-of-june,us-iran-nuclear-deal-by-june-30,will-donald-trump-announce-that-the-united-states-blockade-of-the-strait-of-hormuz-has-been-lifted-by-june-30-2026-159-962,us-x-iran-permanent-peace-deal-by-june-15-2026-734-856-129,us-announces-new-iran-agreementceasefire-extension-by-june-14,will-bitcoin-hit-150k-by-june-30-2026,strait-of-hormuz-traffic-returns-to-normal-by-july-31,us-x-iran-permanent-peace-deal-by-july-31-2026-831-252,will-benjamin-netanyahu-be-the-next-prime-minister-of-israel,us-x-iran-diplomatic-meeting-by-june-30-2026-983-259-948-431-294-182-296-883-134-598,us-announces-new-iran-agreementceasefire-extension-by-june-15-2889-539,will-donald-trump-announce-that-the-united-states-blockade-of-the-strait-of-hormuz-has-been-lifted-by-june-15-2026,will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568,us-announces-new-iran-agreementceasefire-extension-by-june-30-848-925-757-129-337-165,us-x-iran-permanent-peace-deal-by-december-31-2026-961-587-341-574-555-817,will-donald-trump-announce-that-the-united-states-blockade-of-the-strait-of-hormuz-has-been-lifted-by-july-31-2026-495,will-jd-vance-win-the-2028-us-presidential-election,will-jd-vance-win-the-2028-republican-presidential-nomination,will-marco-rubio-win-the-2028-republican-presidential-nomination,will-the-republicans-win-the-2028-us-presidential-election,will-the-democrats-win-the-2028-us-presidential-election,will-the-republican-party-control-the-house-after-the-2026-midterm-elections,will-the-democratic-party-control-the-senate-after-the-2026-midterm-elections,2026-balance-of-power-d-senate-d-house-949,will-luiz-incio-lula-da-silva-win-the-2026-brazilian-presidential-election,will-flvio-bolsonaro-win-the-2026-brazilian-presidential-election,will-jordan-bardella-win-the-2027-french-presidential-election,will-douard-philippe-win-the-2027-french-presidential-election,will-andy-burnham-win-the-2026-makerfield-by-election,starmer-out-by-june-30-2026-862-594-548-219-739,will-gadi-eizenkot-be-the-next-prime-minister-of-israel,will-china-invade-taiwan-by-december-31-2027,us-x-iran-permanent-peace-deal-by-august-31-2026,us-iran-nuclear-deal-by-july-31,iran-agrees-to-end-enrichment-of-uranium-by-june-30,will-no-fed-rate-cuts-happen-in-2026,fed-rate-hike-in-2026,will-bitcoin-reach-90000-by-december-31-2026-113-862-581-343,will-ethereum-dip-to-800-by-december-31-2026-568,will-france-win-the-2026-fifa-world-cup-924,will-spain-win-the-2026-fifa-world-cup-963,will-the-new-york-knicks-win-the-2026-nba-finals,will-usa-win-the-2026-fifa-world-cup-467,will-england-win-the-2026-fifa-world-cup-937,will-argentina-win-the-2026-fifa-world-cup-245,will-portugal-win-the-2026-fifa-world-cup-912,will-brazil-win-the-2026-fifa-world-cup-183,will-germany-win-the-2026-fifa-world-cup-467,will-netherlands-win-the-2026-fifa-world-cup-739"
+              value: "strait-of-hormuz-traffic-returns-to-normal-by-end-of-june,strait-of-hormuz-traffic-returns-to-normal-by-july-31,will-benjamin-netanyahu-be-the-next-prime-minister-of-israel,will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568,will-jd-vance-win-the-2028-us-presidential-election,will-jd-vance-win-the-2028-republican-presidential-nomination,will-marco-rubio-win-the-2028-republican-presidential-nomination,will-the-republicans-win-the-2028-us-presidential-election,will-the-democrats-win-the-2028-us-presidential-election,will-the-republican-party-control-the-house-after-the-2026-midterm-elections,will-the-democratic-party-control-the-senate-after-the-2026-midterm-elections,2026-balance-of-power-d-senate-d-house-949,will-luiz-incio-lula-da-silva-win-the-2026-brazilian-presidential-election,will-flvio-bolsonaro-win-the-2026-brazilian-presidential-election,will-jordan-bardella-win-the-2027-french-presidential-election,will-douard-philippe-win-the-2027-french-presidential-election,will-gadi-eizenkot-be-the-next-prime-minister-of-israel,will-china-invade-taiwan-by-december-31-2027,will-no-fed-rate-cuts-happen-in-2026,fed-rate-hike-in-2026,will-bitcoin-reach-90000-by-december-31-2026-113-862-581-343,will-ethereum-dip-to-800-by-december-31-2026-568,will-france-win-the-2026-fifa-world-cup-924,will-spain-win-the-2026-fifa-world-cup-963,will-usa-win-the-2026-fifa-world-cup-467,will-england-win-the-2026-fifa-world-cup-937,will-argentina-win-the-2026-fifa-world-cup-245,will-portugal-win-the-2026-fifa-world-cup-912,will-brazil-win-the-2026-fifa-world-cup-183"
             # Arb-only markets (sports/World Cup): directional executor skips these; only risk-free
             # YES+NO arbitrage may trade them.
             - name: POLYTRADER_ARB_ONLY_MARKETS
-              value: "will-france-win-the-2026-fifa-world-cup-924,will-spain-win-the-2026-fifa-world-cup-963,will-the-new-york-knicks-win-the-2026-nba-finals,will-usa-win-the-2026-fifa-world-cup-467,will-england-win-the-2026-fifa-world-cup-937,will-argentina-win-the-2026-fifa-world-cup-245,will-portugal-win-the-2026-fifa-world-cup-912,will-brazil-win-the-2026-fifa-world-cup-183,will-germany-win-the-2026-fifa-world-cup-467,will-netherlands-win-the-2026-fifa-world-cup-739"
+              value: "will-france-win-the-2026-fifa-world-cup-924,will-spain-win-the-2026-fifa-world-cup-963,will-usa-win-the-2026-fifa-world-cup-467,will-england-win-the-2026-fifa-world-cup-937,will-argentina-win-the-2026-fifa-world-cup-245,will-portugal-win-the-2026-fifa-world-cup-912,will-brazil-win-the-2026-fifa-world-cup-183"
             # Autonomous paper executor: when "on", passing Decision Reports go through RiskManager
             # gates and place Kelly-sized PAPER orders (never real). Default off = evaluation only.
             - name: POLYTRADER_AUTONOMOUS_PAPER_EXECUTION
@@ -58,6 +61,30 @@ spec:
             # ~180s tick. 0 disables (bootstrap-only). Directional exec is unaffected (arb-only routing).
             - name: POLYTRADER_ARB_DISCOVERY_LIMIT
               value: "150"
+            # Directional market rotation (6h cadence): promote up to LIMIT active, order-book,
+            # binary, NON-sports markets ending within MAX_DAYS and above the 24h-volume floor into
+            # market_data.directional_universe; demote on close/resolution. The directional executor
+            # trades ONLY (bootstrap slugs ∪ active rotation rows) — everything else stays arb-only.
+            # This keeps the tradeable set short-dated and fresh (the profile the June 2026 curated
+            # set proved out) instead of decaying as hand-picked markets resolve. 0 disables.
+            - name: POLYTRADER_ROTATION_LIMIT
+              value: "20"
+            - name: POLYTRADER_ROTATION_MAX_DAYS
+              value: "30"
+            - name: POLYTRADER_ROTATION_MIN_VOL24H
+              value: "5000"
+            # Autonomous exits (paper-only, 5-min cadence): close positions at market on
+            # take-profit / stop-loss / time-stop / signal-flip instead of holding to resolution.
+            # Turns slow markets into bounded round-trips so Hermes gets realized win/loss feedback
+            # in days, not months. Settlement still owns resolved/closed markets.
+            - name: POLYTRADER_AUTONOMOUS_EXITS
+              value: "on"
+            - name: POLYTRADER_EXIT_TAKE_PROFIT_PCT
+              value: "0.25"
+            - name: POLYTRADER_EXIT_STOP_LOSS_PCT
+              value: "0.15"
+            - name: POLYTRADER_EXIT_MAX_HOLD_DAYS
+              value: "14"
             # Both-sides target selection: when "on", the 5-min DR generator evaluates BOTH outcomes
             # and targets whichever has the higher net edge after fees (instead of always the cheaper
             # side). Lets the book buy a favorite when signals support it — unlocks theta's converging-

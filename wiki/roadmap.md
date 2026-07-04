@@ -230,6 +230,106 @@ conclusive — but there is *zero* evidence of positive directional edge and cle
      is NOT in `POLYTRADER_BOOTSTRAP_MARKETS` — the curated set is the only directional-eligible universe;
      every discovery market is arb-only by definition. Baseline held clean ($10k, 0 positions) throughout.
 
+- **Standstill diagnosis + 4-track rebuild — 2026-07-04.** Operator review: "the algorithm is at a
+  standstill." Root-caused it as idle BY CONSTRUCTION, three legs pinned at once: (a) single-market
+  Yes+NO arb structurally dead (430 scans since the 100-market widening, best cost pinned $1.000–1.001,
+  zero sub-dollar — breadth confirmed rather than fixed it); (b) the hand-curated bootstrap set had
+  DECAYED — 29 of 50 slugs resolved (June Iran/Hormuz deadlines; even the Jul/Aug/Dec deadline variants
+  resolved early with the June deal), and the 21 survivors are multi-month/-year horizons that never
+  clear the 2% edge gate; (c) the learning loop starved — 0 settlements/24h AND no autonomous exit path
+  existed (Sell was manual-API-only), so realized feedback was gated on months-out resolutions. Plus a
+  DR-selection lottery: `ORDER BY updated_at DESC LIMIT 20` over a ~140-market universe that refreshes
+  wholesale each tick meant the ~20 DR slots filled with arbitrary arb-only discovery markets, starving
+  the directional-eligible set of decision reports at all. Fixes, all four tracks (one deploy):
+  1. **Automated market rotation** (`src/rotation/`, `market_data.directional_universe`, migration
+     20260704090000): 6h job promotes active/order-book/binary/NON-sports markets ending within
+     `POLYTRADER_ROTATION_MAX_DAYS` (30) above `POLYTRADER_ROTATION_MIN_VOL24H` ($5k), cap
+     `POLYTRADER_ROTATION_LIMIT` (20); demotes on close/resolution/expiry (insert-only — resolution is
+     final). Directional eligibility = bootstrap env ∪ active rows; ingester must-track UNION keeps
+     promoted markets ingested regardless of discovery rank; DR query now ranks directional-eligible
+     markets FIRST (limit 20→40). Client-side end-date re-check guards against Gamma ignoring
+     end_date_min/max. Journals `directional_rotation`.
+  2. **Autonomous exits** (`src/exits/`, gated `POLYTRADER_AUTONOMOUS_EXITS=on`): 5-min evaluator closes
+     positions at market on take-profit (+25%), stop-loss (−15%), time-stop (14d), or signal-flip
+     (latest DR targets the opposite outcome at ≥ live gate). Skips closed/resolved (settlement owns
+     those) and stale marks (>30min). Journals `autonomous_paper_exit` per round-trip for Hermes.
+     **Required an engine fix:** the cash model was buy-only — a Sell's P&L would have evaporated
+     (cash only got the cost basis back) and the buy-averaging formula corrupted avg_entry on partial
+     sells (never triggered before: no-pyramiding meant positions always started flat). `submit_order`
+     now keeps avg on sells, computes realized_delta = Σ(price−avg)×size, and carries it into the
+     post_fill_tx snapshot's realized_pnl (mark-to-market then propagates it).
+  3. **NegRisk EVENT-level arb** (`src/strategy/negrisk.rs`, migration 20260704100000 adds
+     markets.event_id + neg_risk): at most one member of a negRisk event resolves Yes ⇒ buying No
+     across k members pays ≥ k−1; arb whenever Σ(1−ask_No) > 1 (implied probs overround). Holds for ANY
+     SUBSET of members, so partial book coverage still finds arbs — scans what the universe already
+     ingests, no event-wide fetch needed. Per-leg real fees; MIN_MEMBERS=3 (2-member events = the binary
+     scanner's job); journals `negrisk_arb_scan` + `autonomous_negrisk_arb_execution`; executor mirrors
+     the two-leg guard (skip only when EVERY leg already holds No) + shares the $250 arb cap. This is
+     the structural answer to "single-book arb is dead": keeping N books of one event mutually
+     consistent is much harder than keeping one book efficient.
+  4. **Hygiene:** gate-sim fill query reset-filtered (4th reset-boundary site — the panel showed 78
+     pre-reset ghost fills/$9.4k notional against an empty portfolio); the go-live "proven" gate's
+     settled COUNT reset-filtered (5th site — 37 pre-reset settlements could have satisfied
+     MIN_SETTLED=10 against a post-reset track record that proved nothing); bootstrap env pruned
+     50→29 slugs (dead ones only produced closed=true fallback churn every tick).
+  **RESET-BOUNDARY RULE (now 5 occurrences):** any query that aggregates journal events, fills, or
+  win/loss counts across time MUST filter `created_at >= (SELECT max(as_of) FROM
+  virtual_portfolio_snapshots WHERE snapshot_reason='manual_paper_reset')`. Grep for new aggregate
+  queries in review.
+  **First-deploy leak + fix (same day, image local-1783169442):** the first rotation pass promoted 13
+  SPORTS markets — Polymarket's scheduled-match slugs are league-PREFIXED (`wta-`, `atp-`, `cs2-`,
+  `val-`, `lol-`) and `arb_category`'s substring keywords missed them all (plus "wimbledon"), so the
+  Pegula market leaked a directional fill for the SECOND time ($18.69 No) and a WTA match filled
+  $3.89 — which the new exit evaluator sold 2s later on signal-flip (first live proof of the Sell
+  path + realized-P&L capture working end-to-end). Fixes: prefix-anchored `pre()` matcher in
+  `arb_category` (substring would false-positive: "oval-office" contains "val-") + "wimbledon"/
+  "tennis"/"grand-slam" keywords + regression tests on the leaked slugs; wrong rows DELETED from
+  directional_universe; paper reset → clean $10k. Verified post-fix: rotation pass promoted 0 of 100
+  candidates (top-volume short-dated pool is ~all sports matches — correctly excluded now; the 2
+  legit promotions, musk-tweets + SBF-pardon, persist), next mark held exactly $10,000.00 (no
+  claw-back — the reset-aware cash fixes hold), 0 stray fills. **NegRisk scanner first live data:
+  8 events / ~77 member books per pass, best implied-Yes sum 0.990** — genuinely near the 1.00 arb
+  line from below (vs the single-market scanner permanently pinned at $1.001 from the wrong side).
+  LESSON for the classifier: Polymarket slug taxonomies are league-prefixed for scheduled games;
+  any "non-sports" filter must anchor prefixes, not just substrings.
+
+- **Taker/maker fee overhaul — DONE 2026-07-04 (operator asked to audit taker & maker algorithms).**
+  Verified against docs.polymarket.com/trading/fees + maker-rebates + taker-rebates: taker fee =
+  `shares × rate × p × (1−p)` per category (geo 0, sports 0.03, crypto 0.07, finance/politics/
+  mentions/tech 0.04, econ/culture/weather/other 0.05); **MAKERS ARE NEVER CHARGED** (they earn
+  20–25% fee-curve-weighted rebates; takers have a tiered rebate program — ignored as conservative,
+  ~nil at Bronze/paper volumes). Audit results: engine fills + both arb scanners were already
+  correct (per-market stored rate, real formula; every sim fill crosses the book so always-taker is
+  right — sells through the exit path are taker fills too, same symmetric formula). THREE stale
+  sites fixed:
+  1. **`fuse_net` had a UNIT BUG + flat model:** it subtracted `notional×bps + gas − offset` in
+     RAW USDC from the FRACTIONAL gross edge — on the $10 DR notional that over-penalized every
+     decision report ~10× (≈5.1 points instead of ≈0.5) — and its flat 50bps ignored that
+     geopolitics is FREE while crypto at low p costs rate×(1−p) ≈ up to 7% of notional. Now:
+     `fee_frac = rate×(1−p) + gas/notional`, per-market rate + per-side price via the reworked
+     `FeeContext {taker_fee_rate, price, est_gas_usdc}` (flat taker_bps/maker_bps/rewards_offset
+     fields deleted). Verified live: sports p=0.515 → 0.01555; crypto p=0.9995 → 0.001035;
+     geopolitics → 0.0010 (gas only). Attribution journals `fee_cost_frac` (what's subtracted) +
+     `est_fees_and_gas` (USDC, audit); the backtest's `report_fee` prefers the new key and falls
+     back to the old one so historical replays still subtract exactly what the live gate saw.
+     **Effect on behavior: geopolitics/high-p edges were being under-reported ~4–5 points — some
+     previously-rejected DRs will now correctly clear the 2% gate; low-p crypto entries now carry
+     their true ~5–7% cost.**
+  2. **Backtest Phase-3 realistic fills charged flat 0.5% of cost** — now per-level
+     `polymarket_fee` with a per-market rate map (`load_fee_rates`: stored Gamma rate else category
+     default — same resolution order as the live engine).
+  3. **Dead flat-fee plumbing deleted:** `FeeModel` (models.rs, never called), the engine's unused
+     `paper_fee_bps` ctor param/field, `POLYTRADER_PAPER_FEE_BPS` config knob, and server's
+     `paper_fee_bps_from_env`. The server candidates endpoint also passed `target_mid` (a PRICE) as
+     the costing notional — now $10 like the DR generator, with per-market FeeContext.
+  Also added the **"mentions" category** (0.04; `-say-`/`of-tweets`/`tweet-count` slugs — the
+  rotation-promoted musk-tweets market was falling to Other/0.05).
+  **Maker-side disposition (roadmap item, not built):** posting resting limit orders instead of
+  crossing would pay ZERO fee + earn the 20–25% maker rebate — a real edge lever on fee-enabled
+  markets (sports/crypto), but it requires simulating resting-order queues + fill probability,
+  which snapshot-based 5-min ingestion can't do honestly. Revisit only with a WebSocket feed
+  (same prerequisite as simultaneous-fill arb execution).
+
 Drawdown circuit-breaker (auto-pause execution on equity drop), push-alerts for anomalies currently
 caught by hand (WAL archiving flip, LLM health, signal drift), calibration dashboard.
 

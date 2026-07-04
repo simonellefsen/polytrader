@@ -38,6 +38,17 @@ pub struct Market {
     /// order-book-less markets avoids a wasted CLOB fetch + error every tick). Defaults false.
     #[serde(default)]
     pub enable_order_book: bool,
+    /// Gamma `volume24hr` (USD). Feeds the directional-rotation promotion filter (liquidity floor).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_24hr: Option<Decimal>,
+    /// Gamma parent event id (`events[0].id`). Groups the mutually-exclusive member markets of a
+    /// negRisk event for the event-level arbitrage scanner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// Gamma `negRisk` (market-level, falling back to the parent event's flag): at most ONE member
+    /// market of this event resolves Yes. The invariant the buy-all-No event arb rests on.
+    #[serde(default)]
+    pub neg_risk: bool,
 }
 
 #[derive(Clone)]
@@ -120,6 +131,29 @@ impl GammaClient {
                 .get("enableOrderBook")
                 .and_then(|b| b.as_bool())
                 .unwrap_or(false),
+            volume_24hr: v.get("volume24hr").and_then(|n| match n {
+                Value::Number(x) => x.as_f64().and_then(Decimal::from_f64_retain),
+                Value::String(s) => s.parse::<Decimal>().ok(),
+                _ => None,
+            }),
+            event_id: v
+                .get("events")
+                .and_then(|e| e.as_array())
+                .and_then(|a| a.first())
+                .and_then(|e| e.get("id"))
+                .and_then(|i| i.as_str())
+                .map(|s| s.to_string()),
+            neg_risk: v
+                .get("negRisk")
+                .and_then(|b| b.as_bool())
+                .or_else(|| {
+                    v.get("events")
+                        .and_then(|e| e.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|e| e.get("negRisk"))
+                        .and_then(|b| b.as_bool())
+                })
+                .unwrap_or(false),
         }
     }
 
@@ -149,6 +183,45 @@ impl GammaClient {
             usable = out.len(),
             limit,
             "gamma arb-discovery markets"
+        );
+        Ok(out)
+    }
+
+    /// Discover directional-rotation candidates: top active binary order-book markets by 24h volume
+    /// whose end date falls within the next `max_days`. Short-dated is the point — the profile that
+    /// made the June 2026 curated set tradeable (uncertain, moving, resolves in days-weeks) versus
+    /// the multi-year horizons that never clear the edge gate. The caller applies the non-sports
+    /// classifier and the volume floor; this returns the raw usable pool. Failure is caller-non-fatal.
+    pub async fn discover_directional_markets(
+        &self,
+        limit: usize,
+        max_days: i64,
+    ) -> Result<Vec<Market>> {
+        let now = chrono::Utc::now();
+        let url = format!(
+            "{}/markets?active=true&closed=false&order=volume24hr&ascending=false&limit={}&end_date_min={}&end_date_max={}",
+            self.base,
+            limit,
+            now.format("%Y-%m-%dT%H:%M:%SZ"),
+            (now + chrono::Duration::days(max_days)).format("%Y-%m-%dT%H:%M:%SZ"),
+        );
+        let resp: Vec<Value> = self.http.get(&url).send().await?.json().await?;
+        let out: Vec<Market> = resp
+            .iter()
+            .map(Self::parse_market)
+            .filter(|m| {
+                !m.closed
+                    && m.enable_order_book
+                    && m.outcomes.len() == 2
+                    && m.clob_token_ids.len() == 2
+            })
+            .collect();
+        tracing::info!(
+            returned = resp.len(),
+            usable = out.len(),
+            limit,
+            max_days,
+            "gamma directional-rotation candidates"
         );
         Ok(out)
     }

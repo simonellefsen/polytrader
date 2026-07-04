@@ -24,10 +24,9 @@ pub struct Config {
     #[arg(long, env = "RUST_LOG", default_value = "info,polytrader=debug")]
     pub log_level: String,
 
-    /// Taker fee in basis points for paper market orders (default 50 = 0.5%, matches typical Polymarket taker).
-    #[arg(long, env = "POLYTRADER_PAPER_FEE_BPS", default_value_t = 50)]
-    pub paper_fee_bps: u16,
-
+    // paper_fee_bps removed 2026-07-04: fees are Polymarket's real per-market taker model
+    // (shares × rate × p × (1−p), rate synced from Gamma; geopolitics free, makers never charged)
+    // resolved per fill in the paper engine — a global flat bps knob had nothing left to configure.
     /// Comma-separated list of market slugs (or ids) for focused ingestion + paper trading.
     /// Spans Geopolitics / Breaking / Finance plus Sports (the sports ones are arbitrage-only —
     /// see arb_only_markets). Finance/Tech with genuinely-uncertain prices are scarce on Polymarket

@@ -243,7 +243,8 @@ impl ArbitrageScanner {
 
 /// Extract the lowest (best) ask price and its available depth from a JSONB asks array.
 /// Returns (price, depth). Both are zero if the book is empty or unparseable.
-fn best_ask(asks: &serde_json::Value) -> (Decimal, Decimal) {
+/// (Shared with the NegRisk event-level scanner.)
+pub(crate) fn best_ask(asks: &serde_json::Value) -> (Decimal, Decimal) {
     let arr = match asks.as_array() {
         Some(a) if !a.is_empty() => a,
         _ => return (Decimal::ZERO, Decimal::ZERO),

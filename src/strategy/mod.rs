@@ -29,6 +29,7 @@
 
 pub mod arbitrage;
 pub mod external;
+pub mod negrisk;
 pub mod overreaction;
 pub mod theta;
 pub mod weights;
@@ -61,15 +62,24 @@ pub struct Signal {
     pub metadata: serde_json::Value,
 }
 
-/// Minimal fee context for net-of-fees calculations in fusion (decoupled from paper crate for skeleton).
-/// Values from PaperTradingEngine::fee_model() or conservative defaults.
+/// Fee context for net-of-fees calculations in fusion — Polymarket's REAL taker model
+/// (docs.polymarket.com/trading/fees): `fee = shares × rate × p × (1−p)`, per-market rate,
+/// geopolitics fee-free. **Makers are never charged on Polymarket** (they earn 20–25% rebates
+/// instead), and every simulated fill crosses the book (taker), so taker is the only side costed.
+/// The tiered taker-rebate program is deliberately ignored (conservative: at paper volumes the
+/// tier is Bronze and the rebate ~nil).
 /// See wiki/strategies/fees-tax-latency-and-execution-tiers.md for why net (not gross) is mandatory.
 #[derive(Debug, Clone, Default)]
 pub struct FeeContext {
-    pub taker_bps: Decimal,
-    pub maker_bps: Decimal,
+    /// Per-market Polymarket taker fee RATE (e.g. 0.04; 0 = fee-free geopolitics). Prefer the
+    /// stored `market_data.markets.taker_fee_rate` (synced from Gamma feeSchedule); fall back to
+    /// `crate::polymarket_taker_fee_rate(slug)` (category default).
+    pub taker_fee_rate: Decimal,
+    /// Trade price `p` for this side — the fee shape `p × (1−p)` peaks at 0.50, zero at extremes.
+    pub price: Decimal,
+    /// Estimated gas per order in USDC (orders are gasless via the relayer; kept as a small
+    /// conservative buffer).
     pub est_gas_usdc: Decimal,
-    pub rewards_offset_bps: Decimal,
 }
 
 /// Decision Report (for 5-min deliberate tier + journal).
@@ -414,23 +424,38 @@ impl FusionEngine {
         let (gross, mut attribution) = self.fuse(snapshot, ctx)?;
 
         let (net, fee_note) = if let Some(f) = fee_ctx {
-            let rate = f.taker_bps / dec!(10000); // conservative: assume taker for most opportunities
-            let fees = (notional * rate) + f.est_gas_usdc
-                - (notional * (f.rewards_offset_bps / dec!(10000)));
-            let fees = fees.max(Decimal::ZERO);
-            let n = gross - fees;
+            // Polymarket's real taker fee, expressed as a FRACTION of notional so units match the
+            // fractional `gross` edge. (The old code subtracted raw USDC from the fraction — on a
+            // $10 notional that over-penalized every DR ~10×, and its flat-bps model ignored that
+            // geopolitics is FREE while crypto at low p costs up to rate×(1−p) ≈ 7% of notional.)
+            //   shares   = notional / p
+            //   fee_usdc = shares × rate × p × (1−p) = notional × rate × (1−p)
+            //   cost     = (fee_usdc + gas) / notional  — the fraction subtracted from the edge.
+            let (fee_usdc, cost_frac) = if f.price > Decimal::ZERO && notional > Decimal::ZERO {
+                let shares = notional / f.price;
+                let fee = crate::polymarket_fee(f.taker_fee_rate, f.price, shares);
+                (fee, (fee + f.est_gas_usdc) / notional)
+            } else {
+                (Decimal::ZERO, Decimal::ZERO)
+            };
+            let n = gross - cost_frac;
 
-            // Enrich attribution (jsonb ready for journal; explicit, no silent)
+            // Enrich attribution (jsonb ready for journal; explicit, no silent).
+            // `fee_cost_frac` is the value actually subtracted (fraction-of-notional; the backtest
+            // harness prefers it); `est_fees_and_gas` stays as the USDC amount for audit and as the
+            // historical-report fallback key.
             if let Some(map) = attribution.as_object_mut() {
                 map.insert(
                     "fee_impact".to_string(),
                     json!({
-                        "taker_bps_used": f.taker_bps.to_string(),
-                        "est_fees_and_gas": fees.to_string(),
+                        "taker_fee_rate_used": f.taker_fee_rate.to_string(),
+                        "price": f.price.to_string(),
+                        "fee_cost_frac": cost_frac.to_string(),
+                        "est_fees_and_gas": (fee_usdc + f.est_gas_usdc).to_string(),
                         "notional_for_cost": notional.to_string(),
                         "gross_edge": gross.to_string(),
                         "net_edge_after_fees": n.to_string(),
-                        "note": "PRIMARY signal for deliberate 5-min tier (see fees wiki + 4-6% min net in goals). Gross optimism fatal at small capital."
+                        "note": "PRIMARY signal for deliberate 5-min tier (see fees wiki + 4-6% min net in goals). Real Polymarket taker model: shares × rate × p × (1−p); makers pay nothing (we always cross = taker)."
                     }),
                 );
             }

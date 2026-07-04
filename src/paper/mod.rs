@@ -13,6 +13,5 @@ mod models;
 pub use engine::PaperTradingEngine;
 #[allow(unused_imports)]
 pub use models::{
-    FeeModel, OrderSide, OrderStatus, OrderType, PaperFill, PaperOrder, PaperPosition,
-    VirtualPortfolio,
+    OrderSide, OrderStatus, OrderType, PaperFill, PaperOrder, PaperPosition, VirtualPortfolio,
 };

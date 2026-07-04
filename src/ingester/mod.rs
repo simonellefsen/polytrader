@@ -30,7 +30,8 @@ pub async fn ingest_tick(
     //       is the arb frequency lever: dislocations are rare per-market but scale with books watched, PLUS
     //   (3) every market we currently hold a position in — a CORRECTNESS guarantee: a held market that
     //       rotates out of the top-N discovery list must still be re-ingested so it resolves/settles
-    //       (never go blind; same class of bug as the 2026-06-17 settlement blocker).
+    //       (never go blind; same class of bug as the 2026-06-17 settlement blocker) — plus every
+    //       active directional-rotation promotion, which needs books/DRs regardless of discovery rank.
     let discovery_limit = std::env::var("POLYTRADER_ARB_DISCOVERY_LIMIT")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -67,22 +68,27 @@ pub async fn ingest_tick(
         }
     }
 
-    // (3) held-position markets not already in the universe (settlement-tracking guarantee).
-    let held_slugs: Vec<String> = sqlx::query_scalar(
+    // (3) held-position markets not already in the universe (settlement-tracking guarantee), PLUS
+    //     active directional-rotation promotions — a promoted market needs orderbook snapshots and
+    //     decision reports even when it sits outside the volume-ranked discovery top-N (UNION keeps
+    //     this one query; both sets share the "must never go blind" property).
+    let must_track_slugs: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT m.slug FROM paper_trading.paper_positions p
          JOIN market_data.markets m ON m.gamma_id = p.market_id
-         WHERE p.shares > 0 AND COALESCE(m.slug, '') <> ''",
+         WHERE p.shares > 0 AND COALESCE(m.slug, '') <> ''
+         UNION
+         SELECT slug FROM market_data.directional_universe WHERE demoted_at IS NULL",
     )
     .fetch_all(pool)
     .await
     .unwrap_or_default();
-    let missing_held: Vec<String> = held_slugs
+    let missing_must_track: Vec<String> = must_track_slugs
         .into_iter()
         .filter(|s| !candidates.iter().any(|m| &m.slug == s))
         .collect();
-    if !missing_held.is_empty() {
+    if !missing_must_track.is_empty() {
         for m in gamma
-            .fetch_markets_by_slugs(&missing_held)
+            .fetch_markets_by_slugs(&missing_must_track)
             .await
             .unwrap_or_default()
         {
@@ -134,8 +140,8 @@ pub async fn ingest_tick(
         // Upsert market (resolution fields refreshed on conflict so closes are captured).
         sqlx::query(
             r#"INSERT INTO market_data.markets
-               (gamma_id, slug, question, outcomes, clob_token_ids, active, closed, updated_at, raw_json, outcome_prices, resolved_outcome, taker_fee_rate)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11)
+               (gamma_id, slug, question, outcomes, clob_token_ids, active, closed, updated_at, raw_json, outcome_prices, resolved_outcome, taker_fee_rate, event_id, neg_risk)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11, $12, $13)
                ON CONFLICT (gamma_id) DO UPDATE SET
                  slug = EXCLUDED.slug,
                  question = EXCLUDED.question,
@@ -146,6 +152,8 @@ pub async fn ingest_tick(
                  raw_json = EXCLUDED.raw_json,
                  -- refresh the fee rate when Gamma reports one; keep the last known value if absent
                  taker_fee_rate = COALESCE(EXCLUDED.taker_fee_rate, market_data.markets.taker_fee_rate),
+                 event_id = COALESCE(EXCLUDED.event_id, market_data.markets.event_id),
+                 neg_risk = EXCLUDED.neg_risk OR market_data.markets.neg_risk,
                  updated_at = now()"#,
         )
         .bind(&m.id)
@@ -159,6 +167,8 @@ pub async fn ingest_tick(
         .bind(prices_j)
         .bind(&resolved_outcome)
         .bind(m.taker_fee_rate)
+        .bind(&m.event_id)
+        .bind(m.neg_risk)
         .execute(pool)
         .await?;
 

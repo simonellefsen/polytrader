@@ -230,6 +230,7 @@ struct StrategyCandidateMarketRow {
     category: Option<String>,
     last_mid_yes: Decimal,
     last_mid_no: Decimal,
+    taker_fee_rate: Option<Decimal>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -933,11 +934,9 @@ async fn submit_paper_order_from_request(
         );
     };
 
-    let paper_fee_bps = paper_fee_bps_from_env();
     let engine = crate::paper::PaperTradingEngine::new(
         pool.clone(),
         Arc::new(crate::journal::JournalWriter::new(pool.clone())),
-        paper_fee_bps,
     );
     let order = crate::paper::PaperOrder {
         id: uuid::Uuid::new_v4(),
@@ -1514,11 +1513,16 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
         Option<String>,
         Option<bool>,
     );
+    // RESET-BOUNDARY: same as settle_rows above — reset preserves the journal, so lifetime fills
+    // would report pre-reset bands (e.g. 78 ghost fills / $9.4k notional against an empty portfolio).
     let fill_rows: Vec<FillBandRow> = sqlx::query_as(
         "SELECT payload->>'market_id', payload->>'outcome', payload->>'net_edge',
                     payload->>'gross_notional', (payload->>'clears_shadow_gate')::bool
              FROM journal.events
-             WHERE event_type = 'autonomous_paper_execution' AND payload->>'action' = 'filled'",
+             WHERE event_type = 'autonomous_paper_execution' AND payload->>'action' = 'filled'
+               AND created_at >= COALESCE(
+                 (SELECT max(as_of) FROM paper_trading.virtual_portfolio_snapshots
+                  WHERE snapshot_reason = 'manual_paper_reset'), '-infinity'::timestamptz)",
     )
     .fetch_all(pool)
     .await
@@ -9140,7 +9144,7 @@ fn json_decimal_field(row: &serde_json::Value, key: &str) -> Option<Decimal> {
 
 async fn build_strategy_paper_candidates(pool: &PgPool) -> anyhow::Result<serde_json::Value> {
     let markets = sqlx::query_as::<_, StrategyCandidateMarketRow>(
-        "SELECT gamma_id, slug, question, category, last_mid_yes, last_mid_no
+        "SELECT gamma_id, slug, question, category, last_mid_yes, last_mid_no, taker_fee_rate
          FROM market_data.markets
          WHERE active = true
            AND last_mid_yes IS NOT NULL
@@ -9155,12 +9159,8 @@ async fn build_strategy_paper_candidates(pool: &PgPool) -> anyhow::Result<serde_
     // weighting the 5-min generator uses. Empty map → all 1.0 (neutral).
     let learned_weights = crate::strategy::load_processor_weights(pool).await;
     let engine = FusionEngine::with_weights(learned_weights);
-    let fee_ctx = FeeContext {
-        taker_bps: Decimal::from(paper_fee_bps_from_env()),
-        maker_bps: Decimal::from(20u64),
-        est_gas_usdc: Decimal::new(1, 2),
-        rewards_offset_bps: Decimal::from(10u64),
-    };
+    // Fee context is per-market/per-side (real Polymarket taker model: per-market rate × p × (1−p),
+    // geopolitics free, makers never charged) — built inside the loop below.
     let min_net_edge_for_trade = Decimal::new(4, 2);
     let mut candidates = Vec::new();
 
@@ -9241,8 +9241,17 @@ async fn build_strategy_paper_candidates(pool: &PgPool) -> anyhow::Result<serde_
                 "post_orders_called": false,
             }),
         };
+        let fee_ctx = FeeContext {
+            taker_fee_rate: market
+                .taker_fee_rate
+                .unwrap_or_else(|| crate::polymarket_taker_fee_rate(&market.slug)),
+            price: target_mid,
+            est_gas_usdc: Decimal::new(1, 2),
+        };
+        // Notional for costing: a realistic small position (the old code passed target_mid — a
+        // PRICE in [0,1] — as the notional, making fee costing meaningless).
         let (_gross_edge, net_edge_after_fees, attribution) =
-            engine.fuse_net(&snapshot, &context, Some(&fee_ctx), target_mid)?;
+            engine.fuse_net(&snapshot, &context, Some(&fee_ctx), Decimal::from(10u64))?;
         let decision = strategy_candidate_decision(net_edge_after_fees, min_net_edge_for_trade);
 
         candidates.push(serde_json::json!({
@@ -10743,13 +10752,6 @@ fn paper_position_history_json(row: PaperPositionHistoryRow) -> serde_json::Valu
         "paper_only": true,
         "real_orders_enabled": false,
     })
-}
-
-fn paper_fee_bps_from_env() -> u16 {
-    std::env::var("POLYTRADER_PAPER_FEE_BPS")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(50)
 }
 
 fn normalize_paper_order_outcome(value: &str) -> Option<String> {
