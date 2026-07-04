@@ -221,6 +221,14 @@ conclusive — but there is *zero* evidence of positive directional edge and cle
   **Honest expectation:** even at 100 markets, arb is modest — dislocations are small (that 0.968 was ~$0.80
   on $48 depth, economy fee ate half) and rare. ~3× the books ≈ ~3× the shots (~a few/wk). Next breadth
   lever if wanted: paginate discovery past Gamma's 100-cap. Directional stays retired (arb-only routing).
+  5. **Directional-routing gap closed 2026-07-04 (image local-1783137796).** Overnight, the directional
+     executor evaluated (and risk-gate-REJECTED, 5×, no fills) a DISCOVERY market — 2645374 "Will Ayo
+     Dosunmu play for the Toronto Raptors in 2026-27?", an NBA market whose slug dodged `arb_category`'s
+     "sports" keywords, so `is_arb_only_market` returned false → directional-eligible. Widening the universe
+     had unintentionally widened the DIRECTIONAL surface too (only the gate stopped a net-negative fill).
+     Robust fix (no keyword whack-a-mole): `maybe_execute_opportunity` now also skips any market whose slug
+     is NOT in `POLYTRADER_BOOTSTRAP_MARKETS` — the curated set is the only directional-eligible universe;
+     every discovery market is arb-only by definition. Baseline held clean ($10k, 0 positions) throughout.
 
 Drawdown circuit-breaker (auto-pause execution on equity drop), push-alerts for anomalies currently
 caught by hand (WAL archiving flip, LLM health, signal drift), calibration dashboard.

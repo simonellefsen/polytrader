@@ -840,6 +840,19 @@ async fn maybe_execute_opportunity(
         tracing::debug!(slug = %slug, "arb-only market; directional executor skips");
         return Ok(());
     }
+    // Directional executor trades ONLY the curated bootstrap markets. Every market pulled in by the
+    // volume-ranked arb-discovery universe (POLYTRADER_ARB_DISCOVERY_LIMIT) is ARB-ONLY by default: the
+    // retired, net-negative directional strategy must not trade the uncurated discovery set just because
+    // a slug dodged the arb_category keyword classifier (e.g. NBA player markets like 2645374 that the
+    // "sports" keywords miss). Curated slugs stay directional-eligible; discovery = arb-only, robustly.
+    let is_curated = std::env::var("POLYTRADER_BOOTSTRAP_MARKETS")
+        .unwrap_or_default()
+        .split(',')
+        .any(|s| s.trim() == slug);
+    if !is_curated {
+        tracing::debug!(slug = %slug, "non-bootstrap discovery market; directional executor skips (arb-only)");
+        return Ok(());
+    }
     if sizing.recommended_usdc <= dec!(0) || target_mid <= dec!(0) {
         return Ok(());
     }
