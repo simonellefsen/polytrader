@@ -330,6 +330,72 @@ conclusive — but there is *zero* evidence of positive directional edge and cle
   which snapshot-based 5-min ingestion can't do honestly. Revisit only with a WebSocket feed
   (same prerequisite as simultaneous-fill arb execution).
 
+- **Exit evaluator broke a risk-free basket — found & fixed 2026-07-04 evening check.** FIRST LIVE
+  NEGRISK CAPTURE fired at 18:17 on the in-play Canada–Morocco WC exact-score event (event 650891):
+  11 No-legs × 5 units, cost $48.64, guaranteed payout ≥ $50 (max one exact score resolves Yes) ⇒
+  risk-free +$1.21 net — the scanner saw an implied-Yes sum of up to **1.272** (27% overround,
+  in-play books). Then the NEW exit evaluator treated the legs as directional positions: in-play
+  exact-score prices swing violently, TP/SL fired on 5 of 11 legs (−$5.42 sold), 6 legs settled
+  (+$1.41) → realized **−$4.01 instead of guaranteed +$1.21** (a $5.22 structural loss; arithmetic
+  reconciles exactly with the portfolio snapshot). Root cause: exits had no concept of BASKET
+  positions — selling any leg re-introduces exactly the risk the structure eliminated. Also latent:
+  the two-leg Yes+NO arb pairs had the same exposure, and exits selling legs re-arms the negrisk
+  no-pyramiding guard (skip only when ALL legs held) → potential buy/exit churn loop (didn't
+  trigger — only 1 execution — but was live). **Fix:** the exits query now skips any position whose
+  post-reset entry order came from `autonomous_arb_executor` / `autonomous_negrisk_arb_executor`
+  (arb legs are hold-to-resolution by design); this also closes the churn loop at the source.
+  **Positive findings from the same incident:** the negrisk scanner+executor work end-to-end
+  (detect → 11-leg basket fill → settlement), settlements on the 6 held legs paid correctly, and
+  the mark-to-market cash identity held throughout ($9,995.78 = 10,000 − 4.005 − ~$0.22 fees).
+  Minor cosmetic: the `settlement` snapshot at 19:33 wrote cash $9,948.71 (freed collateral not yet
+  credited) and the same-second mark_to_market corrected it to $9,995.78 — a 1-tick equity-curve
+  dip, self-healing, not chased.
+
+- **Rotation tag gate (the whack-a-mole ender) — 2026-07-05 morning check.** Overnight the rotation
+  restored real directional flow: 3 entries, 2 exactly the intended profile (WTI-dip-to-65 Yes @
+  0.63, SBF-pardon No @ 0.983) — but the third was `will-t1-win-msi-2026` (LoL esports, $17.14 Yes)
+  and `cricmlc-was-san` (Major League Cricket) was promoted untraded: the THIRD slug-format
+  generation to dodge the keyword classifier in two days. Cleanup: both rows deleted, T1 position
+  sold via POST /paper/orders (+$0.51 realized after fees — lucky, not clean). **Structural fix:**
+  the market/slug Gamma endpoints carry NO tags, but `/events/{id}` does (T1's event:
+  ["Sports","Esports","league of legends","lol"]) — rotation now fetches the parent event's tags
+  for each would-be promotion and hard-rejects any tagged Sports/Esports, FAIL-CLOSED (no event id
+  or fetch error ⇒ no promotion, retried next pass). Slug keywords stay as the cheap first filter
+  (added `cric*`/`cricket`/`-msi-` + regression tests); the tag gate is the data-driven backstop
+  that doesn't depend on us predicting slug formats. Deployed local-1783234361; first pass: 100
+  candidates, all filtered by the (now-complete-for-today) keywords, 0 promoted, gate armed.
+  Known minor: tag-rejects consume promotion slots within a pass (`take(room)` runs before the
+  gate) — at 6h cadence with a refreshing pool this self-heals; not worth churn.
+  **Overall morning state: healthy.** No real errors (75 log hits all routine CLOB decode noise),
+  exits correctly did NOT touch anything overnight (no arb baskets fired; the 3 directional
+  positions sat within TP/SL bands), settlements clean, cash identity holds ($9,941.29 = 10,000 −
+  4.005 realized − fees − $53.80 locked… identity verified), DB bounded.
+
+- **Midday check 2026-07-05 — routing bug from the fee work, found & fixed (local-1783253913).**
+  `arb_category` has TWO jobs — fee-rate classifier AND arb-only router — and adding "mentions" for
+  the 0.04 fee rate silently made every mentions market arb-only, vetoing the rotation-promoted
+  musk-tweets market (a DR showed 16% net edge but the executor skipped it with no rejection event
+  — the veto ran before eligibility). Fix in `maybe_execute_opportunity`: rotation-active markets
+  are eligible AS GRANTED (the promotion pipeline's event-tag gate already vetoed sports/esports;
+  the slug-category veto no longer re-applies), while bootstrap slugs keep the historical
+  `is_arb_only_market` veto (that list deliberately contains arb-only WC/crypto markets). RULE for
+  future category additions: adding a category to `arb_category` changes BOTH fees and routing —
+  check both consumers.
+  Post-fix verification surfaced a correct-but-notable chain: musk-tweets now reaches the executor,
+  and Kelly sizes it to ZERO — its No is priced 0.9995 (bracket effectively decided), so there is
+  nothing rational to buy. The fused "16% net edge" on a ceiling-priced No is a SIGNAL-CALIBRATION
+  smell (fusion doesn't respect the price ceiling; the edge should shrink as p→1) — the safety
+  stack (Kelly) neutralizes it, but a `net_edge vs (1−p) ceiling` clamp in the DR generator would
+  stop these phantom edges polluting the scorecard. Noted as a signal-quality follow-up, not
+  urgent.
+  Also verified quiet-but-alive: 480 DRs/h (full 40-slot set), 12 arb + 12 negrisk scans/h, ingest
+  current, 0 risk rejections (nothing eligible had a sizable real edge), negrisk best sum 1.010 —
+  correctly filtered (on 3%-fee sports events a ~1% overround is net-negative after per-leg fees).
+  The manual T1 sale's realized capture verified in the books (−4.005 → −3.053, locked freed
+  exactly $17.14). **Real limiter now: rotation candidate SUPPLY** (3 active; the top-100
+  short-dated volume pool is a wall of sports matches). Next lever: paginate discovery past the
+  sports wall (Gamma offset param) and/or tag-filtered discovery queries.
+
 Drawdown circuit-breaker (auto-pause execution on equity drop), push-alerts for anomalies currently
 caught by hand (WAL archiving flip, LLM health, signal drift), calibration dashboard.
 

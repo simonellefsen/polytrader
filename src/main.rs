@@ -892,22 +892,26 @@ async fn maybe_execute_opportunity(
     }
 
     // Arb-only markets (sports / World Cup): never take a directional bet — only the YES+NO
-    // arbitrage executor may trade them. Skip here.
-    if is_arb_only_market(slug) {
+    // Directional eligibility, two grant paths with DIFFERENT category rules:
+    //  - ROTATION-promoted (market_data.directional_universe): eligible AS GRANTED. The promotion
+    //    pipeline already vetoed sports/esports via the event-TAG gate (Polymarket's own taxonomy),
+    //    and `arb_category` must NOT re-veto here — it doubles as the FEE-category classifier, so
+    //    adding a category for fee purposes would silently kill eligibility (exactly what happened
+    //    2026-07-04→05: adding "mentions" for the 0.04 fee rate made the rotation-promoted
+    //    musk-tweets market arb-only, and a 16%-net-edge DR was skipped without even a rejection).
+    //  - BOOTSTRAP env slugs: the historical hand-curated list, which deliberately contains
+    //    arb-only markets (World Cup, crypto) — the `is_arb_only_market` veto still applies.
+    // Everything else (the volume-ranked discovery universe) is ARB-ONLY by default.
+    let is_rotation_active = rotation::is_active(pool, slug).await;
+    if !is_rotation_active && is_arb_only_market(slug) {
         tracing::debug!(slug = %slug, "arb-only market; directional executor skips");
         return Ok(());
     }
-    // Directional executor trades ONLY the curated universe: the bootstrap env allowlist PLUS the
-    // rotation job's active promotions (market_data.directional_universe — short-dated, liquid,
-    // non-sports, demoted on resolution). Every OTHER market pulled in by the volume-ranked
-    // arb-discovery universe (POLYTRADER_ARB_DISCOVERY_LIMIT) is ARB-ONLY by default: the directional
-    // strategy must not trade the uncurated discovery set just because a slug dodged the arb_category
-    // keyword classifier (e.g. NBA player markets like 2645374 that the "sports" keywords miss).
-    let is_curated = std::env::var("POLYTRADER_BOOTSTRAP_MARKETS")
-        .unwrap_or_default()
-        .split(',')
-        .any(|s| s.trim() == slug)
-        || rotation::is_active(pool, slug).await;
+    let is_curated = is_rotation_active
+        || std::env::var("POLYTRADER_BOOTSTRAP_MARKETS")
+            .unwrap_or_default()
+            .split(',')
+            .any(|s| s.trim() == slug);
     if !is_curated {
         tracing::debug!(slug = %slug, "non-curated discovery market; directional executor skips (arb-only)");
         return Ok(());
@@ -1816,7 +1820,7 @@ fn arb_category(slug: &str) -> Option<&'static str> {
     // substring keywords missed (and the Pegula/Wimbledon market leaked a directional fill AGAIN).
     let pre = |w: &[&str]| w.iter().any(|x| s.starts_with(x));
     if pre(&[
-        "wta-", "atp-", "mlb-", "nba-", "nhl-", "nfl-", "ufc-", "epl-", "ucl-",
+        "wta-", "atp-", "mlb-", "nba-", "nhl-", "nfl-", "ufc-", "epl-", "ucl-", "cric",
     ]) || has(&[
         "world-cup",
         "fifa",
@@ -1838,6 +1842,7 @@ fn arb_category(slug: &str) -> Option<&'static str> {
         "wimbledon",
         "tennis",
         "grand-slam",
+        "cricket",
     ]) {
         Some("sports")
     } else if pre(&["cs2-", "csgo-", "val-", "lol-", "dota2-", "dota-", "ow-"])
@@ -1851,6 +1856,7 @@ fn arb_category(slug: &str) -> Option<&'static str> {
             "overwatch",
             "starcraft",
             "rocket-league",
+            "-msi-", // LoL Mid-Season Invitational (will-t1-win-msi-2026 leaked 2026-07-05)
         ])
     {
         Some("esports")
@@ -2243,6 +2249,12 @@ mod tests {
         assert_eq!(arb_category("cs2-big5-nip-2026-07-04"), Some("esports"));
         assert_eq!(arb_category("val-rrq1-edg1-2026-07-04"), Some("esports"));
         assert_eq!(arb_category("lol-blg-t1-2026-07-04"), Some("esports"));
+        // The 2026-07-05 rotation leaks: LoL MSI winner + Major League Cricket match slugs.
+        assert_eq!(
+            arb_category("will-t1-win-msi-2026-20260615160658468"),
+            Some("esports")
+        );
+        assert_eq!(arb_category("cricmlc-was-san-2026-07-04"), Some("sports"));
         // Prefixes must not fire as substrings ("oval-office" contains "val-").
         assert_eq!(arb_category("will-trump-leave-the-oval-office-early"), None);
         // A truly uncategorized slug stays directional.

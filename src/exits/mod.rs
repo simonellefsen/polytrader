@@ -77,7 +77,21 @@ pub async fn evaluate_exits(
          WHERE p.shares > 0
            AND m.closed = false
            AND m.resolved_outcome IS NULL
-           AND m.updated_at > now() - interval '30 minutes'",
+           AND m.updated_at > now() - interval '30 minutes'
+           -- ARB LEGS ARE HOLD-TO-RESOLUTION BY DESIGN: their profit is the guaranteed payout
+           -- structure ACROSS legs (Yes+NO pair < $1; negrisk basket pays >= k-1), and selling any
+           -- leg re-introduces exactly the risk the structure eliminated. 2026-07-04: this
+           -- evaluator sold 5 of 11 legs of a risk-free negrisk basket into in-play exact-score
+           -- price swings, turning a guaranteed +$1.21 into -$4.01. Any position whose entry came
+           -- from an arb executor is therefore invisible to TP/SL/time-stop/signal-flip.
+           AND NOT EXISTS (
+             SELECT 1 FROM paper_trading.paper_orders o
+              WHERE o.market_id = p.market_id AND o.outcome = p.outcome AND o.side = 'Buy'
+                AND o.created_at >= COALESCE(
+                  (SELECT max(as_of) FROM paper_trading.virtual_portfolio_snapshots
+                    WHERE snapshot_reason = 'manual_paper_reset'), '-infinity'::timestamptz)
+                AND o.decision_context->>'source'
+                    IN ('autonomous_arb_executor', 'autonomous_negrisk_arb_executor'))",
     )
     .fetch_all(pool)
     .await

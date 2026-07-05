@@ -88,6 +88,32 @@ pub async fn run_rotation(
             })
             .take(room);
         for m in picks {
+            // TAG GATE (the structural fix for slug-keyword whack-a-mole): before promoting,
+            // check the parent EVENT's tags — Polymarket's own taxonomy. Sports/esports must
+            // never be directional-eligible, and new slug formats keep dodging the keyword
+            // classifier (wta-/cs2-/val- on 07-04, will-t1-win-msi + cricmlc- on 07-05, each a
+            // real leaked promotion). FAIL CLOSED: no event id or a failed tags fetch ⇒ no
+            // promotion this pass (retried next rotation).
+            let Some(event_id) = m.event_id.as_deref() else {
+                tracing::debug!(slug = %m.slug, "rotation: no event id; skipping (fail-closed)");
+                continue;
+            };
+            match gamma.event_tags(event_id).await {
+                Ok(tags) => {
+                    if tags.iter().any(|t| {
+                        t.eq_ignore_ascii_case("sports") || t.eq_ignore_ascii_case("esports")
+                    }) {
+                        tracing::info!(slug = %m.slug, ?tags,
+                            "rotation: rejected by event tag gate (sports/esports stay arb-only)");
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(slug = %m.slug, error = %e,
+                        "rotation: event tags fetch failed; skipping promotion (fail-closed)");
+                    continue;
+                }
+            }
             let end_ts = m
                 .end_date
                 .as_deref()

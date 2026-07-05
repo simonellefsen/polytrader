@@ -226,6 +226,27 @@ impl GammaClient {
         Ok(out)
     }
 
+    /// Tag labels of a Gamma EVENT (`/events/{id}` → `tags[].label`). The market/slug endpoints
+    /// return no tags, but the event endpoint carries Polymarket's own taxonomy (e.g.
+    /// ["Sports", "Esports", "league of legends", "lol"]) — DATA-driven category truth, unlike the
+    /// slug-keyword classifier that new slug formats keep dodging (wta-/cs2- 2026-07-04, then
+    /// will-t1-win-msi/cricmlc- 2026-07-05). Used by the rotation job to hard-reject sports/esports
+    /// from directional eligibility. Errors propagate — the caller fails CLOSED (no promotion).
+    pub async fn event_tags(&self, event_id: &str) -> Result<Vec<String>> {
+        let url = format!("{}/events/{}", self.base, event_id);
+        let ev: Value = self.http.get(&url).send().await?.json().await?;
+        Ok(ev
+            .get("tags")
+            .and_then(|t| t.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.get("label").and_then(|l| l.as_str()))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// Fetch specific markets by slug (public Gamma /markets?slug=...).
     ///
     /// This is the bootstrap path: querying each configured slug directly *guarantees* the market
