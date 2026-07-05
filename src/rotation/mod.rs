@@ -44,6 +44,7 @@ pub async fn run_rotation(
 ) -> Result<RotationStats> {
     let cap = env_i64("POLYTRADER_ROTATION_LIMIT", 0);
     let max_days = env_i64("POLYTRADER_ROTATION_MAX_DAYS", 30);
+    let min_hours = env_i64("POLYTRADER_ROTATION_MIN_HOURS", 12);
     let min_vol = Decimal::from(env_i64("POLYTRADER_ROTATION_MIN_VOL24H", 5_000));
     let mut stats = RotationStats {
         cap,
@@ -65,29 +66,43 @@ pub async fn run_rotation(
     let room = (cap - active).max(0) as usize;
 
     if room > 0 {
-        // Over-fetch: the sports/keyword filter and the volume floor thin the pool considerably.
-        let candidates = gamma.discover_directional_markets(100, max_days).await?;
+        // Paginated fetch: page 0 of the short-dated volume ranking is a wall of sports matches
+        // (~5 non-sports of 100, measured 2026-07-05); the real directional candidates (Fed
+        // brackets, BTC weeklies, Iran deadlines …) live on pages 1–4.
+        let candidates = gamma.discover_directional_markets(5, max_days).await?;
         stats.candidates_usable = candidates.len();
         let horizon = chrono::Utc::now() + chrono::Duration::days(max_days);
+        // NOT pre-truncated to `room`: the tag gate below rejects candidates one by one, and a
+        // pre-truncated iterator would let tag-rejects (e.g. a page of keyword-dodging sports
+        // slugs) burn promotion slots. Instead iterate the whole filtered ranking and stop once
+        // `room` promotions actually landed.
         let picks = candidates
             .into_iter()
             .filter(|m| !m.slug.is_empty() && !is_arb_only(&m.slug))
             .filter(|m| m.volume_24hr.unwrap_or(Decimal::ZERO) >= min_vol)
             // Belt-and-suspenders re-check of the Gamma end_date_min/max query params: a market
             // with no parseable end date, or one outside the window, must never be promoted (the
-            // whole point is short-dated), even if the API ignores the params.
+            // whole point is short-dated), even if the API ignores the params. The LOWER bound is
+            // a real floor, not just "now": Polymarket runs perpetual ultra-fast series
+            // (btc-updown-5m-*, hourly crypto binaries) that rank high on volume and would waste a
+            // promotion slot every pass — one was promoted 2026-07-05 with 5 SECONDS to expiry.
+            // Days-to-weeks is the target profile; sub-`min_hours` markets can't even complete one
+            // ingest+DR cycle.
             .filter(|m| {
+                let min_end = chrono::Utc::now() + chrono::Duration::hours(min_hours);
                 m.end_date
                     .as_deref()
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                     .map(|d| {
                         let d = d.with_timezone(&chrono::Utc);
-                        d > chrono::Utc::now() && d <= horizon
+                        d > min_end && d <= horizon
                     })
                     .unwrap_or(false)
-            })
-            .take(room);
+            });
         for m in picks {
+            if stats.promoted as usize >= room {
+                break;
+            }
             // TAG GATE (the structural fix for slug-keyword whack-a-mole): before promoting,
             // check the parent EVENT's tags — Polymarket's own taxonomy. Sports/esports must
             // never be directional-eligible, and new slug formats keep dodging the keyword

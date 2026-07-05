@@ -192,34 +192,51 @@ impl GammaClient {
     /// made the June 2026 curated set tradeable (uncertain, moving, resolves in days-weeks) versus
     /// the multi-year horizons that never clear the edge gate. The caller applies the non-sports
     /// classifier and the volume floor; this returns the raw usable pool. Failure is caller-non-fatal.
+    ///
+    /// PAGINATED past Gamma's 100-per-page cap (measured 2026-07-05): page 0 of the short-dated
+    /// volume ranking is a wall of sports match markets with only ~5 non-sports candidates, while
+    /// pages 1–4 held ~150 (Fed brackets, BTC weeklies, Iran/Hormuz deadlines, box office …).
+    /// `pages` × 100 candidates, stopping early on a short page. Runs on the 6h rotation cadence,
+    /// so a handful of extra requests is negligible.
     pub async fn discover_directional_markets(
         &self,
-        limit: usize,
+        pages: usize,
         max_days: i64,
     ) -> Result<Vec<Market>> {
+        const PAGE: usize = 100; // Gamma caps a /markets page at 100 regardless of limit
         let now = chrono::Utc::now();
-        let url = format!(
-            "{}/markets?active=true&closed=false&order=volume24hr&ascending=false&limit={}&end_date_min={}&end_date_max={}",
-            self.base,
-            limit,
-            now.format("%Y-%m-%dT%H:%M:%SZ"),
-            (now + chrono::Duration::days(max_days)).format("%Y-%m-%dT%H:%M:%SZ"),
-        );
-        let resp: Vec<Value> = self.http.get(&url).send().await?.json().await?;
-        let out: Vec<Market> = resp
-            .iter()
-            .map(Self::parse_market)
-            .filter(|m| {
+        let emin = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let emax = (now + chrono::Duration::days(max_days))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let mut out: Vec<Market> = Vec::new();
+        let mut returned_total = 0usize;
+        for page in 0..pages.max(1) {
+            let url = format!(
+                "{}/markets?active=true&closed=false&order=volume24hr&ascending=false&limit={}&offset={}&end_date_min={}&end_date_max={}",
+                self.base,
+                PAGE,
+                page * PAGE,
+                emin,
+                emax,
+            );
+            let resp: Vec<Value> = self.http.get(&url).send().await?.json().await?;
+            let n = resp.len();
+            returned_total += n;
+            out.extend(resp.iter().map(Self::parse_market).filter(|m| {
                 !m.closed
                     && m.enable_order_book
                     && m.outcomes.len() == 2
                     && m.clob_token_ids.len() == 2
-            })
-            .collect();
+            }));
+            if n < PAGE {
+                break; // ranking exhausted
+            }
+        }
         tracing::info!(
-            returned = resp.len(),
+            returned = returned_total,
             usable = out.len(),
-            limit,
+            pages,
             max_days,
             "gamma directional-rotation candidates"
         );

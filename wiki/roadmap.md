@@ -83,6 +83,24 @@ conclusive — but there is *zero* evidence of positive directional edge and cle
 - `news_sentiment` fire-rate is volatile (19.9% → 4.5% → 10.1% across checks) — caught by eye, should
   be an automated alert.
 
+## 📋 Open items / TODO (live backlog, most recent first)
+
+Deferred follow-ups surfaced during diagnostic checks but not yet built. Each has a full writeup in
+the dated Decision-log entry below; this is the at-a-glance index.
+
+- [ ] **event_id-based cluster key** (2026-07-05). Rotation ladder promotions (e.g. 6× `gpt-5pt6-released-by-july-N`)
+  are one correlated underlying event, but `risk::cluster_key` drops them in the exempt "uncorrelated"
+  bucket, so up to ~$120 (6 × $20 cap) can concentrate on one binary. Add an event_id-derived cluster
+  key so the concentration cap groups a ladder as one bet. *Low priority at paper scale (~1.2% bankroll).*
+- [ ] **Signal-calibration `(1−p)` ceiling clamp** (2026-07-05). `fuse_net` can report a large net edge on
+  a ceiling-priced side (16% on a 0.9995 No); Kelly correctly zeroes it, but the phantom edge pollutes
+  the scorecard. Clamp fused edge by the remaining price headroom in the DR generator. *Signal-quality, not urgent.*
+- [ ] **Maker-execution simulation** (2026-07-04). Posting resting limit orders pays ZERO taker fee and
+  earns the 20–25% maker rebate — a real lever on fee-enabled markets (sports/crypto). Needs resting-order
+  queue + fill-probability modeling, which honest snapshot-based ingestion can't do. *Blocked on a WebSocket feed.*
+- [ ] **Arb execution realism** (standing). Snapshot-based legs can mis-fill (one leg fills, the other
+  moves) — fine in paper, but real-money arb needs simultaneous WebSocket fills. *Same WS prerequisite as maker sim.*
+
 ---
 
 ## Tier 1 — Unblock learning (highest leverage)
@@ -395,6 +413,25 @@ conclusive — but there is *zero* evidence of positive directional edge and cle
   exactly $17.14). **Real limiter now: rotation candidate SUPPLY** (3 active; the top-100
   short-dated volume pool is a wall of sports matches). Next lever: paginate discovery past the
   sports wall (Gamma offset param) and/or tag-filtered discovery queries.
+
+- **Discovery pagination SHIPPED — evening check 2026-07-05 (image local-1783275412 + floor fix).**
+  Measured the sports wall first: page 0 of the short-dated volume ranking has ~5 non-sports
+  candidates; pages 1–4 hold ~150 (Fed brackets, BTC weeklies, Iran/Hormuz July deadlines, GPT-5.6
+  release ladder, WTI ladder, box office…). `discover_directional_markets` now fetches 5 pages
+  (500 candidates, early-stop on a short page), and the rotation loop no longer pre-truncates to
+  `room` (tag-rejects were burning promotion slots). First paginated pass: **15 promoted**
+  (GPT-5.6 date ladder ×6, WTI ladder ×3, Khamenei ×2, Trump–Starmer, Machado-Venezuela…), and the
+  TAG GATE proved itself on formats keywords can't anticipate — rejected chess tournaments (tagged
+  "Sports"), FIBA basketball (bkfibaqaf-), KBO baseball (kbo-). Two follow-ups from the same pass:
+  (1) it promoted `btc-updown-5m-*` — a perpetual 5-MINUTE crypto binary that expired 5s after
+  promotion; added `POLYTRADER_ROTATION_MIN_HOURS` (default 12) as a time-to-resolution floor
+  (sub-12h markets can't complete an ingest+DR cycle and the updown series would waste a slot
+  every pass); row deleted, verified next pass promotes 0 junk (16 active, cap 20). (2) Noted, not
+  built: ladder promotions concentrate exposure on ONE underlying event (6× GPT-5.6 dates ⇒ up to
+  ~$120 correlated at the $20 cap) and `risk::cluster_key` won't group them (they fall in the
+  exempt "uncorrelated" bucket) — an event_id-based cluster key would close this; at paper scale
+  (1.2% of bankroll) it's low priority. Also added `crint-` (cricket international) to the keyword
+  prefilter with a regression test.
 
 Drawdown circuit-breaker (auto-pause execution on equity drop), push-alerts for anomalies currently
 caught by hand (WAL archiving flip, LLM health, signal drift), calibration dashboard.

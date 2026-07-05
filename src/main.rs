@@ -1820,7 +1820,7 @@ fn arb_category(slug: &str) -> Option<&'static str> {
     // substring keywords missed (and the Pegula/Wimbledon market leaked a directional fill AGAIN).
     let pre = |w: &[&str]| w.iter().any(|x| s.starts_with(x));
     if pre(&[
-        "wta-", "atp-", "mlb-", "nba-", "nhl-", "nfl-", "ufc-", "epl-", "ucl-", "cric",
+        "wta-", "atp-", "mlb-", "nba-", "nhl-", "nfl-", "ufc-", "epl-", "ucl-", "cric", "crint-",
     ]) || has(&[
         "world-cup",
         "fifa",
@@ -2255,6 +2255,7 @@ mod tests {
             Some("esports")
         );
         assert_eq!(arb_category("cricmlc-was-san-2026-07-04"), Some("sports"));
+        assert_eq!(arb_category("crint-gbr3-aus2-2026-07-05"), Some("sports"));
         // Prefixes must not fire as substrings ("oval-office" contains "val-").
         assert_eq!(arb_category("will-trump-leave-the-oval-office-early"), None);
         // A truly uncategorized slug stays directional.
