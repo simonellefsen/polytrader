@@ -44,6 +44,11 @@ pub async fn evaluate_exits(
     }
     let take_profit = dec_env("POLYTRADER_EXIT_TAKE_PROFIT_PCT", dec!(0.25));
     let stop_loss = dec_env("POLYTRADER_EXIT_STOP_LOSS_PCT", dec!(0.15));
+    // Absolute-move floor for the stop: −15% RELATIVE on a cheap share is pennies of pure
+    // bid/ask noise (a 0.18 entry stops on a 2.7¢ wobble — 9 such stops bled −$54 overnight
+    // 2026-07-05→06). The stop only fires when the mid has ALSO moved this much in absolute
+    // price. High-priced entries are unaffected (their 15% is already > the floor).
+    let min_abs_move = dec_env("POLYTRADER_EXIT_MIN_ABS_MOVE", dec!(0.04));
     let max_hold_days = dec_env("POLYTRADER_EXIT_MAX_HOLD_DAYS", dec!(14));
     let min_net_edge = crate::risk::RiskConfig::from_env().min_net_edge;
 
@@ -109,7 +114,7 @@ pub async fn evaluate_exits(
 
         let reason = if move_pct >= take_profit {
             Some("take_profit")
-        } else if move_pct <= -stop_loss {
+        } else if move_pct <= -stop_loss && (mid - avg_entry).abs() >= min_abs_move {
             Some("stop_loss")
         } else if held_days >= max_hold_days {
             Some("time_stop")

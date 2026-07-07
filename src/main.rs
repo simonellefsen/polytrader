@@ -920,6 +920,32 @@ async fn maybe_execute_opportunity(
         return Ok(());
     }
 
+    // RE-ENTRY COOLDOWN: after ANY autonomous exit on this market, block new directional entries
+    // for POLYTRADER_REENTRY_COOLDOWN_HOURS (default 24). Without this, exits CHURN against the
+    // entry loop (measured overnight 2026-07-05→06: −$54 across 9 stop-losses in 10h): a stop-loss
+    // frees the market, the next 5-min DR still likes it → rebuy (england-mexico was bought 4×),
+    // and the both-sides eval oscillates sides via signal-flip exits (WTI-85 flipped Yes⇄No 5×).
+    // Each round trip pays the spread + fees. Per-market (not per-side) so a flip can't dodge it.
+    let cooldown_hours: i64 = std::env::var("POLYTRADER_REENTRY_COOLDOWN_HOURS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(24);
+    let recently_exited: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM journal.events
+          WHERE event_type = 'autonomous_paper_exit' AND payload->>'market_id' = $1
+            AND created_at > now() - make_interval(hours => $2::int))",
+    )
+    .bind(gamma_id)
+    .bind(cooldown_hours as i32)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false);
+    if recently_exited {
+        tracing::debug!(market = %gamma_id, slug = %slug, cooldown_hours,
+            "recently exited; directional re-entry blocked by cooldown");
+        return Ok(());
+    }
+
     // One directional position per market: skip if we already hold ANY open position in this market,
     // on EITHER outcome. This blocks two things:
     //   (1) pyramiding the same side, and

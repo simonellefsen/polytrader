@@ -88,6 +88,9 @@ conclusive — but there is *zero* evidence of positive directional edge and cle
 Deferred follow-ups surfaced during diagnostic checks but not yet built. Each has a full writeup in
 the dated Decision-log entry below; this is the at-a-glance index.
 
+- [ ] **Signal-flip exit debounce** (2026-07-06). The re-entry cooldown stops flip OSCILLATION, but a
+  single noisy DR can still trigger a flip exit; requiring the flip to persist for 2 consecutive DR
+  cycles would cut false exits further. *Small; evaluate after a few days of cooldown data.*
 - [ ] **event_id-based cluster key** (2026-07-05). Rotation ladder promotions (e.g. 6× `gpt-5pt6-released-by-july-N`)
   are one correlated underlying event, but `risk::cluster_key` drops them in the exempt "uncorrelated"
   bucket, so up to ~$120 (6 × $20 cap) can concentrate on one binary. Add an event_id-derived cluster
@@ -414,6 +417,27 @@ the dated Decision-log entry below; this is the at-a-glance index.
   short-dated volume pool is a wall of sports matches). Next lever: paginate discovery past the
   sports wall (Gamma offset param) and/or tag-filtered discovery queries.
 
+- **Exit↔entry churn loop — found & fixed, morning check 2026-07-06 (image local-1783313120).**
+  The paginated rotation set (16 markets) unleashed the directional engine overnight: 19 fills, 17
+  exits, 16 settlements, 2 negrisk baskets — and realized P&L bled −$3.05 → −$52.77. Decomposition:
+  settlements fine (+$1.69/16), take-profit fine (+$4.57), **stop-losses −$54 across 9 exits at avg
+  3h hold**. Two churn mechanisms, both measured live: (1) **stop→rebuy loop** — a stop-loss frees
+  the market, the next 5-min DR still likes it, the executor re-buys (england-mexico-rescheduled
+  bought 4× in one night); (2) **side oscillation** — the both-sides DR eval flips its target on
+  small mid moves, the signal-flip exit sells, the executor buys the OTHER side (WTI-85 flipped
+  Yes⇄No 5×). Each round trip pays spread + fees. Root causes: a −15% RELATIVE stop on cheap shares
+  is pennies of bid/ask noise (0.18 entry stops on a 2.7¢ wobble), and nothing stopped re-entry.
+  **Fixes:** (a) `POLYTRADER_REENTRY_COOLDOWN_HOURS` (24) — after any autonomous exit, the market
+  is blocked from directional re-entry, PER-MARKET so a side-flip can't dodge it; (b)
+  `POLYTRADER_EXIT_MIN_ABS_MOVE` (0.04) — the stop only fires when the mid also moved ≥4¢ absolute
+  (high-priced entries unaffected; their 15% already exceeds it). Worst case is now ONE stop-loss
+  per market per day instead of a loop. **Protections that held:** the arb-leg exclusion kept exits
+  OFF both overnight negrisk baskets (3-leg +1.6¢/u and 13-leg +4.7¢/u, complete, awaiting
+  resolution) — the 07-04 basket incident did not repeat. Deploy note: the first `make k8s-deploy`
+  silently no-op'd (docker-frontend DeadlineExceeded masked by the tail pipe — the [[feedback]]
+  about not piping make through head applies to error-masking generally); caught by verifying the
+  pod image, retried OK.
+
 - **Discovery pagination SHIPPED — evening check 2026-07-05 (image local-1783275412 + floor fix).**
   Measured the sports wall first: page 0 of the short-dated volume ranking has ~5 non-sports
   candidates; pages 1–4 hold ~150 (Fed brackets, BTC weeklies, Iran/Hormuz July deadlines, GPT-5.6
@@ -432,6 +456,36 @@ the dated Decision-log entry below; this is the at-a-glance index.
   exempt "uncorrelated" bucket) — an event_id-based cluster key would close this; at paper scale
   (1.2% of bankroll) it's low priority. Also added `crint-` (cricket international) to the keyword
   prefilter with a regression test.
+
+- **Unbounded orderbook_snapshots growth — found & fixed, check 2026-07-06 (image local-1783352736).**
+  DB size trend prompted a look: `orderbook_snapshots`' oldest row was **2026-06-13** — over 3 weeks,
+  despite the documented 48h retention window. Root cause: `prune_orderbook_snapshots` always keeps
+  the LATEST snapshot per (market, outcome) — correct for the CURRENT live working set, but any
+  market that permanently rotates OUT of the ingest universe (arb-discovery samples ~150/tick,
+  rotation discovery ~500/pass) never gets a newer snapshot, so its stale "latest" row is kept
+  FOREVER. Measured: 201 distinct stuck markets (402 rows), **183 of them not even formally closed**
+  in our DB — just discovery/rotation churn that happened to rank once and never again.
+  `rollup_price_history` already rolls up EVERY row past the 48h window regardless of latest-status,
+  so the price signal was never at risk — only the raw book was leaking. Checked all consumers
+  (arb/negrisk scanners use a 30-min freshness bound; paper engine + `fetch_latest_book` just want
+  "the latest, whatever it is") — nothing depends on a stale row surviving, since any market with a
+  live purpose (bootstrap/rotation-active/held-position) is guaranteed a fresh snapshot every ingest
+  tick via the must-track union, so it never goes this stale in the first place. **Fix:** added
+  `STALE_LATEST_CAP_DAYS = 3` — the keep-latest exception is now capped; past 3 days a "latest" row
+  is pruned regardless. Verified post-deploy: oldest row dropped from 06-13 to within the 3-day cap,
+  55,167 rows deleted in the first pass, `orderbook_snapshots` at 122K live rows / **0 dead tuples**
+  (autovacuum keeping pace). This was a slow, compounding leak — it would have kept growing roughly
+  in proportion to the total distinct markets ever sampled by discovery over the system's lifetime.
+  **Same check confirmed the 2026-07-06 anti-churn fix (cooldown + abs-move floor) is working as
+  designed**, one full day in: zero cooldown breaches since deploy (grep-verified: every rebuy-after-
+  exit row is dated before the 04:45 deploy), stop-loss frequency down ~8× (2 exits/24h at −$6.69,
+  avg 38h held, vs 9 exits/10h at −$54, avg 3h held pre-fix) — the fix is converting noise-driven
+  round-trips into occasional, larger, more deliberate exits. Also reconfirmed the arb-leg exclusion:
+  a new 5-leg negrisk basket (guaranteed +$0.61) filled and sat untouched by exits. No settlement
+  gaps, zero non-routine errors, rotation turning over normally (3 promoted/3 demoted/24h, 0 tag-gate
+  leaks). Portfolio still net-negative (realized −$56.28) — consistent with the long-documented "no
+  proven directional edge" finding, not a new bug; the churn fix slowed the bleed rate, it didn't
+  (and can't) manufacture edge that isn't there.
 
 Drawdown circuit-breaker (auto-pause execution on equity drop), push-alerts for anomalies currently
 caught by hand (WAL archiving flip, LLM health, signal drift), calibration dashboard.

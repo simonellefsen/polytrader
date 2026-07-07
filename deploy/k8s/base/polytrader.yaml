@@ -85,6 +85,15 @@ spec:
               value: "0.15"
             - name: POLYTRADER_EXIT_MAX_HOLD_DAYS
               value: "14"
+            # Anti-churn (2026-07-06, after −$54 of overnight stop-loss churn): a stop only fires
+            # when the mid ALSO moved this much in absolute price (relative −15% on cheap shares is
+            # bid/ask noise), and after any autonomous exit the market is blocked from directional
+            # re-entry for the cooldown (stop→rebuy and signal-flip Yes⇄No oscillation both paid
+            # spread+fees every round trip).
+            - name: POLYTRADER_EXIT_MIN_ABS_MOVE
+              value: "0.04"
+            - name: POLYTRADER_REENTRY_COOLDOWN_HOURS
+              value: "24"
             # Both-sides target selection: when "on", the 5-min DR generator evaluates BOTH outcomes
             # and targets whichever has the higher net edge after fees (instead of always the cheaper
             # side). Lets the book buy a favorite when signals support it — unlocks theta's converging-

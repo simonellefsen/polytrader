@@ -27,6 +27,16 @@ const TELEMETRY_DAYS: i64 = 14;
 /// Keep full-granularity (5-min) portfolio equity snapshots this recent (1D/1W chart); older
 /// mark-to-market snapshots are thinned to 1/hour (fills/settlements/resets are always kept).
 const PORTFOLIO_RAW_DAYS: i64 = 7;
+/// Hard cap on the "keep the latest snapshot per (market, outcome)" exception in
+/// `prune_orderbook_snapshots`. Found 2026-07-06: that exception is meant for the CURRENT live
+/// working set, but a market that permanently rotates out of the ingest universe (arb-discovery/
+/// rotation churn samples ~650 distinct markets/day) never gets a newer snapshot and its stale row
+/// was kept FOREVER — 201 distinct markets stuck (183 not even formally closed) after ~3 weeks.
+/// `rollup_price_history` already rolls up every row past `SNAPSHOT_RAW_HOURS` regardless of
+/// latest-status, so the price signal is safe; nothing needs the raw book past this cap (any market
+/// with a live purpose — bootstrap/rotation-active/held-position — gets fetched every ingest tick
+/// via the must-track union, so it never goes this stale in the first place).
+const STALE_LATEST_CAP_DAYS: i64 = 3;
 /// Rows deleted per batch (bounds lock time / WAL per statement).
 const BATCH: i64 = 10_000;
 
@@ -98,19 +108,25 @@ async fn rollup_price_history(pool: &PgPool) -> Result<u64> {
     Ok(sqlx::query(&q).execute(pool).await?.rows_affected())
 }
 
-/// Delete raw snapshots older than the raw window, ALWAYS keeping the latest per (market, outcome) —
-/// the live working set (arb scanner / fetch_latest_book). Batched.
+/// Delete raw snapshots older than the raw window, keeping the latest per (market, outcome) — the
+/// live working set (arb scanner / fetch_latest_book) — but ONLY up to `STALE_LATEST_CAP_DAYS`.
+/// Batched.
 async fn prune_orderbook_snapshots(pool: &PgPool) -> Result<u64> {
     // "old AND a newer snapshot exists for the same book" ⇒ not the latest ⇒ safe to drop. The EXISTS
-    // uses idx_obs_market_outcome_fetched. (Closed markets keep their last book: no newer exists.)
+    // uses idx_obs_market_outcome_fetched. The second arm is the hard cap: a "latest" row this stale
+    // means the market permanently dropped out of the ingest universe (see STALE_LATEST_CAP_DAYS
+    // doc) — prune it regardless of latest-status; price_history already has its signal.
     let q = format!(
         "DELETE FROM market_data.orderbook_snapshots
          WHERE id IN (
            SELECT s.id FROM market_data.orderbook_snapshots s
            WHERE s.fetched_at < now() - interval '{SNAPSHOT_RAW_HOURS} hours'
-             AND EXISTS (SELECT 1 FROM market_data.orderbook_snapshots s2
-                         WHERE s2.market_id = s.market_id AND s2.outcome = s.outcome
-                           AND s2.fetched_at > s.fetched_at)
+             AND (
+               EXISTS (SELECT 1 FROM market_data.orderbook_snapshots s2
+                       WHERE s2.market_id = s.market_id AND s2.outcome = s.outcome
+                         AND s2.fetched_at > s.fetched_at)
+               OR s.fetched_at < now() - interval '{STALE_LATEST_CAP_DAYS} days'
+             )
            LIMIT {BATCH})"
     );
     delete_in_batches(pool, &q).await
