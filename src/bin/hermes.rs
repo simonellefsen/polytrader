@@ -1751,6 +1751,38 @@ fn signal_health(baseline_pct: Decimal, recent_pct: Decimal, recent_n: i64) -> &
     "ok"
 }
 
+/// 1h-TTL cache for the 7d fire-rate baseline. The aggregate scans ~35k jsonb report rows (~3s,
+/// tripping the slow-statement WARN every reflection) while the 7-day baseline itself moves
+/// glacially — recomputing it every 5-min cycle was pure DB burn. Mirrors server.rs's
+/// health_7d_baseline_cache pattern. Only successful (total > 0) computations are cached.
+#[allow(clippy::type_complexity)]
+fn baseline_7d_cache() -> &'static std::sync::Mutex<Option<(std::time::Instant, (i64, [i64; 6]))>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<Option<(std::time::Instant, (i64, [i64; 6]))>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// The 7d fire-rate baseline via [`baseline_7d_cache`] (1h TTL), else computed fresh.
+async fn signal_fire_counts_7d_cached(pool: &sqlx::PgPool) -> (i64, [i64; 6]) {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+    let cached = baseline_7d_cache().lock().ok().and_then(|g| {
+        g.as_ref()
+            .filter(|(t, _)| t.elapsed() < TTL)
+            .map(|(_, v)| *v)
+    });
+    if let Some(v) = cached {
+        return v;
+    }
+    let v = signal_fire_counts(pool, "7 days").await;
+    if v.0 > 0 {
+        if let Ok(mut g) = baseline_7d_cache().lock() {
+            *g = Some((std::time::Instant::now(), v));
+        }
+    }
+    v
+}
+
 /// Per-signal slim count-only fire-rate aggregate (total reports + per-signal fired count, in SIGNALS
 /// order) over the given interval. "fired" = the score string contains a 1-9 digit (cast-free mirror of
 /// `!Decimal::is_zero()`; can't throw on a stray non-numeric score). Returns (total, [fired; 6]).
@@ -1851,7 +1883,7 @@ async fn load_and_alert_signal_health(pool: &sqlx::PgPool) -> serde_json::Value 
         }
     };
     let (t24, f24) = signal_fire_counts(pool, "24 hours").await;
-    let (t7d, f7d) = signal_fire_counts(pool, "7 days").await;
+    let (t7d, f7d) = signal_fire_counts_7d_cached(pool).await;
 
     let mut rows = serde_json::Map::new();
     let mut alerts_journaled = 0i64;

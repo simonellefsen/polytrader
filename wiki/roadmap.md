@@ -88,6 +88,58 @@ conclusive — but there is *zero* evidence of positive directional edge and cle
 Deferred follow-ups surfaced during diagnostic checks but not yet built. Each has a full writeup in
 the dated Decision-log entry below; this is the at-a-glance index.
 
+- [ ] **Spread-aware entry gating** (2026-07-08). 82% of post-reset losses are execution friction
+  (fees $17 + slippage ~$33 vs gross ≈ −$11); the executor crosses whatever spread exists. Gate
+  entries on estimated round-trip cost (spread + fee) vs net edge. *Complements the maker-exec TODO.*
+  → *Expanded into the "Path to profitability" plan below (P1).*
+
+## 🎯 Path to profitability (added 2026-07-08, operator-requested)
+
+The post-reset ledger decomposes as: gross signal P&L ≈ **flat** (−$11/4d), execution friction
+≈ **−$50** (82% of losses), negrisk arb ≈ **+$3.28 guaranteed** (the only consistently-positive
+strategy, ~$0.80/day). So the path is: (a) stop paying friction on flat-edge trades, (b) scale the
+one thing that provably works, (c) build the execution capability that unlocks the rest. Ranked by
+certainty-of-benefit ÷ effort:
+
+- [ ] **P1 — Friction-aware entry gate** (small; validate in the backtest harness first). The gate
+  today compares net edge (entry fee only) to a static 2%. Change: estimated ROUND-TRIP cost =
+  entry fee + exit fee + current spread + observed slippage-by-price-band, and require
+  `net_edge ≥ k × round_trip_cost` (k≈1.5–2). Measured basis: fills below $0.20 paid **422bps
+  average slippage** vs 101bps above $0.80 — the cost model must be price-band-aware, not flat.
+- [ ] **P2 — Entry price band** (trivial). Skip directional entries outside ~[0.15, 0.85]: cheap
+  lottery tails combine the worst slippage (422bps), the noisiest stops (the churn source), and the
+  fusion ceiling artifact (the `(1−p)` clamp TODO folds into this). Favorites ≥0.85 have almost no
+  headroom after fees. 15 of 57 post-reset entries were in the <$0.20 band.
+- [ ] **P3 — Scale negrisk: event-completion ingestion + fee-free priority** (small-medium). The
+  scanner only sees legs already in the ingest universe, so baskets are PARTIAL (subset overround).
+  When a scan finds a negrisk event with ≥3 visible legs and implied-Yes sum ≥ ~0.97, add ALL its
+  member slugs to the must-track ingest set — full coverage captures the full overround instead of
+  a slice. Prioritize FEE-FREE categories (geopolitics/politics ladders like "next PM"/nominee
+  events) where the 0.2% net threshold is genuinely capturable — on 3%-fee sports events the
+  measured 1.0–1.4% overrounds are structurally uncapturable, so today's scanner mostly stares at
+  markets it can never trade.
+- [ ] **P4 — Ladder monotonicity scanner** (medium; new strategy, needs payoff math first). Date
+  ladders we ALREADY ingest via rotation ("GPT-5.6 by July 7/8/9/10", "WTI reach 80/85/90") obey
+  hard constraints: P(by d₁) ≤ P(by d₂) for d₁<d₂ (and the WTI ladder is monotone in strike). A
+  violation is a structural mispricing tradeable long-only (buy later-date Yes + earlier-date No;
+  bounded, near-riskless payoff when the violation exceeds combined costs). Cheap to scan (same
+  books), and low-liquidity ladder tails are exactly where retail mispricings persist. This is the
+  same "structure beats prediction" thesis negrisk validated.
+- [ ] **P5 — WebSocket CLOB feed** (large; the multi-unlock). One investment removes the three
+  biggest ceilings at once: (a) maker execution — post resting orders: ZERO fees + 20–25% rebates
+  (turns the $50 friction into a rebate income), (b) simultaneous multi-leg fills — makes in-play
+  negrisk capturable, where the only RICH overrounds live (27% seen on Canada–Morocco), (c) honest
+  fill simulation for everything above. Do after P1–P3 prove out; it's the step that would matter
+  for any real-money future.
+- [ ] **P6 — Turnover budget** (trivial). Cap autonomous directional entries per day (e.g. 6, best
+  net-edge first). Friction scales linearly with trade count; a flat-gross book cannot outrun it —
+  fewer, better trades is a direct P&L improvement at zero information cost.
+
+Sequencing: P2+P6 are one-liners, P1 next (harness-validate the gate constant), P3 alongside (it
+feeds the proven strategy), P4 when the payoff math is written down, P5 as the deliberate big bet.
+Honest caveat: P1/P2/P6 mostly stop the bleeding (→ ~breakeven); the PROFIT upside lives in
+P3/P4/P5 (structural trades) — consistent with the 06-29 verdict that structure, not directional
+prediction, is where this system's edge has ever appeared.
 - [ ] **Hermes image-freshness deploy guard** (2026-07-08). `hermes:local` sat stale from 06-24 to 07-08
   while every deploy re-tagged and "rolled out" the old image (behaviorally confirmed: live weights map
   still contained the 06-29-retired overreaction_fade). A post-deploy check comparing the image's
@@ -461,6 +513,20 @@ the dated Decision-log entry below; this is the at-a-glance index.
   exempt "uncorrelated" bucket) — an event_id-based cluster key would close this; at paper scale
   (1.2% of bankroll) it's low priority. Also added `crint-` (cricket international) to the keyword
   prefilter with a regression test.
+
+- **Evening check 2026-07-08 (hermes local-1783541404): tuning verified live + fee-drag insight.**
+  The rebuilt learning loop is demonstrably working: 13 weight updates in 5h, theta walking
+  0.979→0.921→0.926 in damped steps toward its negative-realized target, momentum easing to 0.990.
+  Also fixed the hermes slow-query spam: the 7d fire-rate baseline (~3–4s jsonb aggregate) was
+  recomputed every 5-min reflection; now cached 1h (`signal_fire_counts_7d_cached`, mirrors
+  server.rs's pattern) — one fresh compute per hour/boot, zero slow-statement WARNs after.
+  **Strategic quantification (echoing Hermes's own LLM synthesis "flat before fees"):** since the
+  07-04 reset, realized is −$61.03, of which fees $17.19 + est. slippage ~$33.18 ≈ **$50 (82%) is
+  pure execution friction**; gross signal P&L is ≈ −$11 over 4 days (near-flat). The book isn't
+  losing on direction — it's bleeding ~$12/day in taker friction at current turnover. The levers,
+  in order: (1) reduce turnover further (the churn fixes already cut it), (2) the maker-execution
+  TODO (zero fees + 20–25% rebates — the structural fix, blocked on WS), (3) spread-aware entry
+  gating (don't cross wide spreads for thin edges).
 
 - **Learning loop was HALF-closed — found & fixed, check 2026-07-08 (hermes local-1783523692).**
   Weight tuning had gone silent for 37h ("no change this cycle" every reflection). Root-caused to
