@@ -1604,9 +1604,33 @@ async fn load_per_signal_realized_pnl(
     BTreeMap<String, Decimal>,
     BTreeMap<String, Decimal>,
 ) {
+    // Realized learning sample = resolution settlements UNION autonomous-exit round-trips.
+    // Exits are the DOMINANT realization path since 2026-07-04 (TP/SL/time-stop/signal-flip close
+    // positions in hours-days); reading only `paper_position_settled` meant every exit's realized
+    // P&L was INVISIBLE to weight tuning — the exact feedback the exits feature was built to
+    // provide (found 2026-07-08: tuning had converged/stalled on a quasi-static settled-only
+    // sample while exits carried the real outcomes). Exit net = realized_gross − fees.
+    // Both arms are RESET-BOUNDARY filtered (6th occurrence of the pattern — the lifetime query
+    // was counting the 2026-06-24 phantom re-settlements: 22 of its 74 rows) and EXCLUDE positions
+    // entered by an arb executor (a negrisk/Yes+NO leg's outcome reflects the basket structure,
+    // not the fusion signals that happened to fire on that market's decision reports).
     let settled: Vec<(Option<String>, Option<Decimal>)> = sqlx::query_as(
-        "SELECT payload->>'market_id', (payload->>'realized_pnl')::numeric
-         FROM journal.events WHERE event_type = 'paper_position_settled'",
+        "WITH reset_boundary AS (
+           SELECT COALESCE(max(as_of), '-infinity'::timestamptz) AS t
+           FROM paper_trading.virtual_portfolio_snapshots
+           WHERE snapshot_reason = 'manual_paper_reset')
+         SELECT e.payload->>'market_id', (e.payload->>'realized_pnl')::numeric
+         FROM journal.events e, reset_boundary rb
+         WHERE e.event_type = 'paper_position_settled' AND e.created_at >= rb.t
+           AND NOT EXISTS (SELECT 1 FROM paper_trading.paper_orders o
+                            WHERE o.market_id = e.payload->>'market_id' AND o.side = 'Buy'
+                              AND o.decision_context->>'source'
+                                  IN ('autonomous_arb_executor','autonomous_negrisk_arb_executor'))
+         UNION ALL
+         SELECT e.payload->>'market_id',
+                (e.payload->>'realized_gross')::numeric - (e.payload->>'fees')::numeric
+         FROM journal.events e, reset_boundary rb
+         WHERE e.event_type = 'autonomous_paper_exit' AND e.created_at >= rb.t",
     )
     .fetch_all(pool)
     .await
@@ -1952,11 +1976,23 @@ fn compute_calibration(samples: &[(bool, Decimal)]) -> serde_json::Value {
 /// Anchored to the ENTRY decision report (the prediction the trade was actually made on), matching the
 /// P&L attribution basis. Non-fatal: a DB error degrades to an empty (n=0) block.
 async fn load_calibration(pool: &sqlx::PgPool) -> serde_json::Value {
+    // Same sample hygiene as the P&L attribution (2026-07-08): post-reset only (excludes the
+    // 06-24 phantom re-settlements) and no arb-executor entries (an arb leg's win/loss says
+    // nothing about the entry DR's win_prob quality). Exits stay OUT of calibration — it scores
+    // predicted-vs-RESOLVED outcomes, and an exited position never resolved for us.
     let samples: Vec<(bool, Decimal)> = sqlx::query_as(
         "WITH settled AS (
            SELECT DISTINCT ON (payload->>'market_id')
                   payload->>'market_id' AS mid, (payload->>'won')::bool AS won
-           FROM journal.events WHERE event_type = 'paper_position_settled'
+           FROM journal.events e
+           WHERE event_type = 'paper_position_settled'
+             AND created_at >= COALESCE(
+               (SELECT max(as_of) FROM paper_trading.virtual_portfolio_snapshots
+                 WHERE snapshot_reason = 'manual_paper_reset'), '-infinity'::timestamptz)
+             AND NOT EXISTS (SELECT 1 FROM paper_trading.paper_orders o
+                              WHERE o.market_id = e.payload->>'market_id' AND o.side = 'Buy'
+                                AND o.decision_context->>'source'
+                                    IN ('autonomous_arb_executor','autonomous_negrisk_arb_executor'))
            ORDER BY payload->>'market_id', created_at)
          SELECT s.won, dr.win_prob
          FROM settled s

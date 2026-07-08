@@ -88,6 +88,11 @@ conclusive — but there is *zero* evidence of positive directional edge and cle
 Deferred follow-ups surfaced during diagnostic checks but not yet built. Each has a full writeup in
 the dated Decision-log entry below; this is the at-a-glance index.
 
+- [ ] **Hermes image-freshness deploy guard** (2026-07-08). `hermes:local` sat stale from 06-24 to 07-08
+  while every deploy re-tagged and "rolled out" the old image (behaviorally confirmed: live weights map
+  still contained the 06-29-retired overreaction_fade). A post-deploy check comparing the image's
+  Created date to the build time (or embedding a build-stamp the pod logs at boot) would make this
+  impossible to miss. *The manual rebuild fixed it; the guard prevents recurrence.*
 - [ ] **Signal-flip exit debounce** (2026-07-06). The re-entry cooldown stops flip OSCILLATION, but a
   single noisy DR can still trigger a flip exit; requiring the flip to persist for 2 consecutive DR
   cycles would cut false exits further. *Small; evaluate after a few days of cooldown data.*
@@ -456,6 +461,36 @@ the dated Decision-log entry below; this is the at-a-glance index.
   exempt "uncorrelated" bucket) — an event_id-based cluster key would close this; at paper scale
   (1.2% of bankroll) it's low priority. Also added `crint-` (cricket international) to the keyword
   prefilter with a regression test.
+
+- **Learning loop was HALF-closed — found & fixed, check 2026-07-08 (hermes local-1783523692).**
+  Weight tuning had gone silent for 37h ("no change this cycle" every reflection). Root-caused to
+  THREE stacked issues in Hermes's realized-P&L attribution (`load_per_signal_realized_pnl` +
+  `load_calibration`):
+  1. **Exit round-trips were invisible.** Attribution read ONLY `paper_position_settled` — but since
+     the 07-04 exits feature, autonomous exits are the DOMINANT realization path (TP/SL/time-stop/
+     signal-flip close positions in hours-days). Every exit's realized P&L — including the −$51
+     churn losses — never fed signal learning. The exits feature's stated purpose was "realized
+     feedback for Hermes in days"; the Hermes side of the pipe was never connected. Fixed: the
+     attribution sample is now settlements UNION exits (net = realized_gross − fees).
+  2. **6th reset-boundary occurrence:** the settled query was LIFETIME — its 74 rows = 22 phantom
+     06-24 re-settlements + 16 legacy + 36 post-reset. The phantoms attributed fake +P&L to whatever
+     fired (momentum/theta). Fixed with the standard post-reset filter.
+  3. **Arb legs polluted attribution:** a negrisk/Yes+NO leg's settlement reflects the basket
+     structure, not the fusion signals that happened to fire on that market's DRs (the 07-05 WC
+     baskets included bootstrap markets WITH decision reports → false credit). Fixed: arb-executor-
+     entered positions are excluded from attribution AND calibration (mirrors the exits exclusion).
+  **Effect was immediate and dramatic:** attributable sample 74 → 39; per-signal realized flipped
+  from the contaminated (+7.76 theta / +6.72 momentum) to the TRUTH (−48.86 theta / −15.06 news /
+  −4.66 momentum) — and the first strategy_weights event in 37h landed seconds after deploy (theta
+  1.007 → 0.979, damped steps). The system had been learning from fiction; now it learns from what
+  actually happened, including its own exits.
+  **Discovered en route — the hermes image was STALE SINCE 06-24:** every `hermes:local-*` deploy
+  tag pointed at a June-24 image (docker CreatedAt identical across all tags), behaviorally
+  confirmed by the retired overreaction_fade still appearing in the live weights map. All hermes-
+  side changes for two weeks had silently not shipped. Manual `docker build -f Dockerfile.hermes`
+  produced a fresh image (build itself works; historical mechanism unclear — likely repeated
+  transient BuildKit frontend failures aborting `docker-build` after the polytrader line on the
+  days hermes code changed). Freshness guard added to the TODO list.
 
 - **Unbounded orderbook_snapshots growth — found & fixed, check 2026-07-06 (image local-1783352736).**
   DB size trend prompted a look: `orderbook_snapshots`' oldest row was **2026-06-13** — over 3 weeks,
