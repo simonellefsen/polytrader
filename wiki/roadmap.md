@@ -159,11 +159,14 @@ feeds the proven strategy), P4 when the payoff math is written down, P5 as the d
 Honest caveat: P1/P2/P6 mostly stop the bleeding (→ ~breakeven); the PROFIT upside lives in
 P3/P4/P5 (structural trades) — consistent with the 06-29 verdict that structure, not directional
 prediction, is where this system's edge has ever appeared.
-- [ ] **Hermes image-freshness deploy guard** (2026-07-08). `hermes:local` sat stale from 06-24 to 07-08
-  while every deploy re-tagged and "rolled out" the old image (behaviorally confirmed: live weights map
-  still contained the 06-29-retired overreaction_fade). A post-deploy check comparing the image's
-  Created date to the build time (or embedding a build-stamp the pod logs at boot) would make this
-  impossible to miss. *The manual rebuild fixed it; the guard prevents recurrence.*
+- [x] **Hermes image-freshness deploy guard — DONE 2026-07-09 (commit a9816ae).** Both Dockerfiles now
+  take `ARG BUILD_SHA` → `LABEL build_sha`; `make docker-build` passes `--build-arg BUILD_SHA=$(git
+  rev-parse --short HEAD)`; and `k8s-apply` inspects each deployed image's label after rollout and
+  ABORTS loudly if it != HEAD. Chose the SHA-label over a Created-timestamp check because a fully-cached
+  rebuild keeps the old Created (timestamp would false-positive on legitimately-unchanged images),
+  whereas the SHA busts the label layer every commit so it can't lie. Verified live: deploy printed
+  `OK polytrader … (build_sha=a9816ae)` / `OK hermes …`. Had hermes been stale it would have printed
+  `STALE hermes … has build_sha=<old>` and aborted.
 - [ ] **Signal-flip exit debounce** (2026-07-06). The re-entry cooldown stops flip OSCILLATION, but a
   single noisy DR can still trigger a flip exit; requiring the flip to persist for 2 consecutive DR
   cycles would cut false exits further. *Small; evaluate after a few days of cooldown data.*
