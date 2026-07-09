@@ -37,6 +37,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /app/target/release/polytrader /app/polytrader
 
+# Build provenance: the git SHA this image was built from. Passed by `make docker-build`; the
+# deploy verifies the RUNNING pod's image carries the current HEAD SHA, which catches a silently
+# stale image (the 2026-06-24→07-08 hermes non-deploy bug). A changed SHA always busts this layer,
+# so the label can never lie about which source produced the image.
+ARG BUILD_SHA=unknown
+LABEL build_sha=$BUILD_SHA
+
 USER polytrader
 EXPOSE 8080
 

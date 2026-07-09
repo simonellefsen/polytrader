@@ -133,8 +133,10 @@ backtest: k8s-check-namespace
 dev: run
 
 docker-build:
-	docker build -t polytrader:local -f Dockerfile .
-	docker build -t hermes:local -f Dockerfile.hermes .
+	@BUILD_SHA=$$(git rev-parse --short HEAD 2>/dev/null || echo nogit); \
+	echo "==> Building images at BUILD_SHA=$$BUILD_SHA"; \
+	docker build --build-arg BUILD_SHA=$$BUILD_SHA -t polytrader:local -f Dockerfile . && \
+	docker build --build-arg BUILD_SHA=$$BUILD_SHA -t hermes:local -f Dockerfile.hermes .
 	@echo "Images built: polytrader:local, hermes:local (hermes ts tag + set-image happens in k8s-apply for robustness)"
 
 # Main deployment target for the POC
@@ -156,7 +158,21 @@ k8s-apply: pre-deploy-check docker-build k8s-check-namespace
 	kubectl set image -n $(NAMESPACE) deployment/polytrader polytrader=$$POLY_TS; \
 	kubectl set image -n $(NAMESPACE) deployment/hermes hermes=$$HERMES_TS; \
 	kubectl rollout status deploy/polytrader -n $(NAMESPACE) --timeout=180s; \
-	kubectl rollout status deploy/hermes   -n $(NAMESPACE) --timeout=120s
+	kubectl rollout status deploy/hermes   -n $(NAMESPACE) --timeout=120s; \
+	HEAD_SHA=$$(git rev-parse --short HEAD 2>/dev/null || echo nogit); \
+	echo "==> Verifying deployed images carry BUILD_SHA=$$HEAD_SHA (catches silently-stale images)..."; \
+	FRESH_FAIL=0; \
+	for pair in "polytrader $$POLY_TS" "hermes $$HERMES_TS"; do \
+	  set -- $$pair; name=$$1; img=$$2; \
+	  lbl=$$(docker inspect --format '{{index .Config.Labels "build_sha"}}' $$img 2>/dev/null); \
+	  if [ "$$lbl" = "$$HEAD_SHA" ]; then \
+	    echo "  OK    $$name -> $$img (build_sha=$$lbl)"; \
+	  else \
+	    echo "  STALE $$name -> $$img has build_sha=$$lbl, expected $$HEAD_SHA -- image did NOT come from current source (docker build may have silently reused a cached/failed image)."; \
+	    FRESH_FAIL=1; \
+	  fi; \
+	done; \
+	if [ "$$FRESH_FAIL" != "0" ]; then echo "ERROR: a deployed image is stale (see STALE above). Aborting."; exit 1; fi
 
 	@echo "==> Waiting for CloudNativePG cluster (can take 1-3 min)..."
 	kubectl wait --for=condition=ready pod -l cnpg.io/cluster=polytrader-postgres -n $(NAMESPACE) --timeout=300s || true

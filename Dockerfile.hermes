@@ -26,6 +26,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /app/target/release/hermes /app/hermes
 
+# Build provenance — see the note in ./Dockerfile. The deploy asserts the running hermes pod's
+# image build_sha == current HEAD, so a stale hermes:local (the class of bug that silently shipped
+# a June-24 image for two weeks) fails the deploy loudly instead of "rolling out" nothing.
+ARG BUILD_SHA=unknown
+LABEL build_sha=$BUILD_SHA
+
 USER hermes
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/app/hermes"]
