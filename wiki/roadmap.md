@@ -536,6 +536,33 @@ prediction, is where this system's edge has ever appeared.
   (1.2% of bankroll) it's low priority. Also added `crint-` (cricket international) to the keyword
   prefilter with a regression test.
 
+- **📈 MEASUREMENT CHECKPOINT #1 — the stop-loss fix is working (2026-07-10, ~22:15 UTC, ~27h post-
+  deploy).** The "let the fix run and measure" plan produced its first data point, and it's positive.
+  P&L recovered from ~−$74 to **−$39.99** (= realized −66.71 + unrealized +26.58). Three drivers,
+  all of them our own fixes converging:
+  1. **Zero stop-losses since the widening deployed** (0.50, live 2026-07-09 19:23 UTC). The 4 stops
+     in the trailing 24h ALL predate it — the noise-selling is gone; positions ride to resolution.
+  2. **Settlements 5/5 winners, +$7.36** (realized −74.07 → −66.71). Post-reset settled record is now
+     ~8/8 winners across checks — thin, but every held-to-resolution position has won.
+  3. **An in-play negrisk basket, captured cleanly (+$19 unrealized).** The scanner caught a
+     France–Morocco WC HALFTIME-result 3-way (h/a/d) with a ~23% overround, bought No on all three
+     legs; halftime came a DRAW, so two No legs mark ~$1 (+$46.44, +$7.43) and the draw-No ~$0
+     (−$34.82) → net +$19 guaranteed by the negrisk invariant. The **arb-leg exclusion (07-04 fix)
+     is protecting it from the exit evaluator** — the 07-04 basket disaster did NOT repeat.
+  **Strategic significance:** this is the FIRST clean capture of a transient in-play dislocation —
+  exactly the "only place edge has ever appeared" from the 07-09 structural synthesis. At rest
+  sports negrisk is uncapturable (3% fee > overround); in-play the overround (23% here, 27% on the
+  earlier Canada–Morocco) dwarfs the fee. The snapshot scanner caught it because the WC halftime
+  legs happened to be in the ingest universe; RELIABLE in-play capture is what P5 (WebSocket) buys.
+  **Caveats (unchanged honesty):** +$26.58 is UNREALIZED — the halftime basket marks 0.9995/0.0005
+  but Gamma hasn't closed the markets yet (settles ~full-time; watch realized jump −66.71 → ~−47);
+  directional marks can revert; still net −$40 and one episodic basket is the bulk of the swing. But
+  the direction is unambiguous: the bleed stopped and both proven-positive mechanisms (winning
+  resolutions + in-play negrisk) are contributing at once. Zero non-routine errors, 22 open
+  positions, $777 locked (~8% of NAV, healthy). **Next confirmation:** the halftime basket settling
+  (realized → ~−47) and whether the other 20 held directional/WC-full-match positions resolve at or
+  above cost over the coming days.
+
 - **Stop-loss WIDENED 0.15 → 0.50 — the exits, not the entries, were the loss (2026-07-09).**
   Acting on the "path to profitability" plan, ran the harness-validation it called for BEFORE
   coding — and it redirected the whole conclusion. Decomposed post-reset realized P&L two ways:
