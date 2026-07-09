@@ -43,11 +43,22 @@ pub async fn evaluate_exits(
         return;
     }
     let take_profit = dec_env("POLYTRADER_EXIT_TAKE_PROFIT_PCT", dec!(0.25));
-    let stop_loss = dec_env("POLYTRADER_EXIT_STOP_LOSS_PCT", dec!(0.15));
-    // Absolute-move floor for the stop: −15% RELATIVE on a cheap share is pennies of pure
+    // Stop-loss WIDENED 0.15 → 0.50 on 2026-07-09 after a P&L-by-realization-type decomposition:
+    // since the 07-04 reset EVERY loss came from exits (−$88 over 38 exits, of which stop-loss was
+    // ~−$69), while EVERY position held to resolution WON (settlements +$4.44, 3/3). A prediction-
+    // market position is already BOUNDED — a share heading to $0 can lose at most its entry cost,
+    // there is no leverage/blowup tail for a tight stop to protect against — and these prices
+    // mean-revert short-term, so a −15% stop systematically SELLS NOISE and pays friction to do it.
+    // Evidence: post-07-06-fix stops still fired right at the −15.6% threshold, held only 0.6–3.5d,
+    // six of eight on the correlated WTI ladder (one oil wobble trips the whole ladder). At 0.50 the
+    // stop only fires on a genuine thesis-COLLAPSE (a position that has halved), while ordinary
+    // wobble rides through to resolution or the time-stop. The time-stop still frees dead capital,
+    // take-profit still locks real gains. Reversible via env; abs-move floor unchanged.
+    let stop_loss = dec_env("POLYTRADER_EXIT_STOP_LOSS_PCT", dec!(0.50));
+    // Absolute-move floor for the stop: a small RELATIVE drop on a cheap share is pennies of pure
     // bid/ask noise (a 0.18 entry stops on a 2.7¢ wobble — 9 such stops bled −$54 overnight
     // 2026-07-05→06). The stop only fires when the mid has ALSO moved this much in absolute
-    // price. High-priced entries are unaffected (their 15% is already > the floor).
+    // price. High-priced entries are unaffected (their 50% is already > the floor).
     let min_abs_move = dec_env("POLYTRADER_EXIT_MIN_ABS_MOVE", dec!(0.04));
     let max_hold_days = dec_env("POLYTRADER_EXIT_MAX_HOLD_DAYS", dec!(14));
     let min_net_edge = crate::risk::RiskConfig::from_env().min_net_edge;

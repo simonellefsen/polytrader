@@ -81,8 +81,14 @@ spec:
               value: "on"
             - name: POLYTRADER_EXIT_TAKE_PROFIT_PCT
               value: "0.25"
+            # WIDENED 0.15 → 0.50 on 2026-07-09: P&L decomposition showed 100% of post-reset losses
+            # came from exits (stop-loss ~−$69) while every held-to-resolution position won (3/3,
+            # +$4.44). Prediction-market positions are bounded (max loss = entry cost, no blowup
+            # tail) and mean-revert, so a tight stop sells noise and pays friction for it. At 0.50
+            # the stop fires only on a genuine thesis-collapse; ordinary wobble rides to resolution
+            # or the time-stop. See wiki/roadmap "stop-loss widened".
             - name: POLYTRADER_EXIT_STOP_LOSS_PCT
-              value: "0.15"
+              value: "0.50"
             - name: POLYTRADER_EXIT_MAX_HOLD_DAYS
               value: "14"
             # Anti-churn (2026-07-06, after −$54 of overnight stop-loss churn): a stop only fires

@@ -106,10 +106,14 @@ certainty-of-benefit ÷ effort:
   entry fee + exit fee + current spread + observed slippage-by-price-band, and require
   `net_edge ≥ k × round_trip_cost` (k≈1.5–2). Measured basis: fills below $0.20 paid **422bps
   average slippage** vs 101bps above $0.80 — the cost model must be price-band-aware, not flat.
-- [ ] **P2 — Entry price band** (trivial). Skip directional entries outside ~[0.15, 0.85]: cheap
-  lottery tails combine the worst slippage (422bps), the noisiest stops (the churn source), and the
-  fusion ceiling artifact (the `(1−p)` clamp TODO folds into this). Favorites ≥0.85 have almost no
-  headroom after fees. 15 of 57 post-reset entries were in the <$0.20 band.
+- [x] **P2 — Entry price band → CORRECTED to "widen the stop-loss" (2026-07-09).** The harness-
+  validation the plan called for OVERTURNED this item. Decomposing realized P&L by entry-price band
+  showed the naive [0.15, 0.85] band was backwards: the >0.85 favorites were the ONLY profitable
+  band (+$1.41) and 0.70–0.85 was the biggest loser (−$41.78), so the band would have cut winners
+  and kept losers. Splitting by realization type revealed the true cause — see the "stop-loss
+  widened" entry below. The price band is NOT implemented; the favorite-only edge (consistent with
+  the calibration "high-conviction underpriced" finding) is logged as a future signal-quality lever,
+  not acted on at n=3 settlements.
 - [ ] **P3 — Scale negrisk: event-completion ingestion + fee-free priority** (small-medium). The
   scanner only sees legs already in the ingest universe, so baskets are PARTIAL (subset overround).
   When a scan finds a negrisk event with ≥3 visible legs and implied-Yes sum ≥ ~0.97, add ALL its
@@ -513,6 +517,33 @@ prediction, is where this system's edge has ever appeared.
   exempt "uncorrelated" bucket) — an event_id-based cluster key would close this; at paper scale
   (1.2% of bankroll) it's low priority. Also added `crint-` (cricket international) to the keyword
   prefilter with a regression test.
+
+- **Stop-loss WIDENED 0.15 → 0.50 — the exits, not the entries, were the loss (2026-07-09).**
+  Acting on the "path to profitability" plan, ran the harness-validation it called for BEFORE
+  coding — and it redirected the whole conclusion. Decomposed post-reset realized P&L two ways:
+  - **By entry-price band:** >0.85 favorites were the ONLY positive band (+$1.41); 0.70–0.85 was the
+    worst (−$41.78). The planned P2 [0.15,0.85] band would have been BACKWARDS (cut winners, keep
+    losers) — so P2 is dropped, not built. (The favorite-only edge echoes the calibration finding
+    that high-conviction bets are underpriced; a future signal lever, not touched at n=3.)
+  - **By realization type — the decisive cut:** `exit <0.30 −$25.13 / exit 0.30–0.85 −$59.83 /
+    exit >0.85 −$3.03 / settle >0.85 +$4.44`. **100% of losses are EXITS; every position held to
+    resolution WON (3/3).** Of the −$88 exit total, stop-loss is ~−$69 (the rest signal-flip −$6,
+    take-profit +$4.6). Even post-07-06-fix, the 8 stops fired right at the −15.6% threshold, held
+    0.6–3.5d, six of eight on the correlated WTI ladder (one oil wobble trips the whole ladder).
+  **Root insight:** a prediction-market position is ALREADY bounded — a share going to $0 loses at
+  most its entry cost, there is no leverage/blowup tail a tight stop protects against — and these
+  prices mean-revert short-term (long-documented: "unrealized marks revert to cost"). So a −15% stop
+  systematically sells noise AND pays friction to do it; it is strictly value-destroying here.
+  **Fix:** stop-loss default 0.15 → 0.50 (env `POLYTRADER_EXIT_STOP_LOSS_PCT`) — fires only on a
+  genuine thesis-collapse (a halved position); ordinary wobble now rides to resolution or the 14d
+  time-stop (which still frees dead capital), take-profit still locks real gains, abs-move floor
+  unchanged. This should convert the bulk of the −$69 stop-loss bleed into held positions that (on
+  the 3/3 evidence, tiny but directionally clear) resolve at or above cost. Expectation to verify
+  next check: far fewer stop-loss exits, realized P&L bleed rate drops sharply. **Caveat:** n=3
+  settlements is thin; if held positions start resolving as LOSSES the picture changes — but holding
+  a bounded position through mean-reverting noise still dominates realizing that noise + friction.
+  Also flags the correlated-cluster problem again (6/8 stops were WTI ladder) → the event_id
+  cluster-key TODO would have sized that whole ladder as one bet.
 
 - **Evening check 2026-07-08 (hermes local-1783541404): tuning verified live + fee-drag insight.**
   The rebuilt learning loop is demonstrably working: 13 weight updates in 5h, theta walking
