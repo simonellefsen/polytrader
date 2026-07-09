@@ -114,21 +114,36 @@ certainty-of-benefit ÷ effort:
   widened" entry below. The price band is NOT implemented; the favorite-only edge (consistent with
   the calibration "high-conviction underpriced" finding) is logged as a future signal-quality lever,
   not acted on at n=3 settlements.
-- [ ] **P3 — Scale negrisk: event-completion ingestion + fee-free priority** (small-medium). The
-  scanner only sees legs already in the ingest universe, so baskets are PARTIAL (subset overround).
-  When a scan finds a negrisk event with ≥3 visible legs and implied-Yes sum ≥ ~0.97, add ALL its
-  member slugs to the must-track ingest set — full coverage captures the full overround instead of
-  a slice. Prioritize FEE-FREE categories (geopolitics/politics ladders like "next PM"/nominee
-  events) where the 0.2% net threshold is genuinely capturable — on 3%-fee sports events the
-  measured 1.0–1.4% overrounds are structurally uncapturable, so today's scanner mostly stares at
-  markets it can never trade.
-- [ ] **P4 — Ladder monotonicity scanner** (medium; new strategy, needs payoff math first). Date
-  ladders we ALREADY ingest via rotation ("GPT-5.6 by July 7/8/9/10", "WTI reach 80/85/90") obey
-  hard constraints: P(by d₁) ≤ P(by d₂) for d₁<d₂ (and the WTI ladder is monotone in strike). A
-  violation is a structural mispricing tradeable long-only (buy later-date Yes + earlier-date No;
-  bounded, near-riskless payoff when the violation exceeds combined costs). Cheap to scan (same
-  books), and low-liquidity ladder tails are exactly where retail mispricings persist. This is the
-  same "structure beats prediction" thesis negrisk validated.
+- [x] **P3 — Scale negrisk via event-completion → VALIDATED DEAD-END (2026-07-09), not built.**
+  Checked the live negrisk events before coding: the only ones near the arb line are SPORTS (3–5%
+  fee). Pulled the full World Cup Winner event (30615) from Gamma: **60 member markets, only 8
+  usable** (the rest are eliminated teams priced ~0/~1, contributing nothing) — so event-completion
+  ingestion would just add dead legs. Full-basket math on the 8 usable legs: 0.8% overround vs 2.4%
+  fees = **−1.6%/unit (negative)**, and that's on MID prices; real best-ask is worse. The fee-free
+  events (e.g. 81557 geopolitics) sit far below the line (0.76). Conclusion: negrisk-at-rest is the
+  same structural dead-end as single-market arb — efficient where fee-free, uncapturable where the
+  overround exists (sports fees eat it). The +$3.28 we captured was TRANSIENT IN-PLAY dislocation
+  (27% on Canada–Morocco), which needs WebSocket execution (P5), not more legs.
+- [x] **P4 — Ladder monotonicity scanner → VALIDATED DEAD-END (2026-07-09), not built.** Checked the
+  ladders we already ingest for ordering violations. WTI "reach $X": 0.345 > 0.165 > 0.093 > 0.047 >
+  0.042 — **perfectly monotone in strike**, clean to 3 decimals on a liquid, actively-arbed family.
+  GPT-5.6 "released by date": 0.0005 → 0.9995 monotone increasing, consistent. No violations. The
+  market keeps ladder constraints consistent exactly where they're cheap to arb — same efficiency
+  wall. A cheap violation-MONITOR could still catch a transient illiquid-tail dislocation, but with
+  no execution edge (WebSocket) and the liquid ladders clean, it's low-value observability, deferred.
+
+**⛰️ Structural synthesis (2026-07-09): the "arb-at-rest" thesis is falsified.** P3 (negrisk
+completion) and P4 (ladder monotonicity) join single-market Yes+NO arb as validated dead-ends —
+Polymarket is efficient everywhere we can trade cheaply, and every apparent inefficiency is either a
+high-fee sports market (fee > overround) or a transient in-play spike. The ONLY edge this system has
+ever captured came from in-play dislocations, which require **P5 (WebSocket)** to catch reliably.
+So the realistic path narrows to: (1) let the 2026-07-09 stop-loss fix run — measure whether
+ride-to-resolution turns the directional book breakeven-or-better (the exits were the whole loss);
+(2) if it does, P5 becomes the justified big bet for the in-play/maker edge; (3) if it doesn't, the
+honest conclusion is this venue+account-size has no capturable edge and the value was the
+engineering, not the alpha (the standing 06-29 verdict, now reinforced from the arb side too). The
+disciplined win here was NEGATIVE: three would-be features falsified by data before a line of
+build — exactly what the harness-first rule is for.
 - [ ] **P5 — WebSocket CLOB feed** (large; the multi-unlock). One investment removes the three
   biggest ceilings at once: (a) maker execution — post resting orders: ZERO fees + 20–25% rebates
   (turns the $50 friction into a rebate income), (b) simultaneous multi-leg fills — makes in-play
