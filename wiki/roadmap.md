@@ -88,10 +88,20 @@ conclusive — but there is *zero* evidence of positive directional edge and cle
 Deferred follow-ups surfaced during diagnostic checks but not yet built. Each has a full writeup in
 the dated Decision-log entry below; this is the at-a-glance index.
 
-- [ ] **Spread-aware entry gating** (2026-07-08). 82% of post-reset losses are execution friction
-  (fees $17 + slippage ~$33 vs gross ≈ −$11); the executor crosses whatever spread exists. Gate
-  entries on estimated round-trip cost (spread + fee) vs net edge. *Complements the maker-exec TODO.*
-  → *Expanded into the "Path to profitability" plan below (P1).*
+- [x] **Spread-aware entry gating** (2026-07-08) → *Built as P1 in the "Path to profitability" plan
+  below, DONE 2026-07-10.*
+- [ ] **`make backtest` can OOM-kill the live pod** (2026-07-10). The harness runs via `kubectl exec`
+  inside the SAME 512Mi container as the trading server; a full-history run exceeded the limit and
+  `OOMKilled` the live pod (self-recovered, ~1s gap, no data loss — all state is DB-backed). Needs a
+  durable fix: bump the polytrader pod's memory limit, or make `load_reports`/`load_settlements`
+  stream/paginate instead of materializing full history. Workaround: always pass `--since <date>`.
+  *Real operational risk — prioritize before the next unbounded backtest run.*
+- [ ] **Anchor residual ~$10 gap** (2026-07-10). After folding in exit-realized P&L (commit 77ef205),
+  the fidelity anchor is ~90% closed but not PASS. Suspected cause: manual sells via `POST
+  /paper/orders` (e.g. the 07-05 T1-esports cleanup) realize P&L through the same engine path as an
+  autonomous exit but aren't tagged `autonomous_paper_exit`, so `load_exit_realized` misses them. Add
+  a `source` tag on manual submits too, or broaden the load to any Sell fill without a settlement.
+  *Low priority — doesn't block relative (config-vs-config) backtest comparisons, only exact PASS.*
 
 ## 🎯 Path to profitability (added 2026-07-08, operator-requested)
 
@@ -101,11 +111,55 @@ strategy, ~$0.80/day). So the path is: (a) stop paying friction on flat-edge tra
 one thing that provably works, (c) build the execution capability that unlocks the rest. Ranked by
 certainty-of-benefit ÷ effort:
 
-- [ ] **P1 — Friction-aware entry gate** (small; validate in the backtest harness first). The gate
-  today compares net edge (entry fee only) to a static 2%. Change: estimated ROUND-TRIP cost =
-  entry fee + exit fee + current spread + observed slippage-by-price-band, and require
-  `net_edge ≥ k × round_trip_cost` (k≈1.5–2). Measured basis: fills below $0.20 paid **422bps
-  average slippage** vs 101bps above $0.80 — the cost model must be price-band-aware, not flat.
+- [x] **P1 — Friction-aware entry gate — DONE 2026-07-10 (commit 5712c7c, deployed local-1783701242).**
+  Re-derived the price-band slippage split on the larger current fill sample (was 422/101bps 07-08 on
+  a small sample): **<0.20: 404 slip + 356 fee = 760bps one-way; 0.20–0.40: 513bps; 0.40–0.60: 357bps;
+  0.60–0.80: 278bps; ≥0.80: 107bps** — a ~7× gap between the cheapest and priciest bands. Added
+  `round_trip_cost_frac(price)` (pure, doubled for entry+exit) and a new Gate 1.5 in the SHARED
+  `risk::gate` (same pure fn backing the live executor and the offline backtest harness, so they
+  can't diverge): reject unless `net_edge ≥ k × round_trip_cost_frac(price)`,
+  `k = POLYTRADER_ROUNDTRIP_COST_MULTIPLIER` (default 1.5, 0 disables — preserves the old min-edge-
+  only behavior exactly). 4 new unit tests + 6 existing gate tests updated for the new `price` param.
+  **Harness-validated per the plan's own instruction, comparing `--rt-multiplier 0` (old) vs default
+  1.5 (new) on the same historical decision-report stream:**
+  | | multiplier=0 (old) | multiplier=1.5 (new) |
+  |---|---|---|
+  | fills | 33 | 29 (4 blocked) |
+  | settled W/L | 11/0 | 11/0 (**unchanged**) |
+  | book-walk total P&L | −$5.12 | **+$4.21** |
+  The gate blocked exactly the 4 marginal cheap-book entries dragging down the mark-to-market — it
+  did NOT touch any of the 11 winners. Thin sample (relative ranking only, not live-comparable), but
+  directionally exactly the friction thesis: fewer, better-priced entries. Live gate hasn't rejected
+  on this reason yet (15 min post-deploy) — confirm in the next diagnostic check.
+  **Two findings surfaced while validating, both dispositioned:**
+  1. **`make backtest` OOM-killed the LIVE polytrader pod** (`kubectl exec` runs the harness inside
+     the same 512Mi container as the trading server; the full-history run exceeded the limit,
+     `OOMKilled`, restart count +1). State fully recovered (DB-backed, ~1s gap, all background tasks
+     respawned) but this is a real operational risk — a plain `make backtest` with no `--since` bound
+     can crash production. Worked around this session with `--since <date>`; **needs a durable fix**
+     (bump the pod memory limit, or make the harness stream/paginate `load_reports`/`load_settlements`
+     instead of loading full history into memory). Added to the TODO list below.
+  2. **Backtest fidelity anchor was ALSO broken** (see the dedicated entry below, commit 77ef205) —
+     found because the very first validation run refused to trust its own counterfactual output.
+  3. **Docker Desktop's credential helper was stuck**, causing every `docker pull`/`docker build` to
+     hang until `DeadlineExceeded` (2 failed deploy attempts before diagnosis) — `docker logout`
+     cleared it. Spawned as a background task chip for a durable fix (task_d225d11c); not a code bug.
+
+- **Backtest fidelity anchor fixed: exits weren't counted — DONE 2026-07-10 (commit 77ef205).** The
+  very first P1 validation run refused to trust itself: `ANCHOR: MISMATCH`, settlements recomputed to
+  **+$42.34** vs live-recorded **−$48.10** — a ~$90 gap. Root cause: `realized_from_settlements` only
+  ever summed `paper_position_settled` events, but autonomous exits (TP/SL/time-stop/signal-flip,
+  shipped 07-04) have been the DOMINANT realization path since — the exact same bug shape as the
+  2026-07-08 Hermes attribution fix, just in the other consumer that was never touched. Added
+  `load_exit_realized` (net = realized_gross − fees, reset-boundary filtered, same pattern as
+  `load_settlements`) and folded it into the anchor. Post-fix: recomputed −$58.18 (settlements +42.34
+  + exits −100.52) vs live −$48.10 — **closed ~90% of the gap** (from ~$90 off to ~$10 off), proving
+  the exit-P&L hypothesis was the dominant cause. **Residual ~$10 still unexplained** — most likely
+  manual sells issued directly via `POST /paper/orders` (e.g. the 07-05 T1-esports-position cleanup
+  earlier this session), which realize P&L through the identical engine code path but aren't tagged
+  `autonomous_paper_exit`, so `load_exit_realized` can't see them. Anchor still reads MISMATCH (not
+  PASS) until that's closed too — noted below, not chased further today since it doesn't block
+  trusting the RELATIVE comparison P1 needed (both configs share the identical, if imperfect, anchor).
 - [x] **P2 — Entry price band → CORRECTED to "widen the stop-loss" (2026-07-09).** The harness-
   validation the plan called for OVERTURNED this item. Decomposing realized P&L by entry-price band
   showed the naive [0.15, 0.85] band was backwards: the >0.85 favorites were the ONLY profitable
