@@ -143,7 +143,14 @@ certainty-of-benefit ÷ effort:
      found because the very first validation run refused to trust its own counterfactual output.
   3. **Docker Desktop's credential helper was stuck**, causing every `docker pull`/`docker build` to
      hang until `DeadlineExceeded` (2 failed deploy attempts before diagnosis) — `docker logout`
-     cleared it. Spawned as a background task chip for a durable fix (task_d225d11c); not a code bug.
+     cleared it. **DONE 2026-07-10 (commit 6726d18):** `docker-build` now detects the
+     `DeadlineExceeded`/`error getting credentials` signatures in its own output and self-heals with
+     one automatic `docker logout` + retry before failing for real — verified against a mocked
+     `docker build` in both the transient-failure (retries, succeeds) and genuine-failure (fails
+     immediately, no wasted retry) cases. Considered restarting Docker Desktop instead (would clear
+     the stuck state directly) but that VM hosts every other project's k8s pods too (danske-spil,
+     saxo, …) — too broad a blast radius for a transient, already-clear stall; scoped the fix to
+     polytrader's own Makefile instead.
 
 - **Backtest fidelity anchor fixed: exits weren't counted — DONE 2026-07-10 (commit 77ef205).** The
   very first P1 validation run refused to trust itself: `ANCHOR: MISMATCH`, settlements recomputed to
