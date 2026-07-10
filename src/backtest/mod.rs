@@ -692,6 +692,7 @@ pub async fn run(pool: &sqlx::PgPool, args: &[String]) -> anyhow::Result<()> {
     // The anchor validates accounting against the live CUMULATIVE realized, so it always loads the full
     // settlement history — `--since` only bounds the counterfactual's report replay, never the anchor.
     let settlements = load_settlements(pool).await?;
+    let exit_realized = load_exit_realized(pool).await?;
     let reports = load_reports(pool, since.as_deref()).await?;
     let resolutions = load_resolutions(pool).await?;
     let slug_of = load_slug_map(pool).await?;
@@ -708,13 +709,18 @@ pub async fn run(pool: &sqlx::PgPool, args: &[String]) -> anyhow::Result<()> {
         risk.round_trip_cost_multiplier = k;
     }
 
-    // --- Fidelity anchor: the production settlement formula recomputed over every live settlement ---
-    let (anchor_realized, settled, wins, losses, all_match) =
+    // --- Fidelity anchor: the production settlement formula recomputed over every live settlement,
+    // PLUS every autonomous exit's realized delta (see load_exit_realized doc — exits have been the
+    // dominant realization path since 2026-07-04, and the anchor read a false MISMATCH without them).
+    let (settlement_realized, settled, wins, losses, all_match) =
         realized_from_settlements(&settlements);
+    let anchor_realized = settlement_realized + exit_realized;
     let realized_matches = anchor_realized == live_realized;
     println!("== Fidelity anchor (settlement formula vs live) ==");
     println!("  settlements: {settled}   W/L: {wins}/{losses}");
-    println!("  realized recomputed: {anchor_realized}");
+    println!(
+        "  realized recomputed: {anchor_realized}  (settlements {settlement_realized} + exits {exit_realized})"
+    );
     println!("  realized live-recorded: {live_realized}");
     println!("  per-record formula match: {all_match}");
     println!(
@@ -938,6 +944,27 @@ async fn load_settlements(pool: &sqlx::PgPool) -> anyhow::Result<Vec<SettlementR
             })
         })
         .collect())
+}
+
+/// Net realized P&L from autonomous exits (take-profit/stop-loss/time-stop/signal-flip) since the
+/// last reset. Found 2026-07-10: the anchor summed ONLY `paper_position_settled` and compared
+/// against `live_realized`, which also includes every exit's realized delta — since exits shipped
+/// 2026-07-04 they're the DOMINANT realization path, so the anchor read a false MISMATCH (51
+/// settlements recomputed to +$42.34 vs a live-recorded −$48.10; the ~$90 gap is exactly the
+/// accumulated exit P&L the anchor never knew existed). Same fix shape as the 2026-07-08 Hermes
+/// attribution bug, applied here to the OTHER consumer that summed settlements alone.
+async fn load_exit_realized(pool: &sqlx::PgPool) -> anyhow::Result<Decimal> {
+    let r: Option<Decimal> = sqlx::query_scalar(
+        "SELECT SUM((payload->>'realized_gross')::numeric - (payload->>'fees')::numeric)
+         FROM journal.events
+         WHERE event_type = 'autonomous_paper_exit'
+           AND created_at >= COALESCE(
+             (SELECT max(as_of) FROM paper_trading.virtual_portfolio_snapshots
+              WHERE snapshot_reason = 'manual_paper_reset'), '-infinity'::timestamptz)",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(r.unwrap_or(dec!(0)))
 }
 
 async fn load_reports(pool: &sqlx::PgPool, since: Option<&str>) -> anyhow::Result<Vec<ReportRow>> {
