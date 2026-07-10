@@ -25,6 +25,9 @@
 NAMESPACE := polytrader
 K8S_BASE  := deploy/k8s/base
 
+# bash needed for PIPESTATUS (docker-build's stuck-credential-helper retry, below).
+SHELL := /bin/bash
+
 # Strict namespace guard for polytrader project.
 # We ONLY ever touch the $(NAMESPACE) namespace, except for the explicit
 # one-time ngrok policy update in the shared tunnel (saxo-rust ns).
@@ -132,11 +135,31 @@ backtest: k8s-check-namespace
 
 dev: run
 
+# Self-healing docker-build: Docker Desktop's credential helper occasionally wedges after long
+# uptime (observed 2026-07-10 — `docker pull`/`docker build` hang until BuildKit's own
+# "DeadlineExceeded resolving docker/dockerfile:1" or a raw "error getting credentials", 2 failed
+# deploy attempts before diagnosis). `docker logout` reliably clears it. Rather than requiring a
+# human to notice + diagnose + `docker logout` + retry each time, detect the known failure
+# signatures and self-heal with ONE automatic retry before giving up for real.
 docker-build:
 	@BUILD_SHA=$$(git rev-parse --short HEAD 2>/dev/null || echo nogit); \
 	echo "==> Building images at BUILD_SHA=$$BUILD_SHA"; \
-	docker build --build-arg BUILD_SHA=$$BUILD_SHA -t polytrader:local -f Dockerfile . && \
-	docker build --build-arg BUILD_SHA=$$BUILD_SHA -t hermes:local -f Dockerfile.hermes .
+	LOG=$$(mktemp); \
+	build_with_retry() { \
+	  img=$$1; df=$$2; \
+	  docker build --build-arg BUILD_SHA=$$BUILD_SHA -t $$img -f $$df . 2>&1 | tee $$LOG; \
+	  status=$${PIPESTATUS[0]}; \
+	  if [ "$$status" != "0" ] && grep -qE "DeadlineExceeded|error getting credentials" $$LOG; then \
+	    echo "==> Detected the stuck-Docker-credential-helper signature; running 'docker logout' and retrying once..."; \
+	    docker logout > /dev/null 2>&1 || true; \
+	    docker build --build-arg BUILD_SHA=$$BUILD_SHA -t $$img -f $$df . 2>&1 | tee $$LOG; \
+	    status=$${PIPESTATUS[0]}; \
+	  fi; \
+	  return $$status; \
+	}; \
+	build_with_retry polytrader:local Dockerfile && \
+	build_with_retry hermes:local Dockerfile.hermes; \
+	rc=$$?; rm -f $$LOG; exit $$rc
 	@echo "Images built: polytrader:local, hermes:local (hermes ts tag + set-image happens in k8s-apply for robustness)"
 
 # Main deployment target for the POC
