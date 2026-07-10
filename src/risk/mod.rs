@@ -57,6 +57,13 @@ pub struct RiskConfig {
     pub shadow_net_edge: Decimal,
     /// Stop trading if cumulative PnL / portfolio_value drops below this threshold.
     pub pnl_floor: Decimal,
+    /// Roadmap "P1 — friction-aware entry gate" (2026-07-10): multiplier `k` such that a trade is
+    /// only approved when `net_edge >= k * round_trip_cost_frac(price)` (see that function for the
+    /// price-banded fee+slippage estimate). `min_net_edge` alone only ever charged the ENTRY fee —
+    /// it never priced the EXIT leg or the realized slippage, both of which are severe on cheap
+    /// shares (measured 2026-07-10: 760bps one-way total cost under $0.20 vs 107bps above $0.80).
+    /// 0 disables the gate entirely (pure min_net_edge behavior, unchanged).
+    pub round_trip_cost_multiplier: Decimal,
 }
 
 impl Default for RiskConfig {
@@ -70,8 +77,34 @@ impl Default for RiskConfig {
             min_net_edge: dec!(0.02),
             shadow_net_edge: dec!(0.04),
             pnl_floor: dec!(-0.20),
+            round_trip_cost_multiplier: dec!(1.5),
         }
     }
+}
+
+/// Price-banded round-trip cost estimate: fee + slippage, BOTH legs (entry + exit), as a fraction of
+/// notional. `min_net_edge` alone only ever priced the entry fee; this is the actual cost of a full
+/// round-trip on THIS venue, which is highly price-dependent (a thin, cheap-share book is expensive to
+/// cross twice). Bands and bps are the measured post-reset average `paper_fills.slippage_bps` + real
+/// per-fill fee rate, by entry price, as of 2026-07-10 (re-derive via the same query as fill history
+/// grows — see wiki/roadmap "P1 — friction-aware entry gate"):
+///   <0.20: 404 slip + 356 fee = 760bps one-way   0.20-0.40: 241+272=513   0.40-0.60: 230+127=357
+///   0.60-0.80: 178+100=278bps one-way            >=0.80: 85+22=107bps one-way
+/// Doubled for the round trip (a symmetric exit is assumed — the exits feature always closes at
+/// market, i.e. also crosses the book).
+pub fn round_trip_cost_frac(price: Decimal) -> Decimal {
+    let one_way_bps = if price < dec!(0.20) {
+        dec!(760)
+    } else if price < dec!(0.40) {
+        dec!(513)
+    } else if price < dec!(0.60) {
+        dec!(357)
+    } else if price < dec!(0.80) {
+        dec!(278)
+    } else {
+        dec!(107)
+    };
+    (one_way_bps * dec!(2)) / dec!(10000)
 }
 
 impl RiskConfig {
@@ -104,6 +137,10 @@ impl RiskConfig {
             min_net_edge: dec_env("POLYTRADER_MIN_NET_EDGE", d.min_net_edge),
             shadow_net_edge: dec_env("POLYTRADER_SHADOW_NET_EDGE", d.shadow_net_edge),
             pnl_floor: dec_env("POLYTRADER_PNL_FLOOR", d.pnl_floor),
+            round_trip_cost_multiplier: dec_env(
+                "POLYTRADER_ROUNDTRIP_COST_MULTIPLIER",
+                d.round_trip_cost_multiplier,
+            ),
         }
     }
 
@@ -119,6 +156,7 @@ impl RiskConfig {
             "min_net_edge": self.min_net_edge.to_string(),
             "shadow_net_edge": self.shadow_net_edge.to_string(),
             "pnl_floor": self.pnl_floor.to_string(),
+            "round_trip_cost_multiplier": self.round_trip_cost_multiplier.to_string(),
         })
     }
 }
@@ -333,6 +371,7 @@ impl RiskManager {
         market_id: &str,
         net_edge: Decimal,
         proposed_usdc: Decimal,
+        price: Decimal,
     ) -> Result<RiskCheck> {
         // Gate 1 short-circuit: the common min-edge rejection skips the DB exposure load. gate()
         // applies the identical check (via min_edge_reject) so the offline backtest harness
@@ -340,8 +379,11 @@ impl RiskManager {
         if net_edge < self.config.min_net_edge {
             return Ok(self.min_edge_reject(net_edge));
         }
+        if let Some(r) = self.round_trip_reject(net_edge, price) {
+            return Ok(r);
+        }
         let exp = self.load_exposure(pool, market_id).await?;
-        Ok(self.gate(market_id, net_edge, proposed_usdc, &exp))
+        Ok(self.gate(market_id, net_edge, proposed_usdc, price, &exp))
     }
 
     /// The standard "below minimum net edge" rejection, shared by the live short-circuit in
@@ -357,21 +399,50 @@ impl RiskManager {
         }
     }
 
+    /// Gate 1.5 (P1, 2026-07-10): reject when net edge doesn't clear `k *
+    /// round_trip_cost_frac(price)`. `None` when the multiplier is 0 (gate disabled) or the trade
+    /// clears it. Shared by the live short-circuit and the pure `gate` for the same no-drift reason
+    /// as `min_edge_reject`.
+    fn round_trip_reject(&self, net_edge: Decimal, price: Decimal) -> Option<RiskCheck> {
+        if self.config.round_trip_cost_multiplier <= Decimal::ZERO {
+            return None;
+        }
+        let required = round_trip_cost_frac(price) * self.config.round_trip_cost_multiplier;
+        if net_edge >= required {
+            return None;
+        }
+        Some(RiskCheck {
+            approved: false,
+            reason: format!(
+                "net_edge {net_edge:.4} < round-trip friction floor {required:.4} \
+                 ({:.0}x round_trip_cost_frac({price:.2}))",
+                self.config.round_trip_cost_multiplier
+            ),
+            recommended_size: None,
+        })
+    }
+
     /// Pure pre-trade risk gate: given the candidate edge/size and a portfolio-exposure snapshot,
     /// produce the approve / trim / reject decision. No DB, no async — the single source of truth
     /// shared by the live [`RiskManager::check_pre_trade`] (which loads `exp` from Postgres) and the
-    /// offline backtest harness (which feeds a simulated `exp`). Gate order: 1 min-edge, 2 PnL floor,
-    /// 3 total exposure, 3.5 correlated-cluster cap (trim), 4 per-market concentration (trim/reject).
+    /// offline backtest harness (which feeds a simulated `exp`). Gate order: 1 min-edge, 1.5
+    /// friction-aware round-trip cost floor, 2 PnL floor, 3 total exposure, 3.5 correlated-cluster
+    /// cap (trim), 4 per-market concentration (trim/reject).
     pub fn gate(
         &self,
         market_id: &str,
         net_edge: Decimal,
         proposed_usdc: Decimal,
+        price: Decimal,
         exp: &PortfolioExposure,
     ) -> RiskCheck {
         // Gate 1: minimum net edge
         if net_edge < self.config.min_net_edge {
             return self.min_edge_reject(net_edge);
+        }
+        // Gate 1.5: friction-aware round-trip cost floor (see round_trip_reject doc).
+        if let Some(r) = self.round_trip_reject(net_edge, price) {
+            return r;
         }
 
         let total_value = exp.virtual_usdc + exp.total_locked;
@@ -613,7 +684,7 @@ mod gate_tests {
             "uncorrelated",
             dec!(0),
         );
-        let r = mgr().gate("m", dec!(0.01), dec!(10), &e);
+        let r = mgr().gate("m", dec!(0.01), dec!(10), dec!(0.9), &e);
         assert!(!r.approved);
         assert!(r.reason.contains("min"), "{}", r.reason);
         assert!(r.recommended_size.is_none());
@@ -629,7 +700,7 @@ mod gate_tests {
             "uncorrelated",
             dec!(0),
         );
-        let r = mgr().gate("m", dec!(0.05), dec!(10), &e);
+        let r = mgr().gate("m", dec!(0.05), dec!(10), dec!(0.9), &e);
         assert!(r.approved);
         assert_eq!(r.recommended_size, Some(dec!(10)));
     }
@@ -645,7 +716,7 @@ mod gate_tests {
             "uncorrelated",
             dec!(0),
         );
-        let r = mgr().gate("m", dec!(0.05), dec!(10), &e);
+        let r = mgr().gate("m", dec!(0.05), dec!(10), dec!(0.9), &e);
         assert!(!r.approved);
         assert!(r.reason.contains("floor"), "{}", r.reason);
     }
@@ -661,7 +732,7 @@ mod gate_tests {
             "uncorrelated",
             dec!(0),
         );
-        let r = mgr().gate("m", dec!(0.05), dec!(10), &e);
+        let r = mgr().gate("m", dec!(0.05), dec!(10), dec!(0.9), &e);
         assert!(!r.approved);
         assert!(r.reason.contains("total exposure"), "{}", r.reason);
     }
@@ -677,7 +748,7 @@ mod gate_tests {
             "iran_geopolitics",
             dec!(50),
         );
-        let r = mgr().gate("m", dec!(0.05), dec!(30), &e);
+        let r = mgr().gate("m", dec!(0.05), dec!(30), dec!(0.9), &e);
         assert!(r.approved);
         assert_eq!(r.recommended_size, Some(dec!(20)));
         assert!(r.reason.contains("cluster"), "{}", r.reason);
@@ -694,9 +765,67 @@ mod gate_tests {
             "uncorrelated",
             dec!(20),
         );
-        let r = mgr().gate("m", dec!(0.05), dec!(30), &e);
+        let r = mgr().gate("m", dec!(0.05), dec!(30), dec!(0.9), &e);
         assert!(r.approved);
         assert_eq!(r.recommended_size, Some(dec!(14)));
         assert!(r.reason.contains("concentration"), "{}", r.reason);
+    }
+
+    #[test]
+    fn round_trip_cost_frac_is_price_banded_and_doubled() {
+        // 760bps one-way under $0.20 -> 1520bps round trip.
+        assert_eq!(round_trip_cost_frac(dec!(0.10)), dec!(0.152));
+        // 107bps one-way >= $0.80 -> 214bps round trip.
+        assert_eq!(round_trip_cost_frac(dec!(0.90)), dec!(0.0214));
+    }
+
+    #[test]
+    fn gate_rejects_cheap_share_below_friction_floor() {
+        // price 0.10 -> round_trip_cost_frac = 0.152; default multiplier 1.5 -> floor 0.228.
+        // net_edge 0.05 clears Gate 1 (min_net_edge 0.02) but not the friction floor.
+        let e = exp(
+            dec!(150),
+            dec!(0),
+            dec!(0),
+            dec!(0),
+            "uncorrelated",
+            dec!(0),
+        );
+        let r = mgr().gate("m", dec!(0.05), dec!(10), dec!(0.10), &e);
+        assert!(!r.approved);
+        assert!(r.reason.contains("round-trip"), "{}", r.reason);
+    }
+
+    #[test]
+    fn gate_approves_cheap_share_when_edge_clears_friction_floor() {
+        // Same 0.228 floor, but net_edge 0.25 clears it.
+        let e = exp(
+            dec!(150),
+            dec!(0),
+            dec!(0),
+            dec!(0),
+            "uncorrelated",
+            dec!(0),
+        );
+        let r = mgr().gate("m", dec!(0.25), dec!(10), dec!(0.10), &e);
+        assert!(r.approved);
+    }
+
+    #[test]
+    fn gate_friction_floor_disabled_by_zero_multiplier() {
+        let mut cfg = RiskConfig::default();
+        cfg.round_trip_cost_multiplier = dec!(0);
+        let rm = RiskManager::new(cfg);
+        let e = exp(
+            dec!(150),
+            dec!(0),
+            dec!(0),
+            dec!(0),
+            "uncorrelated",
+            dec!(0),
+        );
+        // net_edge 0.05 would fail the friction floor at the default multiplier but the gate is off.
+        let r = rm.gate("m", dec!(0.05), dec!(10), dec!(0.10), &e);
+        assert!(r.approved);
     }
 }

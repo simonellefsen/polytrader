@@ -120,6 +120,13 @@ spec:
               value: "0.02"
             - name: POLYTRADER_SHADOW_NET_EDGE
               value: "0.04"
+            # Friction-aware round-trip cost gate (roadmap "P1", 2026-07-10): a trade is only
+            # approved when net_edge >= k * round_trip_cost_frac(price), the measured price-banded
+            # fee+slippage cost of a full entry+exit round trip. MIN_NET_EDGE alone only ever priced
+            # the entry fee, never the exit leg or realized slippage (760bps one-way under $0.20 vs
+            # 107bps above $0.80) -- this is what actually stopped the cheap-share losses. 0 disables.
+            - name: POLYTRADER_ROUNDTRIP_COST_MULTIPLIER
+              value: "1.5"
             # Correlated-cluster exposure cap: max fraction of the book locked across all markets that
             # resolve off the same underlying event (e.g. the ~15 Iran/Hormuz peace-deal markets). Each
             # passes the 20% per-market cap individually, but together they are one giant correlated bet.

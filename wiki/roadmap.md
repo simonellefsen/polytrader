@@ -167,9 +167,12 @@ prediction, is where this system's edge has ever appeared.
   whereas the SHA busts the label layer every commit so it can't lie. Verified live: deploy printed
   `OK polytrader … (build_sha=a9816ae)` / `OK hermes …`. Had hermes been stale it would have printed
   `STALE hermes … has build_sha=<old>` and aborted.
-- [ ] **Signal-flip exit debounce** (2026-07-06). The re-entry cooldown stops flip OSCILLATION, but a
-  single noisy DR can still trigger a flip exit; requiring the flip to persist for 2 consecutive DR
-  cycles would cut false exits further. *Small; evaluate after a few days of cooldown data.*
+- [x] **Signal-flip exit debounce — DONE 2026-07-10 (commit bee0cce).** Implemented ahead of this
+  entry as part of the exit-record decomposition that day (post-reset: signal_flip 21 exits/8 wins/
+  −$13.73, the dominant leak once the stop-loss was widened). `POLYTRADER_EXIT_SIGNAL_FLIP_CYCLES`
+  (default 2) requires the flip to persist across N consecutive decision reports. Verified in the
+  2026-07-10 diagnostic: the one post-deploy flip exit had a NEGATIVE edge at the two prior cycles,
+  only qualified once it held positive (2.05% → 2.10%) for two consecutive reports before firing.
 - [ ] **event_id-based cluster key** (2026-07-05). Rotation ladder promotions (e.g. 6× `gpt-5pt6-released-by-july-N`)
   are one correlated underlying event, but `risk::cluster_key` drops them in the exempt "uncorrelated"
   bucket, so up to ~$120 (6 × $20 cap) can concentrate on one binary. Add an event_id-derived cluster

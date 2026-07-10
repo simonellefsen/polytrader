@@ -985,7 +985,13 @@ async fn maybe_execute_opportunity(
         "lenient_below_shadow"
     };
     let check = risk
-        .check_pre_trade(pool, gamma_id, net_edge, sizing.recommended_usdc)
+        .check_pre_trade(
+            pool,
+            gamma_id,
+            net_edge,
+            sizing.recommended_usdc,
+            target_mid,
+        )
         .await?;
     if !check.approved {
         // De-spam: a permanently-unattractive market (e.g. a longshot with negative edge) would

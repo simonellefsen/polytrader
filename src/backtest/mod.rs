@@ -380,7 +380,13 @@ pub fn simulate_counterfactual(
             continue;
         }
         let exp = sim.exposure(&rep.market_id, slug_of);
-        let check = rm.gate(&rep.market_id, net, sizing.recommended_usdc, &exp);
+        let check = rm.gate(
+            &rep.market_id,
+            net,
+            sizing.recommended_usdc,
+            rep.target_mid,
+            &exp,
+        );
         if !check.approved {
             continue;
         }
@@ -680,6 +686,7 @@ fn parse_dec_str(s: Option<String>) -> Option<Decimal> {
 pub async fn run(pool: &sqlx::PgPool, args: &[String]) -> anyhow::Result<()> {
     let since = flag_value(args, "--since").map(str::to_string);
     let min_net_edge = flag_value(args, "--min-net-edge").and_then(|s| s.parse::<Decimal>().ok());
+    let rt_multiplier = flag_value(args, "--rt-multiplier").and_then(|s| s.parse::<Decimal>().ok());
     let weights_override = flag_value(args, "--weights").map(parse_weights);
 
     // The anchor validates accounting against the live CUMULATIVE realized, so it always loads the full
@@ -696,6 +703,9 @@ pub async fn run(pool: &sqlx::PgPool, args: &[String]) -> anyhow::Result<()> {
     let mut risk = RiskConfig::from_env();
     if let Some(m) = min_net_edge {
         risk.min_net_edge = m;
+    }
+    if let Some(k) = rt_multiplier {
+        risk.round_trip_cost_multiplier = k;
     }
 
     // --- Fidelity anchor: the production settlement formula recomputed over every live settlement ---
