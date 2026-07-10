@@ -207,25 +207,44 @@ pub async fn evaluate_exits(
 
 /// Latest decision report for this market targets the OPPOSITE outcome with a tradeable edge —
 /// the fused signals now say the other side is the value side.
+/// DEBOUNCED (2026-07-10): the flip must persist across the last `POLYTRADER_EXIT_SIGNAL_FLIP_CYCLES`
+/// consecutive decision reports (default 2 ≈ 10 min), not just the newest one. A single noisy DR was
+/// enough to sell a bounded, mean-reverting position and pay the round-trip friction: post-reset
+/// signal-flip exits ran 21 trades / 8 wins / **−$13.73**, and with the stop-loss widened on 07-09 it
+/// became the dominant remaining exit leak (3 of 3 flips on 07-09→10 lost, −$4.71). Same lesson as the
+/// stop-loss: require evidence the model genuinely changed its mind, not one wobble. Take-profit is
+/// left alone — it is the only net-positive exit reason (5/5, +$14.18).
 async fn signal_flipped(
     pool: &PgPool,
     market_id: &str,
     held_outcome: &str,
     min_net_edge: Decimal,
 ) -> bool {
-    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+    let cycles: i64 = std::env::var("POLYTRADER_EXIT_SIGNAL_FLIP_CYCLES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(2);
+    let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT payload->>'target_outcome', payload->'report'->>'net_edge_after_fees'
          FROM journal.events
          WHERE event_type = 'decision_report' AND payload->>'market_id' = $1
-         ORDER BY created_at DESC LIMIT 1",
+         ORDER BY created_at DESC LIMIT $2",
     )
     .bind(market_id)
-    .fetch_optional(pool)
+    .bind(cycles)
+    .fetch_all(pool)
     .await
-    .unwrap_or(None);
-    let Some((Some(target), Some(edge))) = row else {
+    .unwrap_or_default();
+    // Need a full window of reports; a fresh position without `cycles` reports yet never flips.
+    if (rows.len() as i64) < cycles {
         return false;
-    };
-    let edge: Decimal = edge.parse().unwrap_or(Decimal::ZERO);
-    !target.eq_ignore_ascii_case(held_outcome) && edge >= min_net_edge
+    }
+    rows.iter().all(|(target, edge)| {
+        let (Some(target), Some(edge)) = (target, edge) else {
+            return false;
+        };
+        let edge: Decimal = edge.parse().unwrap_or(Decimal::ZERO);
+        !target.eq_ignore_ascii_case(held_outcome) && edge >= min_net_edge
+    })
 }

@@ -1587,10 +1587,19 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
             .and_then(|s| s.parse::<Decimal>().ok())
             .unwrap_or(Decimal::ZERO);
         let won = p.get("won").and_then(|v| v.as_bool()).unwrap_or(false);
-        let in_strict = band_map
-            .get(&(m.to_string(), o.to_string()))
-            .copied()
-            .unwrap_or(realized >= Decimal::ZERO);
+        // Only settlements that came from a DIRECTIONAL entry belong in the gate simulation — the
+        // gate never governed anything else. A settlement with no entry in `band_map` is an arb /
+        // negrisk basket leg (or a pre-execution-journaling legacy position), so SKIP it.
+        // The old code instead fell back to `in_strict = realized >= 0`, which was circular:
+        // it classified an unmapped settlement by its own OUTCOME and then measured that outcome.
+        // Live impact (2026-07-10): 41 unmapped arb-leg settlements, 34 of them profitable, GIFTED
+        // +$91.42 to the strict band while their losing siblings stayed lenient-only — manufacturing
+        // the entire "strict +$103 vs lenient +$40" gap and making a tighter gate look great on
+        // evidence that was really just arb P&L. (Matches the long-standing roadmap note that the
+        // strict-beats-lenient signal is a subset-methodology artifact.)
+        let Some(&in_strict) = band_map.get(&(m.to_string(), o.to_string())) else {
+            continue;
+        };
         len_real += realized;
         len_settled += 1;
         if won {

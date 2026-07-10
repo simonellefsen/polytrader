@@ -91,6 +91,12 @@ spec:
               value: "0.50"
             - name: POLYTRADER_EXIT_MAX_HOLD_DAYS
               value: "14"
+            # Signal-flip debounce (2026-07-10): the flip must hold across this many consecutive
+            # decision reports (~5 min each) before exiting. A single noisy DR was selling bounded,
+            # mean-reverting positions and paying round-trip friction: 21 flips / 8 wins / -$13.73
+            # post-reset, and the dominant leak once the stop-loss was widened.
+            - name: POLYTRADER_EXIT_SIGNAL_FLIP_CYCLES
+              value: "2"
             # Anti-churn (2026-07-06, after −$54 of overnight stop-loss churn): a stop only fires
             # when the mid ALSO moved this much in absolute price (relative −15% on cheap shares is
             # bid/ask noise), and after any autonomous exit the market is blocked from directional
