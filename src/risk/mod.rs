@@ -415,8 +415,8 @@ impl RiskManager {
             approved: false,
             reason: format!(
                 "net_edge {net_edge:.4} < round-trip friction floor {required:.4} \
-                 ({:.0}x round_trip_cost_frac({price:.2}))",
-                self.config.round_trip_cost_multiplier
+                 ({}x round_trip_cost_frac({price:.2}))",
+                self.config.round_trip_cost_multiplier.normalize()
             ),
             recommended_size: None,
         })
@@ -794,6 +794,9 @@ mod gate_tests {
         let r = mgr().gate("m", dec!(0.05), dec!(10), dec!(0.10), &e);
         assert!(!r.approved);
         assert!(r.reason.contains("round-trip"), "{}", r.reason);
+        // The multiplier must print exactly ("1.5x"), not truncated to "1x" the way a `{:.0}`
+        // format of Decimal 1.5 did.
+        assert!(r.reason.contains("(1.5x"), "{}", r.reason);
     }
 
     #[test]

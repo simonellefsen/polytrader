@@ -1674,7 +1674,11 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     // (any nonzero decimal does; "0"/"-0"/"0.00"/absent do not) — a cast-free, robust mirror of
     // `!Decimal::is_zero()` that can't throw on a stray non-numeric score. Columns follow SIGNALS order.
     let (baseline_7d_total, baseline_7d_fired): (i64, [i64; 6]) = {
-        const TTL: std::time::Duration = std::time::Duration::from_secs(300);
+        // 1h TTL: the 7d baseline moves glacially, but the scan behind it is a ~6.5s full read of
+        // a week of decision_report JSONB. At the old 300s TTL every 5-min dashboard poll recomputed
+        // it (169 slow-query alerts in 14h on 2026-07-11); 1h keeps the health check honest at 1/12
+        // the DB load.
+        const TTL: std::time::Duration = std::time::Duration::from_secs(3600);
         let cache = health_7d_baseline_cache();
         let cached = cache.lock().ok().and_then(|g| {
             g.as_ref()

@@ -124,6 +124,26 @@ pub fn newsdata_query(slug: &str) -> String {
     words.join(" ")
 }
 
+/// Process-wide newsdata.io rate-limit cooldown deadline (unix secs). The journal-count budget in
+/// main.rs only sees SUCCESSFUL fetches (a 429 never writes a `news_cache` event), so once the
+/// provider quota is exhausted every cycle re-fires a doomed request per stale market — 2,192
+/// hammered 429s in 14h on 2026-07-11. A 429 sets this deadline; until it passes, callers skip the
+/// fetch and fall back to stale cache exactly like the budget-exhausted path.
+static NEWS_COOLDOWN_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const NEWS_COOLDOWN_SECS: u64 = 1800;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// True while newsdata.io fetches are suppressed after a 429 (see [`NEWS_COOLDOWN_UNTIL`]).
+pub fn news_fetch_in_cooldown() -> bool {
+    unix_now() < NEWS_COOLDOWN_UNTIL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One newsdata.io `/api/1/latest` call (costs 1 API credit). Returns (headline_count, polarity,
 /// top_titles). Sentiment is paid-only, so polarity is computed from title+description via the
 /// keyword lexicon. `size=10` is credit-optimal (1 credit regardless of size, up to 10 free).
@@ -135,6 +155,9 @@ pub async fn fetch_newsdata_news(
     api_key: &str,
     query: &str,
 ) -> Option<(usize, Decimal, Vec<String>)> {
+    if news_fetch_in_cooldown() {
+        return None;
+    }
     let resp = client
         .get("https://newsdata.io/api/1/latest")
         .query(&[
@@ -146,6 +169,17 @@ pub async fn fetch_newsdata_news(
         .send()
         .await
         .ok()?;
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        NEWS_COOLDOWN_UNTIL.store(
+            unix_now() + NEWS_COOLDOWN_SECS,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        tracing::warn!(
+            cooldown_secs = NEWS_COOLDOWN_SECS,
+            "newsdata.io 429 — suppressing news fetches until cooldown expires"
+        );
+        return None;
+    }
     if !resp.status().is_success() {
         tracing::warn!(status = %resp.status(), "newsdata.io non-200 (budget/rate?); skipping");
         return None;
@@ -419,5 +453,18 @@ mod tests {
             .unwrap();
         assert_eq!(sig.score, Decimal::ZERO);
         assert_eq!(sig.confidence, Decimal::ZERO);
+    }
+
+    #[test]
+    fn news_cooldown_gates_on_deadline() {
+        use std::sync::atomic::Ordering;
+        // Fresh process: no cooldown.
+        assert!(!super::news_fetch_in_cooldown());
+        // A future deadline suppresses fetches...
+        super::NEWS_COOLDOWN_UNTIL.store(super::unix_now() + 60, Ordering::Relaxed);
+        assert!(super::news_fetch_in_cooldown());
+        // ...and it self-expires once the deadline passes.
+        super::NEWS_COOLDOWN_UNTIL.store(super::unix_now().saturating_sub(1), Ordering::Relaxed);
+        assert!(!super::news_fetch_in_cooldown());
     }
 }

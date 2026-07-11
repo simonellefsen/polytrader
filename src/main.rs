@@ -2114,8 +2114,10 @@ async fn get_news_context_cached(
     .await
     .unwrap_or(0);
 
-    if used_today >= DAILY_CAP {
-        // Budget exhausted — reuse the most recent stale cache rather than spend a credit.
+    if used_today >= DAILY_CAP || crate::strategy::news_fetch_in_cooldown() {
+        // Budget exhausted (or the provider 429'd recently — the journal-count budget can't see
+        // failed fetches, so without this check an exhausted quota gets retry-hammered every
+        // cycle) — reuse the most recent stale cache rather than spend a credit.
         let stale: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT payload->'news' FROM journal.events
              WHERE event_type = 'news_cache' AND payload->>'market_id' = $1

@@ -600,6 +600,38 @@ prediction, is where this system's edge has ever appeared.
   (1.2% of bankroll) it's low priority. Also added `crint-` (cricket international) to the keyword
   prefilter with a regression test.
 
+- **📈 MEASUREMENT CHECKPOINT #2 + diagnostic — P1 gate live-confirmed, basket realized, 3 fixes
+  (2026-07-11, ~07:30 UTC).** Both checkpoint-#1 predictions confirmed, plus the first live P1 data:
+  1. **The halftime negrisk basket settled: +$6.29 realized, exactly the invariant** (cost 1.948/u
+     vs 2.00 floor × 121u). Realized P&L jumped −66.71 → **−42.89** (checkpoint #1 predicted ~−47).
+     The legs settled 11 min apart (+110.11 / +8.71 / −112.53), which paints a scary ±$110
+     spike-and-reversal on the dashboard P&L chart — that's settlement TIMING, not a loss; net is
+     the guaranteed +$6.29.
+  2. **P1 friction gate fired live, correctly**: 2 rejections since deploy, both thin-edge mid-book
+     entries (net_edge 2.2–2.3% vs the 15.4% floor at price 0.36) — precisely the marginal
+     cheap-book profile the harness said it would block. Fills 13/14h vs 35 the previous 24h; the
+     11W/0L settled streak continued (10 settlements since deploy, incl. the basket legs).
+  3. **Zero stop-losses again** (one signal-flip exit, −$1.59 net) — the 0.50 widening holds.
+  4. **Ledger tie-out clean**: settlements +48.65 + exits −102.11 = −53.46 vs live −42.89; the
+     +10.57 residual IS the known untagged-manual-sells gap (TODO above), no new drift.
+  **Three defects found and fixed this check (uncommitted pending operator go-ahead):**
+  - **newsdata.io 429 retry-hammering — the real cause of news_sentiment's `dormant` badge.** The
+    daily budget counts `news_cache` journal writes as spent credits, but a 429 never writes one —
+    so once the provider quota was exhausted the budget stayed "under cap" forever and every 5-min
+    cycle re-fired a doomed request per stale market: **2,192 429s in 14h**. Fix: a 429 now sets a
+    process-wide 30-min cooldown (`news_fetch_in_cooldown`) checked both inside
+    `fetch_newsdata_news` and in `get_news_context_cached`, which falls back to the stale cache
+    exactly like the budget-exhausted path. Unit-tested (deadline set/expire).
+  - **Signal-scorecard 7d baseline recomputed every 5 min** — the 6.5s full JSONB scan behind
+    `health_7d` had a 300s TTL, equal to the dashboard poll interval, so every poll missed the
+    cache (169 slow-query alerts in 14h). TTL → 1h; the 7-day baseline moves glacially.
+  - **Friction-floor log printed "1x" for multiplier 1.5** — `{:.0}` on a Decimal truncates. The
+    MATH was right (floor 0.1539 = 0.1026 × 1.5 ✓), display-only; now prints `1.5x` (test extended).
+  Also verified: pods 0 restarts/14h (61Mi of 512Mi), Hermes 0 errors, rotation cycling (3 passes),
+  arb-leg exclusion still protecting the open 6-leg basket (cost 4.987/u vs 5.00 floor), two old
+  box-arbs held to resolution as designed. `yahoo_finance: degraded` is benign — it only fires on
+  crypto-asset markets and the current rotation set has few; not a feed failure.
+
 - **📈 MEASUREMENT CHECKPOINT #1 — the stop-loss fix is working (2026-07-10, ~22:15 UTC, ~27h post-
   deploy).** The "let the fix run and measure" plan produced its first data point, and it's positive.
   P&L recovered from ~−$74 to **−$39.99** (= realized −66.71 + unrealized +26.58). Three drivers,
