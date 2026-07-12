@@ -187,7 +187,11 @@ spec:
               memory: "128Mi"
               cpu: "100m"
             limits:
-              memory: "512Mi"
+              # 512Mi → 1Gi (2026-07-12): `make backtest` kubectl-exec's the harness into THIS
+              # container's cgroup, and a full-history replay once OOM-killed the live server
+              # (2026-07-10). The harness now defaults --since to the last paper reset (the real
+              # fix); the extra headroom covers explicit --full-history runs and general growth.
+              memory: "1Gi"
               cpu: "500m"
           securityContext:
             allowPrivilegeEscalation: false

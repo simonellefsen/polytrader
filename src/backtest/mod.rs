@@ -684,7 +684,27 @@ fn parse_dec_str(s: Option<String>) -> Option<Decimal> {
 /// them; never writes. Prints the fidelity anchor (settlement formula vs live realized) and a
 /// counterfactual run under the chosen config.
 pub async fn run(pool: &sqlx::PgPool, args: &[String]) -> anyhow::Result<()> {
-    let since = flag_value(args, "--since").map(str::to_string);
+    let mut since = flag_value(args, "--since").map(str::to_string);
+    // OOM GUARD (2026-07-12, roadmap TODO): this harness runs via `kubectl exec` INSIDE the live
+    // trading pod's 512Mi cgroup, and an unbounded report load once OOM-killed the live server
+    // (2026-07-10). Without an explicit `--since`, bound the replay at the latest paper reset —
+    // that's also the only window whose results are comparable to the live portfolio. A truly
+    // unbounded run must be requested explicitly with `--full-history`.
+    if since.is_none() && !args.iter().any(|a| a == "--full-history") {
+        let boundary: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT max(as_of)::text FROM paper_trading.virtual_portfolio_snapshots
+             WHERE snapshot_reason = 'manual_paper_reset'",
+        )
+        .fetch_optional(pool)
+        .await?;
+        since = boundary.flatten();
+        match &since {
+            Some(b) => println!(
+                "note: no --since given; defaulting to the last paper reset ({b}). Pass --full-history for an unbounded replay (memory-heavy; runs inside the live pod)."
+            ),
+            None => println!("note: no --since and no paper reset found; replaying full history."),
+        }
+    }
     let min_net_edge = flag_value(args, "--min-net-edge").and_then(|s| s.parse::<Decimal>().ok());
     let rt_multiplier = flag_value(args, "--rt-multiplier").and_then(|s| s.parse::<Decimal>().ok());
     let weights_override = flag_value(args, "--weights").map(parse_weights);

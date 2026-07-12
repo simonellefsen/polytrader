@@ -90,12 +90,18 @@ the dated Decision-log entry below; this is the at-a-glance index.
 
 - [x] **Spread-aware entry gating** (2026-07-08) → *Built as P1 in the "Path to profitability" plan
   below, DONE 2026-07-10.*
-- [ ] **`make backtest` can OOM-kill the live pod** (2026-07-10). The harness runs via `kubectl exec`
-  inside the SAME 512Mi container as the trading server; a full-history run exceeded the limit and
-  `OOMKilled` the live pod (self-recovered, ~1s gap, no data loss — all state is DB-backed). Needs a
-  durable fix: bump the polytrader pod's memory limit, or make `load_reports`/`load_settlements`
-  stream/paginate instead of materializing full history. Workaround: always pass `--since <date>`.
-  *Real operational risk — prioritize before the next unbounded backtest run.*
+- [x] **`make backtest` can OOM-kill the live pod** (2026-07-10) → *DONE 2026-07-12, two-pronged.
+  (1) Default `--since` guard in `backtest::run`: with no explicit `--since`, the replay is bounded
+  at the latest `manual_paper_reset` snapshot (currently 2026-07-04 12:51) — which is also the only
+  window comparable to the live portfolio; an unbounded replay now requires an explicit
+  `--full-history` flag and prints what it defaulted to. An accidental plain `make backtest` can no
+  longer materialize full history inside the live pod's cgroup. (2) Pod memory limit 512Mi → 1Gi
+  (requests unchanged) for explicit full-history runs and growth headroom. Considered running the
+  harness in its own ephemeral pod (fully decoupled blast radius) but it would need the deployment's
+  secret mounts (DB URI, L2 key) replicated via kubectl-run overrides — too much machinery vs. the
+  bounded-by-default fix. Streaming/paginating `load_reports` stays as the escalation if replay
+  volume ever outgrows 1Gi; the slim server-side projection (~200B/row) already covers the main
+  blowup vector.*
 - [x] **Advisory-only opportunities policy** (2026-07-12) → *DONE same day — decided YES, built as
   `fuse_named` in `strategy/mod.rs`: a directional edge requires ≥1 market-internal signal
   (momentum/spike/theta) firing with nonzero score AND confidence; advisory-only firing sets fuse to
