@@ -977,6 +977,7 @@ async fn load_reports(pool: &sqlx::PgPool, since: Option<&str>) -> anyhow::Resul
                 jsonb_build_object(
                     'orderbook_momentum', jsonb_build_object('score', a->'orderbook_momentum'->'score', 'confidence', a->'orderbook_momentum'->'confidence'),
                     'spike_divergence',   jsonb_build_object('score', a->'spike_divergence'->'score',   'confidence', a->'spike_divergence'->'confidence'),
+                    'theta_convergence',  jsonb_build_object('score', a->'theta_convergence'->'score',  'confidence', a->'theta_convergence'->'confidence'),
                     'overreaction_fade',  jsonb_build_object('score', a->'overreaction_fade'->'score',  'confidence', a->'overreaction_fade'->'confidence'),
                     'yahoo_finance',      jsonb_build_object('score', a->'yahoo_finance'->'score',      'confidence', a->'yahoo_finance'->'confidence'),
                     'news_sentiment',     jsonb_build_object('score', a->'news_sentiment'->'score',     'confidence', a->'news_sentiment'->'confidence'),

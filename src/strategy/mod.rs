@@ -360,9 +360,10 @@ impl FusionEngine {
         ctx: &serde_json::Value,
     ) -> Result<(Decimal, serde_json::Value)> {
         let mut attribution = serde_json::Map::new();
-        // (score, confidence, learned_weight) per successful processor — fed to the shared fusion core
-        // so the live path and the offline `fuse_from_attribution` replay use identical math.
-        let mut contributions: Vec<(Decimal, Decimal, Decimal)> = Vec::new();
+        // (name, score, confidence, learned_weight) per successful processor — fed to the shared
+        // fusion core so the live path and the offline `fuse_from_attribution` replay use identical
+        // math AND the identical advisory-only policy.
+        let mut contributions: Vec<(&str, Decimal, Decimal, Decimal)> = Vec::new();
 
         for p in &self.processors {
             match p.compute_signal(snapshot, ctx) {
@@ -371,7 +372,7 @@ impl FusionEngine {
                     // Default multiplier 1.0 reproduces the original confidence-only weighting.
                     let learned = self.weight_for(sig.processor_name);
                     let w = sig.confidence * learned;
-                    contributions.push((sig.score, sig.confidence, learned));
+                    contributions.push((sig.processor_name, sig.score, sig.confidence, learned));
                     attribution.insert(
                         sig.processor_name.to_string(),
                         json!({
@@ -392,7 +393,19 @@ impl FusionEngine {
             }
         }
 
-        let fused = fuse_weighted(contributions.iter().copied());
+        let (fused, advisory_only_suppressed) = fuse_named(contributions.iter().copied());
+        if advisory_only_suppressed {
+            // Journal WHY the edge is 0 so Hermes/diagnostics can distinguish "no signal" from
+            // "advisory-only impulse suppressed by policy". No score/confidence keys, so replay
+            // paths skip this entry as a non-signal.
+            attribution.insert(
+                "advisory_only_policy".to_string(),
+                json!({
+                    "suppressed": true,
+                    "note": "directional impulse came only from advisory signals (news/yahoo); requires >=1 market-internal signal (momentum/spike/theta) firing to originate an edge"
+                }),
+            );
+        }
 
         let attr_json = serde_json::Value::Object(attribution);
         Ok((fused, attr_json))
@@ -491,11 +504,61 @@ impl FusionEngine {
     }
 }
 
+/// Signal processors that read the market itself (order book, price history, time-to-resolution).
+/// Everything else (news_sentiment, yahoo_finance) is ADVISORY: external context that may adjust an
+/// edge these originate, but — per the advisory-only opportunities policy below — can never
+/// originate a directional edge on its own.
+pub const MARKET_INTERNAL_SIGNALS: [&str; 3] = [
+    "orderbook_momentum",
+    "spike_divergence",
+    "theta_convergence",
+];
+
+fn is_market_internal(name: &str) -> bool {
+    MARKET_INTERNAL_SIGNALS.contains(&name)
+}
+
+/// Named fusion + the advisory-only opportunities policy (2026-07-12, roadmap TODO): a directional
+/// opportunity requires at least one market-internal signal actually firing (nonzero score AND
+/// nonzero confidence). If the entire directional impulse comes from advisories, the fused edge is
+/// suppressed to 0 and the second return value is `true` so callers can journal why.
+///
+/// Rationale: even with the `max(Σw, 1)` denominator floor in [`fuse_weighted`], a lone advisory
+/// fuses to ~its own confidence (0.17–0.30) — honest, but still enough to clear the 2% min-edge
+/// gate and cheap-band friction floors on stale/off-topic headlines (the "banana art pricing"
+/// class of incident). News/finance context is only evidence FOR a market move when the market
+/// itself shows something; it should tilt sizing/direction, never conjure a trade from nothing.
+/// A market-internal signal present with score 0 (e.g. momentum's `balanced_book`) does NOT count
+/// as firing — the book explicitly says "no edge", and an advisory must not overrule it alone.
+///
+/// Shared by the live [`FusionEngine::fuse`] and the backtest replay [`fuse_from_attribution`], so
+/// counterfactuals apply the identical policy and stored advisory-only reports auto-correct.
+pub fn fuse_named<'a, I>(signals: I) -> (Decimal, bool)
+where
+    I: IntoIterator<Item = (&'a str, Decimal, Decimal, Decimal)>,
+{
+    let mut contributions: Vec<(Decimal, Decimal, Decimal)> = Vec::new();
+    let mut internal_fired = false;
+    for (name, score, confidence, learned) in signals {
+        if is_market_internal(name) && score != Decimal::ZERO && confidence > Decimal::ZERO {
+            internal_fired = true;
+        }
+        contributions.push((score, confidence, learned));
+    }
+    let fused = fuse_weighted(contributions);
+    if fused != Decimal::ZERO && !internal_fired {
+        (Decimal::ZERO, true)
+    } else {
+        (fused, false)
+    }
+}
+
 /// Pure weighted-average fusion — the single source of truth for how per-signal scores combine.
 /// `fused = Σ(scoreᵢ · confidenceᵢ · learned_weightᵢ) / max(Σ(confidenceᵢ · learned_weightᵢ), 1)`,
 /// and 0 when the total effective weight is ≤ 0. Shared by the live [`FusionEngine::fuse`] (fresh
 /// signals) and the offline backtest harness via [`fuse_from_attribution`] (stored decision-report
-/// scores replayed under a candidate weight vector — no processors re-run).
+/// scores replayed under a candidate weight vector — no processors re-run), both through the
+/// policy-applying wrapper [`fuse_named`].
 ///
 /// The `max(…, 1)` floor on the denominator (2026-07-12): a plain weighted MEAN cancels confidence
 /// out entirely when only one signal fires — a lone advisory with score ±1 and confidence 0.175
@@ -542,7 +605,7 @@ pub fn fuse_from_attribution(
             _ => None,
         }
     }
-    let mut contributions: Vec<(Decimal, Decimal, Decimal)> = Vec::new();
+    let mut contributions: Vec<(&str, Decimal, Decimal, Decimal)> = Vec::new();
     if let Some(map) = attribution.as_object() {
         for (name, entry) in map {
             let (Some(score), Some(confidence)) = (
@@ -552,10 +615,12 @@ pub fn fuse_from_attribution(
                 continue; // fee_impact / decision_report_summary / error entry — not a signal
             };
             let learned = clamp_weight(weights.get(name).copied().unwrap_or(dec!(1.0)));
-            contributions.push((score, confidence, learned));
+            contributions.push((name.as_str(), score, confidence, learned));
         }
     }
-    fuse_weighted(contributions)
+    // fuse_named applies the advisory-only policy identically to the live path, so replayed
+    // advisory-only reports (e.g. the 2026-07-12 saturation-day batch) auto-correct to edge 0.
+    fuse_named(contributions).0
 }
 
 impl Default for FusionEngine {
@@ -715,6 +780,73 @@ mod processor_tests {
             fuse_weighted(vec![(dec!(0.9), dec!(0), dec!(1.5))]),
             Decimal::ZERO
         );
+    }
+
+    #[test]
+    fn advisory_only_set_cannot_originate_directional_edge() {
+        // The 2026-07-12 policy: news/yahoo alone — even both agreeing — fuse to a suppressed 0.
+        let (fused, suppressed) = fuse_named(vec![
+            ("news_sentiment", dec!(0.8), dec!(0.30), dec!(1.0)),
+            ("yahoo_finance", dec!(0.5), dec!(0.25), dec!(1.0)),
+        ]);
+        assert_eq!(fused, Decimal::ZERO);
+        assert!(suppressed);
+
+        // Same via the replay path: a stored advisory-only report auto-corrects to edge 0.
+        let attr = json!({
+            "news_sentiment": {"score": "0.8", "confidence": "0.30"},
+            "yahoo_finance": {"score": "0.5", "confidence": "0.25"},
+            "fee_impact": {"gross_edge": "0.29"},
+        });
+        assert_eq!(
+            fuse_from_attribution(&attr, &BTreeMap::new()),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn market_internal_firing_lets_advisories_adjust() {
+        // Momentum fires ⇒ the advisory contributes normally (policy is presence-gated, not a veto).
+        let signals = vec![
+            ("orderbook_momentum", dec!(0.10), dec!(0.5), dec!(1.0)),
+            ("news_sentiment", dec!(-0.20), dec!(0.4), dec!(2.0)),
+        ];
+        let (fused, suppressed) = fuse_named(signals.clone());
+        assert!(!suppressed);
+        assert_eq!(
+            fused,
+            fuse_weighted(signals.into_iter().map(|(_, s, c, w)| (s, c, w)))
+        );
+    }
+
+    #[test]
+    fn balanced_book_does_not_count_as_market_internal_firing() {
+        // Momentum present but score 0 ("balanced_book") = the market explicitly reads no-edge;
+        // an advisory must not overrule it alone. A zero-CONFIDENCE internal reading is equally
+        // non-firing (contributes no weight at all).
+        let (fused, suppressed) = fuse_named(vec![
+            ("orderbook_momentum", Decimal::ZERO, dec!(0.5), dec!(1.0)),
+            ("news_sentiment", dec!(0.6), dec!(0.30), dec!(1.0)),
+        ]);
+        assert_eq!(fused, Decimal::ZERO);
+        assert!(suppressed);
+
+        let (fused, suppressed) = fuse_named(vec![
+            ("theta_convergence", dec!(0.4), Decimal::ZERO, dec!(1.0)),
+            ("news_sentiment", dec!(0.6), dec!(0.30), dec!(1.0)),
+        ]);
+        assert_eq!(fused, Decimal::ZERO);
+        assert!(suppressed);
+
+        // But an all-zero fusion result is plain "no signal", not a policy suppression.
+        let (fused, suppressed) = fuse_named(vec![(
+            "news_sentiment",
+            Decimal::ZERO,
+            dec!(0.30),
+            dec!(1.0),
+        )]);
+        assert_eq!(fused, Decimal::ZERO);
+        assert!(!suppressed);
     }
 
     #[test]

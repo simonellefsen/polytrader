@@ -96,11 +96,19 @@ the dated Decision-log entry below; this is the at-a-glance index.
   durable fix: bump the polytrader pod's memory limit, or make `load_reports`/`load_settlements`
   stream/paginate instead of materializing full history. Workaround: always pass `--since <date>`.
   *Real operational risk — prioritize before the next unbounded backtest run.*
-- [ ] **Advisory-only opportunities policy** (2026-07-12). With the fusion denominator floor a lone
-  advisory (news/yahoo) fuses to at most its own confidence (~0.17–0.30) — honest, but still enough
-  to clear the 2% gate and mid-price friction floors on stale/off-topic headlines. Decide whether a
-  directional opportunity should require ≥1 market-internal signal (momentum/spike/theta) to fire,
-  with advisories only ever adjusting. See checkpoint #4.
+- [x] **Advisory-only opportunities policy** (2026-07-12) → *DONE same day — decided YES, built as
+  `fuse_named` in `strategy/mod.rs`: a directional edge requires ≥1 market-internal signal
+  (momentum/spike/theta) firing with nonzero score AND confidence; advisory-only firing sets fuse to
+  a suppressed 0 with an `advisory_only_policy` attribution note (so Hermes can tell "no signal"
+  from "suppressed"). A market-internal signal reading score 0 (momentum `balanced_book`) does NOT
+  count as firing — the book explicitly says no-edge and an advisory can't overrule it alone. Shared
+  by live fuse and `fuse_from_attribution`, so backtest counterfactuals apply the identical policy
+  and the 07-12 saturation-day reports replay to edge 0. Validation of need: the FIRST post-5ad406f
+  DR cycle (20:26 UTC) showed max |net edge| 0.164 — exactly the lone-advisory confidence bound the
+  denominator floor leaves through, which this policy now zeroes. Bonus fidelity fix found while
+  wiring: the backtest `load_reports` slim projection carried retired `overreaction_fade` but had
+  NEVER projected `theta_convergence`, silently dropping theta from every replay (and it would have
+  made theta-only reports mis-suppress under this policy). Added to the projection. 3 new tests.*
 - [ ] **News relevance filter** (2026-07-12). The slug-derived newsdata query matched "banana art
   pricing" headlines to a prediction market; keyword polarity over off-topic text is pure noise.
   Cheap options: require ≥1 slug topic-noun to appear in a headline before counting it; or drop
