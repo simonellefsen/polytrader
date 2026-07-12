@@ -143,6 +143,57 @@ pub fn newsdata_query(slug: &str) -> String {
     words.join(" ")
 }
 
+/// SUBJECT tokens of a news query — the words that identify what the market is actually about
+/// (bitcoin, wti, trump), as opposed to the generic market-mechanics words (hit, price, dip),
+/// month names, and threshold numbers ("150k") that also survive into [`newsdata_query`].
+///
+/// This anchors the news relevance filter (2026-07-12, roadmap TODO): newsdata.io matches ANY query
+/// word, so "will-X-price-hit-…" queries returned "banana art pricing" headlines whose keyword
+/// polarity then scored a prediction market. Generic words must not count as topical overlap.
+pub fn news_subject_tokens(query: &str) -> Vec<String> {
+    const GENERIC: [&str; 40] = [
+        "hit", "hits", "reach", "reaches", "win", "wins", "close", "closes", "price", "prices",
+        "pricing", "high", "higher", "low", "lower", "new", "record", "above", "below", "dip",
+        "dips", "fall", "falls", "drop", "drops", "plunge", "decline", "rise", "rises", "up",
+        "down", "end", "ends", "before", "after", "between", "over", "under", "million", "billion",
+    ];
+    const MONTHS: [&str; 12] = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ];
+    query
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .filter(|w| !w.chars().any(|c| c.is_ascii_digit())) // "150k", "55" — thresholds, not topics
+        .filter(|w| !GENERIC.contains(&w.as_str()))
+        .filter(|w| !MONTHS.contains(&w.as_str()))
+        .collect()
+}
+
+/// Whether a headline/description mentions ≥1 subject token, matched on whole words (lowercased,
+/// split on non-alphanumeric) with a prefix allowance for tokens ≥4 chars so "bitcoin" catches
+/// "bitcoins" but "wti" (3 chars) only matches exactly — no "white"→"hit"-style substring hits.
+pub fn text_mentions_subject(text: &str, subject: &[String]) -> bool {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .any(|tok| {
+            subject
+                .iter()
+                .any(|s| tok == s || (s.len() >= 4 && tok.starts_with(s.as_str())))
+        })
+}
+
 /// Process-wide newsdata.io rate-limit cooldown deadline (unix secs). The journal-count budget in
 /// main.rs only sees SUCCESSFUL fetches (a 429 never writes a `news_cache` event), so once the
 /// provider quota is exhausted every cycle re-fires a doomed request per stale market — 2,192
@@ -208,10 +259,26 @@ pub async fn fetch_newsdata_news(
         return None;
     }
     let results = v["results"].as_array()?;
+    // Relevance filter (2026-07-12): newsdata.io matches ANY query word, so generic tokens pulled
+    // in completely off-topic stories ("banana art pricing" for a price-threshold market) whose
+    // keyword polarity is pure noise. An article only counts if its title or description mentions
+    // a SUBJECT token. Fail-open when the query has no subject tokens (degenerate slug) — same
+    // behavior as before the filter.
+    let subject = news_subject_tokens(query);
+    let mut off_topic = 0usize;
     let mut titles = Vec::new();
     let mut texts = Vec::new();
     for a in results.iter().take(10) {
-        if let Some(t) = a["title"].as_str() {
+        let title = a["title"].as_str();
+        let desc = a["description"].as_str();
+        let on_topic = subject.is_empty()
+            || title.is_some_and(|t| text_mentions_subject(t, &subject))
+            || desc.is_some_and(|d| text_mentions_subject(d, &subject));
+        if !on_topic {
+            off_topic += 1;
+            continue;
+        }
+        if let Some(t) = title {
             // Syndicated stories come back as multiple results with the identical title;
             // counting them twice double-weights their keywords in the polarity.
             if titles.iter().any(|seen| seen == t) {
@@ -220,9 +287,17 @@ pub async fn fetch_newsdata_news(
             titles.push(t.to_string());
             texts.push(t.to_string());
         }
-        if let Some(d) = a["description"].as_str() {
+        if let Some(d) = desc {
             texts.push(d.to_string());
         }
+    }
+    if off_topic > 0 {
+        tracing::info!(
+            off_topic,
+            kept = titles.len(),
+            query,
+            "news relevance filter dropped off-topic articles"
+        );
     }
     if titles.is_empty() {
         return None;
@@ -537,6 +612,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(legacy.score, up.score);
+    }
+
+    #[test]
+    fn news_subject_tokens_keep_topics_drop_mechanics() {
+        // The banana-incident shape: only "bitcoin" identifies the market; hit/150k/june are
+        // mechanics that newsdata matches against anything.
+        assert_eq!(
+            super::news_subject_tokens("bitcoin hit 150k june"),
+            vec!["bitcoin"]
+        );
+        // Down-market ladder: "wti" survives, dip/july don't.
+        assert_eq!(super::news_subject_tokens("wti dip july"), vec!["wti"]);
+        // Multi-word subjects all survive ("win" is generic).
+        assert_eq!(
+            super::news_subject_tokens("trump win presidency"),
+            vec!["trump", "presidency"]
+        );
+        // Degenerate all-generic query → empty (callers fail open).
+        assert!(super::news_subject_tokens("price hit high").is_empty());
+    }
+
+    #[test]
+    fn text_mentions_subject_word_boundaries_and_prefixes() {
+        let bitcoin = vec!["bitcoin".to_string()];
+        // The 2026-07-12 off-topic class: no subject mention → filtered.
+        assert!(!super::text_mentions_subject(
+            "Banana art pricing sparks auction frenzy",
+            &bitcoin
+        ));
+        assert!(super::text_mentions_subject(
+            "Bitcoin's rally continues as ETF inflows surge",
+            &bitcoin
+        ));
+        // ≥4-char subjects match as prefixes ("bitcoins"), short ones only exactly:
+        assert!(super::text_mentions_subject(
+            "Investors dump bitcoins",
+            &bitcoin
+        ));
+        let wti = vec!["wti".to_string()];
+        assert!(super::text_mentions_subject("WTI crude slides 2%", &wti));
+        // No substring false-positives: "white" must not match short token heuristics.
+        assert!(!super::text_mentions_subject(
+            "White House briefing",
+            &vec!["hit".to_string()]
+        ));
     }
 
     #[test]

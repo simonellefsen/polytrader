@@ -109,10 +109,17 @@ the dated Decision-log entry below; this is the at-a-glance index.
   wiring: the backtest `load_reports` slim projection carried retired `overreaction_fade` but had
   NEVER projected `theta_convergence`, silently dropping theta from every replay (and it would have
   made theta-only reports mis-suppress under this policy). Added to the projection. 3 new tests.*
-- [ ] **News relevance filter** (2026-07-12). The slug-derived newsdata query matched "banana art
-  pricing" headlines to a prediction market; keyword polarity over off-topic text is pure noise.
-  Cheap options: require ≥1 slug topic-noun to appear in a headline before counting it; or drop
-  markets whose query returns <N on-topic hits. See checkpoint #4.
+- [x] **News relevance filter** (2026-07-12) → *DONE same day, in `strategy/external.rs`. Root
+  cause: newsdata.io matches ANY query word, and `newsdata_query` keeps generic market-mechanics
+  words — "will-X-price-hit-…" → query containing "price hit" → "banana art pricing" headlines.
+  Fix: `news_subject_tokens(query)` extracts the SUBJECT words (drops digit-bearing thresholds like
+  "150k", month names, and a 40-word generic list: hit/reach/price/dip/win/…), and
+  `fetch_newsdata_news` now only counts an article if its title or description mentions ≥1 subject
+  token (`text_mentions_subject`: whole-word match, prefix allowed for tokens ≥4 chars so
+  "bitcoin" catches "bitcoins" but "wti" can't substring-false-positive). All-generic queries fail
+  OPEN (pre-filter behavior); dropped counts are logged (`news relevance filter dropped off-topic
+  articles`). Filter runs at fetch time so cached `news_cache` payloads are clean at the source;
+  old cache entries age out on the 2h TTL. 2 new tests.*
 - [ ] **Anchor residual ~$10 gap** (2026-07-10). After folding in exit-realized P&L (commit 77ef205),
   the fidelity anchor is ~90% closed but not PASS. Suspected cause: manual sells via `POST
   /paper/orders` (e.g. the 07-05 T1-esports cleanup) realize P&L through the same engine path as an
