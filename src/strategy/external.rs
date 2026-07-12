@@ -105,6 +105,25 @@ async fn fetch_yahoo_spot(client: &reqwest::Client, symbol: &str) -> Option<Deci
     Decimal::from_f64_retain(price).map(|d| d.round_dp(2))
 }
 
+/// Whether a threshold-style market asks about the underlying going DOWN ("will-wti-dip-to-55…",
+/// "…-fall-below-…") rather than up. Bullish headlines support YES on an up-market but NO on a
+/// down-market — without this, the 2026-07-12 news shock pushed oil-rally polarity toward YES on
+/// the entire WTI ladder including the dip strikes, which is exactly backwards. Matched on whole
+/// slug tokens so e.g. "underdog" can't false-positive.
+pub fn slug_market_direction(slug: &str) -> &'static str {
+    const DOWN: [&str; 9] = [
+        "dip", "below", "under", "fall", "falls", "drop", "drops", "plunge", "decline",
+    ];
+    if slug
+        .split('-')
+        .any(|tok| DOWN.contains(&tok.to_lowercase().as_str()))
+    {
+        "down"
+    } else {
+        "up"
+    }
+}
+
 /// Build a concise newsdata.io `q` from the market slug: drop stopwords / bare year tokens, keep the
 /// topic nouns (e.g. "will-bitcoin-hit-150k-by-june-30-2026" → "bitcoin hit 150k june"). A focused
 /// query returns more on-topic results per credit than the full question sentence.
@@ -333,7 +352,14 @@ impl SignalProcessor for NewsSentimentProcessor {
         if count == 0 {
             return Ok(zero("news_sentiment", json!({"reason": "no_headlines"})));
         }
-        let polarity = dec_str(&n["polarity"]); // [-1, 1]
+        let mut polarity = dec_str(&n["polarity"]); // [-1, 1]
+                                                    // Down-markets ("dip to 55", "fall below…") invert: bullish headlines mean the DOWN event
+                                                    // is LESS likely. Injected per-cycle from the slug (see slug_market_direction); absent on
+                                                    // pre-2026-07-12 cached payloads, which defaults to the old up-market behavior.
+        let direction = n["market_direction"].as_str().unwrap_or("up");
+        if direction == "down" {
+            polarity = -polarity;
+        }
         let target = snapshot["target_outcome"].as_str().unwrap_or("Yes");
         let score = if target.eq_ignore_ascii_case("No") {
             -polarity
@@ -453,6 +479,59 @@ mod tests {
             .unwrap();
         assert_eq!(sig.score, Decimal::ZERO);
         assert_eq!(sig.confidence, Decimal::ZERO);
+    }
+
+    #[test]
+    fn slug_market_direction_detects_down_markets() {
+        assert_eq!(
+            super::slug_market_direction("will-wti-dip-to-55-in-july-2026"),
+            "down"
+        );
+        assert_eq!(
+            super::slug_market_direction("will-eth-fall-below-2000-by-august"),
+            "down"
+        );
+        assert_eq!(
+            super::slug_market_direction("will-wti-reach-85-in-july-2026"),
+            "up"
+        );
+        // Whole-token match only: "underdog" must not read as a down-market.
+        assert_eq!(super::slug_market_direction("will-the-underdog-win"), "up");
+    }
+
+    #[test]
+    fn news_processor_inverts_polarity_on_down_markets() {
+        let news = |direction: &str| {
+            json!({
+                "target_outcome": "Yes",
+                "external": {"news": {
+                    "headline_count": 8,
+                    "polarity": "0.29",
+                    "market_direction": direction,
+                }}
+            })
+        };
+        // Bullish headlines: support YES on an up-market…
+        let up = NewsSentimentProcessor
+            .compute_signal(&news("up"), &json!({}))
+            .unwrap();
+        assert!(up.score > Decimal::ZERO);
+        // …but oppose YES on a down-market ("dip to 55" is LESS likely when oil rallies).
+        let down = NewsSentimentProcessor
+            .compute_signal(&news("down"), &json!({}))
+            .unwrap();
+        assert_eq!(down.score, -up.score);
+        // Absent field (pre-existing cached payloads) behaves like "up".
+        let legacy = NewsSentimentProcessor
+            .compute_signal(
+                &json!({
+                    "target_outcome": "Yes",
+                    "external": {"news": {"headline_count": 8, "polarity": "0.29"}}
+                }),
+                &json!({}),
+            )
+            .unwrap();
+        assert_eq!(legacy.score, up.score);
     }
 
     #[test]

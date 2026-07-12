@@ -600,6 +600,38 @@ prediction, is where this system's edge has ever appeared.
   (1.2% of bankroll) it's low priority. Also added `crint-` (cricket international) to the keyword
   prefilter with a regression test.
 
+- **📈 CHECKPOINT #3 + diagnostic — the midnight news shock: mass signal-flip anatomy, 2 fixes
+  (2026-07-12, ~11:30 UTC).** Realized P&L improved again, −42.89 → **−22.56** (settlements +33.88
+  in 24h — incl. a Yes/No box pair netting +3.62 and a 4-leg negrisk basket realizing — against
+  −14.7 of exits). Zero stop-losses for a third day; 11W/0L settled streak intact per gate sim.
+  **But the 07-11 fixes were committed (7c7a79c), never deployed** — the 429 storm ran another day
+  (3,179 in 24h) and news_sentiment sat fully dormant… until it wasn't:
+  **Root-caused a NEW live incident — the 00:21:36 mass signal-flip.** 7 positions (6 = the entire
+  WTI July ladder) exited in the SAME second, −$10.4 net friction. Full chain, each link verified in
+  the journal: newsdata.io's daily quota reset at midnight UTC → the first fetches in ~24h succeeded
+  → oil-rally headlines (crude keyword polarity **+0.29**) landed on every WTI market in ONE cycle →
+  news edge +8.7% overwhelmed momentum (−2.9%, which still favored the HELD side!) → DR target
+  flipped ladder-wide at 00:16:27 (the same cycle the CLOB returned zero-ask books for dozens of
+  markets — red herring, checked and exonerated; news was the driver) → the 2-cycle flip debounce
+  passed trivially (cached news persists 2h) → mass exit at 00:21:36. Two real defects under it,
+  both fixed:
+  1. **News polarity was direction-blind** — bullish-oil pushed +Yes on `wti-reach-85` AND
+     `wti-dip-to-55` alike (backwards on the dip strikes). `slug_market_direction()` now classifies
+     down-markets by slug token (dip/below/under/fall/drop/plunge/decline), injected per-cycle into
+     the news context (works for cached payloads too); the processor inverts polarity on `down`.
+     Unit-tested both ways + legacy-payload default.
+  2. **Signal-flip exits ignored friction** — the flip fired on a bare ≥2% opposite-side edge while
+     the P1 entry gate demands the friction floor. Selling pays one book-crossing leg, so
+     `flip_row_confirms` now also requires the opposite edge ≥ **one-way** floor at the opposite
+     side's price (`round_trip_cost_frac(p)/2 × k`, shared fn, multiplier-0 disables like the entry
+     gate; unparsable price = no flip, conservative). At the incident's 0.195 opposite price the
+     one-way floor is 11.4% vs the claimed 2.2–2.7% — all 7 flips would have been blocked. The
+     take-profit/stop-loss/time-stop rules are untouched. 5 new unit tests.
+  Deploying together with the 07-11 fixes (429 cooldown + scorecard TTL). **Watch next check:** the
+  first post-midnight-UTC cycle — news should return under cooldown discipline and NOT flip the
+  (rebuilt) commodity ladder positions; signal_flip exits should drop to near-zero on cheap
+  opposite sides.
+
 - **📈 MEASUREMENT CHECKPOINT #2 + diagnostic — P1 gate live-confirmed, basket realized, 3 fixes
   (2026-07-11, ~07:30 UTC).** Both checkpoint-#1 predictions confirmed, plus the first live P1 data:
   1. **The halftime negrisk basket settled: +$6.29 realized, exactly the invariant** (cost 1.948/u

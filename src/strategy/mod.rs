@@ -37,7 +37,7 @@ pub mod weights;
 pub use arbitrage::ArbitrageScanner;
 pub use external::{
     fetch_newsdata_news, fetch_yahoo_context, news_fetch_in_cooldown, newsdata_query,
-    NewsSentimentProcessor, YahooFinanceProcessor,
+    slug_market_direction, NewsSentimentProcessor, YahooFinanceProcessor,
 };
 // OverreactionProcessor retired 2026-06-29 (no longer wired into the fusion engine); the impl remains
 // in overreaction.rs for reference. Re-export removed so the unused processor doesn't warn.

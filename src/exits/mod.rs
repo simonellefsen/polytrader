@@ -214,6 +214,14 @@ pub async fn evaluate_exits(
 /// became the dominant remaining exit leak (3 of 3 flips on 07-09→10 lost, −$4.71). Same lesson as the
 /// stop-loss: require evidence the model genuinely changed its mind, not one wobble. Take-profit is
 /// left alone — it is the only net-positive exit reason (5/5, +$14.18).
+/// FRICTION FLOOR (2026-07-12): the opposite side's edge must also clear the ONE-WAY friction cost
+/// at ITS price (`round_trip_cost_frac(price)/2 × POLYTRADER_ROUNDTRIP_COST_MULTIPLIER`), not just
+/// `min_net_edge`. A flip exit pays one leg of book-crossing to act on the opposite thesis, so the
+/// claimed edge has to at least cover that leg — the same measured price-banded costs the P1 entry
+/// gate uses. Without this, the 2026-07-12 00:21 news shock (newsdata quota reset → stale-starved
+/// news came back oil-bullish across the whole WTI ladder in one cycle) flipped 7 positions on
+/// 2.2–2.7% edges at ~0.195-priced opposite sides, where the one-way floor is ~11.4% — pure friction
+/// burn (−$10.4). Cheap-side flips need an order-of-magnitude more conviction to justify selling.
 async fn signal_flipped(
     pool: &PgPool,
     market_id: &str,
@@ -225,8 +233,10 @@ async fn signal_flipped(
         .and_then(|v| v.trim().parse().ok())
         .filter(|n| *n >= 1)
         .unwrap_or(2);
-    let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT payload->>'target_outcome', payload->'report'->>'net_edge_after_fees'
+    let rt_multiplier = crate::risk::RiskConfig::from_env().round_trip_cost_multiplier;
+    let rows: Vec<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT payload->>'target_outcome', payload->'report'->>'net_edge_after_fees',
+                payload->'report'->'attribution'->'fee_impact'->>'price'
          FROM journal.events
          WHERE event_type = 'decision_report' AND payload->>'market_id' = $1
          ORDER BY created_at DESC LIMIT $2",
@@ -240,11 +250,128 @@ async fn signal_flipped(
     if (rows.len() as i64) < cycles {
         return false;
     }
-    rows.iter().all(|(target, edge)| {
-        let (Some(target), Some(edge)) = (target, edge) else {
-            return false;
-        };
-        let edge: Decimal = edge.parse().unwrap_or(Decimal::ZERO);
-        !target.eq_ignore_ascii_case(held_outcome) && edge >= min_net_edge
+    rows.iter().all(|(target, edge, price)| {
+        flip_row_confirms(
+            target.as_deref(),
+            edge.as_deref(),
+            price.as_deref(),
+            held_outcome,
+            min_net_edge,
+            rt_multiplier,
+        )
     })
+}
+
+/// One decision report confirms a flip iff it targets the OPPOSITE outcome and its net edge clears
+/// both `min_net_edge` and the one-way friction floor at the report's target price. A report with
+/// no parsable price never confirms (conservative: holding a bounded position beats paying friction
+/// on incomplete evidence). Multiplier 0 disables the friction floor, mirroring the entry gate.
+fn flip_row_confirms(
+    target: Option<&str>,
+    edge: Option<&str>,
+    price: Option<&str>,
+    held_outcome: &str,
+    min_net_edge: Decimal,
+    rt_multiplier: Decimal,
+) -> bool {
+    let (Some(target), Some(edge)) = (target, edge) else {
+        return false;
+    };
+    if target.eq_ignore_ascii_case(held_outcome) {
+        return false;
+    }
+    let edge: Decimal = edge.parse().unwrap_or(Decimal::ZERO);
+    if edge < min_net_edge {
+        return false;
+    }
+    if rt_multiplier <= Decimal::ZERO {
+        return true;
+    }
+    let Some(price) = price.and_then(|p| p.parse::<Decimal>().ok()) else {
+        return false;
+    };
+    let one_way_floor = crate::risk::round_trip_cost_frac(price) / dec!(2) * rt_multiplier;
+    edge >= one_way_floor
+}
+
+#[cfg(test)]
+mod tests {
+    use super::flip_row_confirms;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn flip_needs_opposite_target_and_min_edge() {
+        // Same side as held → never confirms, regardless of edge.
+        assert!(!flip_row_confirms(
+            Some("No"),
+            Some("0.30"),
+            Some("0.90"),
+            "No",
+            dec!(0.02),
+            dec!(1.5)
+        ));
+        // Opposite side but edge below min_net_edge → no.
+        assert!(!flip_row_confirms(
+            Some("Yes"),
+            Some("0.01"),
+            Some("0.90"),
+            "No",
+            dec!(0.02),
+            dec!(1.5)
+        ));
+    }
+
+    #[test]
+    fn flip_blocked_by_one_way_friction_floor_on_cheap_side() {
+        // The 2026-07-12 00:21 shape: opposite side priced 0.195 (one-way floor
+        // 760bps × 1.5 = 11.4%) with a 2.7% claimed edge → must NOT confirm.
+        assert!(!flip_row_confirms(
+            Some("Yes"),
+            Some("0.027"),
+            Some("0.195"),
+            "No",
+            dec!(0.02),
+            dec!(1.5)
+        ));
+        // Same claim on an expensive side (0.90: one-way 107bps × 1.5 = 1.6%) → confirms.
+        assert!(flip_row_confirms(
+            Some("Yes"),
+            Some("0.027"),
+            Some("0.90"),
+            "No",
+            dec!(0.02),
+            dec!(1.5)
+        ));
+        // A cheap side CAN still flip with an edge that actually covers the friction.
+        assert!(flip_row_confirms(
+            Some("Yes"),
+            Some("0.15"),
+            Some("0.195"),
+            "No",
+            dec!(0.02),
+            dec!(1.5)
+        ));
+    }
+
+    #[test]
+    fn flip_conservative_on_missing_price_and_disabled_by_zero_multiplier() {
+        // No parsable price → holding wins (no flip), even with a big edge.
+        assert!(!flip_row_confirms(
+            Some("Yes"),
+            Some("0.30"),
+            None,
+            "No",
+            dec!(0.02),
+            dec!(1.5)
+        ));
+        // Multiplier 0 disables the friction floor (old behavior), mirroring the entry gate.
+        assert!(flip_row_confirms(
+            Some("Yes"),
+            Some("0.027"),
+            None,
+            "No",
+            dec!(0.02),
+            dec!(0)
+        ));
+    }
 }

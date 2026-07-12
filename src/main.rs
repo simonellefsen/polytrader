@@ -630,9 +630,13 @@ async fn produce_5min_decision_report(
             // News only for directional markets — arb-only (sports) markets don't use it, so don't
             // spend newsdata credits on them.
             if !is_arb_only_market(&slug) {
-                if let Some(news) =
+                if let Some(mut news) =
                     get_news_context_cached(pool, journal, c, &gamma_id, &slug).await
                 {
+                    // Derived from the slug per-cycle (not baked into the cache) so cached payloads
+                    // pick it up too: down-markets invert headline polarity in the news processor.
+                    news["market_direction"] =
+                        serde_json::json!(crate::strategy::slug_market_direction(&slug));
                     external.insert("news".to_string(), news);
                 }
             }
