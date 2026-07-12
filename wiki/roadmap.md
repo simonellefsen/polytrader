@@ -250,9 +250,18 @@ build — exactly what the harness-first rule is for.
   negrisk capturable, where the only RICH overrounds live (27% seen on Canada–Morocco), (c) honest
   fill simulation for everything above. Do after P1–P3 prove out; it's the step that would matter
   for any real-money future.
-- [ ] **P6 — Turnover budget** (trivial). Cap autonomous directional entries per day (e.g. 6, best
-  net-edge first). Friction scales linearly with trade count; a flat-gross book cannot outrun it —
-  fewer, better trades is a direct P&L improvement at zero information cost.
+- [x] **P6 — Turnover budget — DONE 2026-07-12.** Cap autonomous directional ENTRIES per UTC day:
+  `POLYTRADER_MAX_DAILY_ENTRIES` (default 6, explicit in the k8s yaml, 0 disables), enforced in
+  `maybe_execute_opportunity` right after the drawdown breaker by counting the day's journaled
+  `action='filled'` executions. Exits and the risk-free arb executor are deliberately NOT counted
+  or capped (they reduce risk / are the proven strategy). Greedy first-come rather than the
+  original "best net-edge first" idea — a global daily ranking isn't knowable mid-day, and the
+  min-edge + friction gates already enforce per-trade quality; the cap's value is bounding the
+  friction bill. Halt is journaled once/hour as `halted_by_daily_turnover_budget` (same de-spam
+  pattern as the drawdown breaker). Actual post-reset baseline (journal): 07-05: 24, 07-06: 13,
+  07-07: 3, 07-08: 10, 07-09: 4, 07-10: 11, 07-11: 4, 07-12: 5 — the cap at 6 would have bound 4 of
+  the last 8 days (the churn-heavy ones: 07-05's 24 was the −$54 overnight rebuy loop the re-entry
+  cooldown later fixed; remaining spikes are cooldown-permitted breadth, which the budget now bounds).
 
 Sequencing: P2+P6 are one-liners, P1 next (harness-validate the gate constant), P3 alongside (it
 feeds the proven strategy), P4 when the payoff math is written down, P5 as the deliberate big bet.

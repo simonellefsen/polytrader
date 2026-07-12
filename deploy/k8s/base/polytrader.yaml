@@ -127,6 +127,11 @@ spec:
             # 107bps above $0.80) -- this is what actually stopped the cheap-share losses. 0 disables.
             - name: POLYTRADER_ROUNDTRIP_COST_MULTIPLIER
               value: "1.5"
+            # P6 turnover budget (2026-07-12): max autonomous directional ENTRIES per UTC day.
+            # Friction is paid per trade while the directional book runs ~flat gross, so the
+            # marginal entry is usually P&L-negative. Exits + risk-free arb are NOT capped. 0 = off.
+            - name: POLYTRADER_MAX_DAILY_ENTRIES
+              value: "6"
             # Correlated-cluster exposure cap: max fraction of the book locked across all markets that
             # resolve off the same underlying event (e.g. the ~15 Iran/Hormuz peace-deal markets). Each
             # passes the 20% per-market cap individually, but together they are one giant correlated bet.

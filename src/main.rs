@@ -802,6 +802,21 @@ fn drawdown_breaker_tripped(
     matches!(threshold_pct, Some(t) if current_dd_pct >= t)
 }
 
+/// Daily directional-entry cap (roadmap P6 turnover budget). Friction scales linearly with trade
+/// count and the directional book runs ~flat gross, so fewer, better trades is a direct P&L lever.
+/// Default 6/day; 0 (or unparsable) disables. Env: POLYTRADER_MAX_DAILY_ENTRIES.
+fn daily_entry_cap() -> i64 {
+    std::env::var("POLYTRADER_MAX_DAILY_ENTRIES")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(6)
+}
+
+/// Pure: is the daily turnover budget exhausted? Disabled when `cap <= 0`.
+fn turnover_budget_exhausted(entries_today: i64, cap: i64) -> bool {
+    cap > 0 && entries_today >= cap
+}
+
 /// Current paper-account NAV drawdown from its all-time peak, in percent (0 if there are no snapshots
 /// or no positive peak). NAV = virtual_usdc + total_locked + unrealized_pnl — the same equity
 /// definition as the /trades scorecard and the Hermes drawdown monitor.
@@ -891,6 +906,57 @@ async fn maybe_execute_opportunity(
                     .await;
             }
             tracing::warn!(drawdown_pct = %dd, threshold_pct = %threshold, "drawdown circuit-breaker tripped; halting new directional entries (paper)");
+            return Ok(());
+        }
+    }
+
+    // P6 — Daily turnover budget: cap autonomous directional ENTRIES per UTC day (default 6,
+    // POLYTRADER_MAX_DAILY_ENTRIES, 0 disables). Friction is paid per trade while gross edge runs
+    // ~flat, so the marginal entry is usually P&L-negative once the day's best opportunities are
+    // taken. Greedy first-come within the day (the min-edge + friction gates already enforce
+    // per-trade quality; a global best-first ranking isn't knowable mid-day). Exits, and the
+    // risk-free arb executor (separate path), are deliberately NOT counted or capped.
+    let cap = daily_entry_cap();
+    if cap > 0 {
+        let entries_today: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM journal.events
+             WHERE event_type = 'autonomous_paper_execution'
+               AND payload->>'action' = 'filled'
+               AND created_at >= date_trunc('day', now())",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+        if turnover_budget_exhausted(entries_today, cap) {
+            // De-spam: journal the halt at most once per hour (every candidate market would
+            // otherwise re-journal it each 5-min cycle for the rest of the day).
+            let recent_halt: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM journal.events
+                 WHERE event_type = 'autonomous_paper_execution'
+                   AND payload->>'action' = 'halted_by_daily_turnover_budget'
+                   AND created_at > now() - interval '1 hour'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+            if recent_halt == 0 {
+                let _ = journal
+                    .record_journal_event(
+                        "autonomous_paper_execution",
+                        "polytrader_executor",
+                        "info",
+                        serde_json::json!({
+                            "action": "halted_by_daily_turnover_budget",
+                            "entries_today": entries_today,
+                            "daily_cap": cap,
+                            "paper_only": true,
+                            "real_orders_enabled": false,
+                            "note": "New directional entries paused until the next UTC day: filled-entry count reached POLYTRADER_MAX_DAILY_ENTRIES (P6 turnover budget). Exits and the risk-free arb executor are unaffected.",
+                        }),
+                    )
+                    .await;
+            }
+            tracing::info!(entries_today, cap, "daily turnover budget exhausted; skipping new directional entries until next UTC day (paper)");
             return Ok(());
         }
     }
@@ -2221,6 +2287,7 @@ async fn fetch_latest_book(
 mod tests {
     use super::{
         arb_category, drawdown_breaker_tripped, polymarket_taker_fee, settlement_payout_and_pnl,
+        turnover_budget_exhausted,
     };
     use rust_decimal_macros::dec;
 
@@ -2310,6 +2377,17 @@ mod tests {
         assert!(drawdown_breaker_tripped(dec!(22.5), Some(dec!(15))));
         // At/near peak (0% drawdown) never trips a positive threshold.
         assert!(!drawdown_breaker_tripped(dec!(0), Some(dec!(15))));
+    }
+
+    #[test]
+    fn turnover_budget_counts_and_disables() {
+        // Under budget → run; at/over → halt (P6: friction is per-trade, cap the day's entries).
+        assert!(!turnover_budget_exhausted(5, 6));
+        assert!(turnover_budget_exhausted(6, 6));
+        assert!(turnover_budget_exhausted(7, 6));
+        // 0 (or negative) disables the budget entirely.
+        assert!(!turnover_budget_exhausted(100, 0));
+        assert!(!turnover_budget_exhausted(100, -1));
     }
 
     #[test]
