@@ -96,6 +96,15 @@ the dated Decision-log entry below; this is the at-a-glance index.
   durable fix: bump the polytrader pod's memory limit, or make `load_reports`/`load_settlements`
   stream/paginate instead of materializing full history. Workaround: always pass `--since <date>`.
   *Real operational risk — prioritize before the next unbounded backtest run.*
+- [ ] **Advisory-only opportunities policy** (2026-07-12). With the fusion denominator floor a lone
+  advisory (news/yahoo) fuses to at most its own confidence (~0.17–0.30) — honest, but still enough
+  to clear the 2% gate and mid-price friction floors on stale/off-topic headlines. Decide whether a
+  directional opportunity should require ≥1 market-internal signal (momentum/spike/theta) to fire,
+  with advisories only ever adjusting. See checkpoint #4.
+- [ ] **News relevance filter** (2026-07-12). The slug-derived newsdata query matched "banana art
+  pricing" headlines to a prediction market; keyword polarity over off-topic text is pure noise.
+  Cheap options: require ≥1 slug topic-noun to appear in a headline before counting it; or drop
+  markets whose query returns <N on-topic hits. See checkpoint #4.
 - [ ] **Anchor residual ~$10 gap** (2026-07-10). After folding in exit-realized P&L (commit 77ef205),
   the fidelity anchor is ~90% closed but not PASS. Suspected cause: manual sells via `POST
   /paper/orders` (e.g. the 07-05 T1-esports cleanup) realize P&L through the same engine path as an
@@ -599,6 +608,38 @@ prediction, is where this system's edge has ever appeared.
   exempt "uncorrelated" bucket) — an event_id-based cluster key would close this; at paper scale
   (1.2% of bankroll) it's low priority. Also added `crint-` (cricket international) to the keyword
   prefilter with a regression test.
+
+- **📈 CHECKPOINT #4 + diagnostic — fusion saturation bug: a lone advisory fused to a "99.9% edge"
+  (2026-07-12, ~20:30 UTC).** Deploy verification first: ebc5ba7 healthy 9h (0 errors, 0 restarts),
+  and the 429 cooldown is behaving exactly as designed — **18 probe requests in 9h instead of
+  ~2,000 hammered** (the provider quota stays exhausted until its midnight reset; one 30-min-spaced
+  probe per window is the correct minimal footprint). Realized ~flat (−22.56 → −24.60). The
+  cooldown's stale-cache fallback resurrected news_sentiment (0% → 30.6% fire rate)… which armed
+  the next landmine:
+  **Every one of the 1,241 news-fired decision reports since the deploy carried an all-positive
+  news score (avg 0.640) and an avg net edge of 40% — peak 99.9%.** Sample: a market whose cached
+  headlines were literal off-topic junk ("Rs 59 cr for a banana? Inside the world of absurd art
+  pricing", duplicated by syndication) scored polarity −1 → target-oriented score **+1.0** → fused
+  gross edge **1.0** → net 0.999. Root cause is NOT news: `fuse_weighted` was a plain weighted
+  MEAN — `Σ(s·w)/Σ(w)` — so when exactly one signal fires its confidence cancels out and the fused
+  edge equals the raw score. The advisory ≤0.30-confidence cap (the module's whole safety design)
+  is nullified precisely when momentum reads `balanced_book` and the advisory speaks alone. Both
+  incidents verified against the formula: WTI 07-12 00:16 (dense signals, fused 0.0604 ✓) and the
+  banana report (lone news, fused exactly 1.0 ✓). **No trades resulted** — every affected market
+  happened to be already-positioned/cooldown-blocked (zero fills, zero rejects, zero exits in the
+  window — the executor's silence was itself the flag that led here). **Fixes:**
+  1. **Denominator floor** — `fuse_weighted = Σ(s·w)/max(Σw, 1)`: sparse firings contribute their
+     weighted SUM (bounded by total confidence — a lone 0.175-weight advisory now fuses to 0.165,
+     not 1.0), dense sets (Σw ≥ 1) normalize exactly as before. Shared by live fuse and the
+     backtest's `fuse_from_attribution`, so replays over the corrupted window auto-correct (stored
+     per-signal scores were honest; only the fusion was wrong). 3 backtest fixtures updated (they
+     encoded the lone-signal passthrough), 1 new regression test.
+  2. **Headline dedupe** — syndicated stories repeat identical titles, double-counting their
+     keywords in the polarity.
+  **Follow-ups added to TODO:** (a) should an advisory-ONLY firing set produce a tradeable
+  opportunity at all (policy: maybe require ≥1 market-internal signal)? (b) news relevance — the
+  crude query matched banana-art headlines to a prediction market; polarity on off-topic text is
+  noise even at honest confidence.
 
 - **📈 CHECKPOINT #3 + diagnostic — the midnight news shock: mass signal-flip anatomy, 2 fixes
   (2026-07-12, ~11:30 UTC).** Realized P&L improved again, −42.89 → **−22.56** (settlements +33.88

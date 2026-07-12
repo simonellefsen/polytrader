@@ -1237,10 +1237,13 @@ mod tests {
 
     #[test]
     fn counterfactual_respects_dedup_and_min_edge_gate() {
-        // Two reports on the same market; a strong positive signal. Only ONE position should open
-        // (dedup), and a higher min_net_edge should be able to suppress it entirely.
+        // Two reports on the same market; two agreeing signals with Σ(conf·weight) = 1.0 so the
+        // fused gross is exactly 0.30 (the max(Σw,1) denominator floor makes a LONE 0.5-weight
+        // signal fuse to half its score — see fuse_weighted_lone_weak_signal_cannot_saturate).
+        // Only ONE position should open (dedup), and a higher min_net_edge suppresses it entirely.
         let attr = json!({
             "orderbook_momentum": {"score": "0.30", "confidence": "0.5"},
+            "theta_convergence": {"score": "0.30", "confidence": "0.5"},
             "fee_impact": {"est_fees_and_gas": "0.05"},
         });
         let reports = vec![
@@ -1287,9 +1290,11 @@ mod tests {
     fn counterfactual_weights_change_outcome() {
         // A signal whose sign flips the bet: with the default weight it fires positive; zeroing its
         // weight removes its contribution. Confirms the candidate weight vector actually bites.
+        // Scores sized so the lone surviving signal (w 0.5, halved by the max(Σw,1) denominator
+        // floor) still clears the friction floor at price 0.50 (10.71%): 0.60·0.5 − 0.05 = 0.25.
         let attr = json!({
-            "orderbook_momentum": {"score": "0.30", "confidence": "0.5"},
-            "news_sentiment": {"score": "-0.30", "confidence": "0.5"},
+            "orderbook_momentum": {"score": "0.60", "confidence": "0.5"},
+            "news_sentiment": {"score": "-0.60", "confidence": "0.5"},
             "fee_impact": {"est_fees_and_gas": "0.05"},
         });
         let reports = vec![ReportRow {
@@ -1467,8 +1472,11 @@ mod tests {
     #[test]
     fn run_sweep_ranks_gate_thresholds() {
         // One market, strong +0.25 net edge. A loose gate (0.02) trades it; a gate above 0.25 doesn't.
+        // Two agreeing signals (Σw = 1.0) keep the fused gross at 0.30 under the max(Σw,1)
+        // denominator floor, so the loose 2% gate fills and the tight 50% gate doesn't.
         let attr = json!({
             "orderbook_momentum": {"score": "0.30", "confidence": "0.5"},
+            "theta_convergence": {"score": "0.30", "confidence": "0.5"},
             "fee_impact": {"est_fees_and_gas": "0.05"},
         });
         let reports = vec![ReportRow {

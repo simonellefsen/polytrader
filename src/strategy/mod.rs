@@ -492,10 +492,18 @@ impl FusionEngine {
 }
 
 /// Pure weighted-average fusion — the single source of truth for how per-signal scores combine.
-/// `fused = Σ(scoreᵢ · confidenceᵢ · learned_weightᵢ) / Σ(confidenceᵢ · learned_weightᵢ)`, and 0 when
-/// the total effective weight is ≤ 0. Shared by the live [`FusionEngine::fuse`] (fresh signals) and
-/// the offline backtest harness via [`fuse_from_attribution`] (stored decision-report scores replayed
-/// under a candidate weight vector — no processors re-run).
+/// `fused = Σ(scoreᵢ · confidenceᵢ · learned_weightᵢ) / max(Σ(confidenceᵢ · learned_weightᵢ), 1)`,
+/// and 0 when the total effective weight is ≤ 0. Shared by the live [`FusionEngine::fuse`] (fresh
+/// signals) and the offline backtest harness via [`fuse_from_attribution`] (stored decision-report
+/// scores replayed under a candidate weight vector — no processors re-run).
+///
+/// The `max(…, 1)` floor on the denominator (2026-07-12): a plain weighted MEAN cancels confidence
+/// out entirely when only one signal fires — a lone advisory with score ±1 and confidence 0.175
+/// fused to ±1.0 ("100% edge"), which is how stale off-topic headlines produced 1,241 decision
+/// reports averaging a 40% net edge (peak 99.9%) the day news_sentiment came back from starvation
+/// while momentum read `balanced_book` on the same markets. With the floor, a sparse firing set
+/// contributes its weighted SUM (bounded by its total confidence — the advisory cap works again),
+/// while a well-populated set (Σw ≥ 1) normalizes exactly as before.
 pub fn fuse_weighted<I>(signals: I) -> Decimal
 where
     I: IntoIterator<Item = (Decimal, Decimal, Decimal)>,
@@ -508,7 +516,7 @@ where
         total_weight += w;
     }
     if total_weight > Decimal::ZERO {
-        total_weighted / total_weight
+        total_weighted / total_weight.max(Decimal::ONE)
     } else {
         Decimal::ZERO
     }
@@ -680,6 +688,23 @@ mod processor_tests {
         // numerator = 0.05 - 0.16 = -0.11 ; denominator = 0.5 + 0.8 = 1.3
         let expected = dec!(-0.11) / dec!(1.3);
         assert_eq!(fuse_weighted(signals), expected);
+    }
+
+    #[test]
+    fn fuse_weighted_lone_weak_signal_cannot_saturate() {
+        // 2026-07-12 incident shape: one advisory fires alone with a saturated score. A plain
+        // weighted MEAN cancels confidence entirely (fused = score = ±1.0, read as "100% edge");
+        // the max(Σw, 1) denominator floor keeps a sparse firing set bounded by its total
+        // confidence instead.
+        let fused = fuse_weighted(vec![(dec!(1), dec!(0.175), dec!(0.943))]);
+        assert_eq!(fused, dec!(0.165025)); // 1 × 0.175 × 0.943 — not 1.0
+        assert!(fused < dec!(0.2));
+        // Two sparse signals still sum, not average up: bounded by Σ(conf·learned).
+        let sparse = vec![
+            (dec!(1), dec!(0.30), dec!(1.0)),
+            (dec!(1), dec!(0.35), dec!(1.0)),
+        ];
+        assert_eq!(fuse_weighted(sparse), dec!(0.65));
     }
 
     #[test]

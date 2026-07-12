@@ -212,6 +212,11 @@ pub async fn fetch_newsdata_news(
     let mut texts = Vec::new();
     for a in results.iter().take(10) {
         if let Some(t) = a["title"].as_str() {
+            // Syndicated stories come back as multiple results with the identical title;
+            // counting them twice double-weights their keywords in the polarity.
+            if titles.iter().any(|seen| seen == t) {
+                continue;
+            }
             titles.push(t.to_string());
             texts.push(t.to_string());
         }
