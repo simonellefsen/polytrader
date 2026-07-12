@@ -126,12 +126,21 @@ the dated Decision-log entry below; this is the at-a-glance index.
   OPEN (pre-filter behavior); dropped counts are logged (`news relevance filter dropped off-topic
   articles`). Filter runs at fetch time so cached `news_cache` payloads are clean at the source;
   old cache entries age out on the 2h TTL. 2 new tests.*
-- [ ] **Anchor residual ~$10 gap** (2026-07-10). After folding in exit-realized P&L (commit 77ef205),
-  the fidelity anchor is ~90% closed but not PASS. Suspected cause: manual sells via `POST
-  /paper/orders` (e.g. the 07-05 T1-esports cleanup) realize P&L through the same engine path as an
-  autonomous exit but aren't tagged `autonomous_paper_exit`, so `load_exit_realized` misses them. Add
-  a `source` tag on manual submits too, or broaden the load to any Sell fill without a settlement.
-  *Low priority — doesn't block relative (config-vs-config) backtest comparisons, only exact PASS.*
+- [x] **Anchor residual ~$10 gap** (2026-07-10) → *CLOSED 2026-07-12 — the suspect was wrong. The
+  residual (+$11.98 by then) decomposed as: **+$11.03 fee-semantics mismatch** in
+  `load_exit_realized` (it summed `realized_gross − fees`, but the engine adds sell realized GROSS
+  to the snapshot's `realized_pnl` — fees enter the cash identity separately via `total_fees_agg`)
+  **+ $0.95 the single actual manual sell** (07-05 T1-esports cleanup, market 2555427, exactly one
+  order). Fixes: (1) `load_exit_realized` drops the fee subtraction; (2) new
+  `load_manual_sell_realized` recovers operator sells' realized deltas from the `post_fill_tx`
+  snapshot DIFF (each sell's tx writes prior+delta; 5s window join since order/fill/snapshot stamps
+  differ by ms) filtered on `decision_context->>'source' != 'autonomous_exit'` — validated to
+  return exactly +0.95205532; (3) exits now journal `realized_gross` UNROUNDED (was `.round_dp(4)`,
+  leaving ±$0.0003 dust across 36 immutable events) and the anchor gained a ±$0.01 tolerance with
+  the residual printed. Full-precision tie-out on live data: settlements 82.53 + exits −108.0839 +
+  manual 0.9521 − live (−24.6016) = **residual −$0.00028** → PASS. A dead-end fills-replay
+  validation (re-deriving avg-entry from `paper_fills`) got within $4.26 but drifts on
+  re-buy-after-exit sequences — the journaled exit events are the authoritative record.*
 
 ## 🎯 Path to profitability (added 2026-07-08, operator-requested)
 

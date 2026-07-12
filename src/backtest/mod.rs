@@ -713,6 +713,7 @@ pub async fn run(pool: &sqlx::PgPool, args: &[String]) -> anyhow::Result<()> {
     // settlement history — `--since` only bounds the counterfactual's report replay, never the anchor.
     let settlements = load_settlements(pool).await?;
     let exit_realized = load_exit_realized(pool).await?;
+    let manual_sell_realized = load_manual_sell_realized(pool).await?;
     let reports = load_reports(pool, since.as_deref()).await?;
     let resolutions = load_resolutions(pool).await?;
     let slug_of = load_slug_map(pool).await?;
@@ -731,17 +732,27 @@ pub async fn run(pool: &sqlx::PgPool, args: &[String]) -> anyhow::Result<()> {
 
     // --- Fidelity anchor: the production settlement formula recomputed over every live settlement,
     // PLUS every autonomous exit's realized delta (see load_exit_realized doc — exits have been the
-    // dominant realization path since 2026-07-04, and the anchor read a false MISMATCH without them).
+    // dominant realization path since 2026-07-04, and the anchor read a false MISMATCH without them),
+    // PLUS manual/operator sells (see load_manual_sell_realized — the 2026-07-05 T1-esports cleanup).
     let (settlement_realized, settled, wins, losses, all_match) =
         realized_from_settlements(&settlements);
-    let anchor_realized = settlement_realized + exit_realized;
-    let realized_matches = anchor_realized == live_realized;
+    let anchor_realized = settlement_realized + exit_realized + manual_sell_realized;
+    // 1-cent tolerance: historical `autonomous_paper_exit` events journaled realized_gross rounded
+    // to 4dp (fixed 2026-07-12, but the written events are immutable), so exact equality is
+    // unattainable by construction — the dust is ±$0.0003 today. Real drift classes (uncounted
+    // exits, fee-semantics mismatch, missed manual sells) were $10–$90; a cent cleanly separates.
+    let residual = anchor_realized - live_realized;
+    let realized_matches = residual.abs() < dec!(0.01);
     println!("== Fidelity anchor (settlement formula vs live) ==");
     println!("  settlements: {settled}   W/L: {wins}/{losses}");
     println!(
-        "  realized recomputed: {anchor_realized}  (settlements {settlement_realized} + exits {exit_realized})"
+        "  realized recomputed: {anchor_realized}  (settlements {settlement_realized} + exits {exit_realized} + manual sells {manual_sell_realized})"
     );
     println!("  realized live-recorded: {live_realized}");
+    println!(
+        "  residual: {} (PASS tolerance ±0.01 — historical exit events carry 4dp-rounded values)",
+        residual.round_dp(6)
+    );
     println!("  per-record formula match: {all_match}");
     println!(
         "  ANCHOR: {}",
@@ -974,11 +985,50 @@ async fn load_settlements(pool: &sqlx::PgPool) -> anyhow::Result<Vec<SettlementR
 /// accumulated exit P&L the anchor never knew existed). Same fix shape as the 2026-07-08 Hermes
 /// attribution bug, applied here to the OTHER consumer that summed settlements alone.
 async fn load_exit_realized(pool: &sqlx::PgPool) -> anyhow::Result<Decimal> {
+    // GROSS, deliberately (2026-07-12): the engine adds each sell's (price − avg_entry) × size to
+    // the snapshot's `realized_pnl` WITHOUT fees — fees enter the cash identity separately via
+    // `total_fees_agg` (see paper/engine.rs). The old `- fees` here compared apples to oranges and
+    // under-read the anchor by the cumulative exit fees (+$11.03 of the "residual ~$10 gap", which
+    // was mis-attributed to manual sells; the real manual-sell contribution was +$0.95).
     let r: Option<Decimal> = sqlx::query_scalar(
-        "SELECT SUM((payload->>'realized_gross')::numeric - (payload->>'fees')::numeric)
+        "SELECT SUM((payload->>'realized_gross')::numeric)
          FROM journal.events
          WHERE event_type = 'autonomous_paper_exit'
            AND created_at >= COALESCE(
+             (SELECT max(as_of) FROM paper_trading.virtual_portfolio_snapshots
+              WHERE snapshot_reason = 'manual_paper_reset'), '-infinity'::timestamptz)",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(r.unwrap_or(dec!(0)))
+}
+
+/// Realized P&L from NON-autonomous sells (operator `POST /paper/orders`, e.g. the 2026-07-05
+/// T1-esports cleanup). These go through the same engine path as an exit but journal no
+/// `autonomous_paper_exit` event, so the anchor missed them. There is no per-sell realized record,
+/// but every fill tx writes a `post_fill_tx` snapshot whose `realized_pnl` is the prior snapshot's
+/// value plus exactly this sell's realized delta — so the snapshot DIFF recovers it. The order row,
+/// its fills, and the snapshot are stamped milliseconds apart (different clock sources), hence the
+/// 5-second window join on the FIRST post-fill snapshot at/after the order, not timestamp equality.
+/// Buys never change `realized_pnl`, so only sells are summed. Sells are identified by
+/// `decision_context->>'source' != 'autonomous_exit'` — the tag every executor path writes.
+async fn load_manual_sell_realized(pool: &sqlx::PgPool) -> anyhow::Result<Decimal> {
+    let r: Option<Decimal> = sqlx::query_scalar(
+        "SELECT SUM(s_now.realized_pnl - s_prev.realized_pnl)
+         FROM paper_trading.paper_orders o
+         JOIN LATERAL (
+           SELECT realized_pnl, as_of FROM paper_trading.virtual_portfolio_snapshots
+           WHERE snapshot_reason = 'post_fill_tx'
+             AND as_of >= o.created_at AND as_of < o.created_at + interval '5 seconds'
+           ORDER BY as_of ASC LIMIT 1
+         ) s_now ON true
+         JOIN LATERAL (
+           SELECT realized_pnl FROM paper_trading.virtual_portfolio_snapshots
+           WHERE as_of < s_now.as_of ORDER BY as_of DESC LIMIT 1
+         ) s_prev ON true
+         WHERE lower(o.side) = 'sell'
+           AND COALESCE(o.decision_context->>'source', '') <> 'autonomous_exit'
+           AND o.created_at >= COALESCE(
              (SELECT max(as_of) FROM paper_trading.virtual_portfolio_snapshots
               WHERE snapshot_reason = 'manual_paper_reset'), '-infinity'::timestamptz)",
     )

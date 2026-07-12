@@ -180,7 +180,11 @@ pub async fn evaluate_exits(
                             "shares_sold": sold.to_string(),
                             "entry_avg": avg_entry.to_string(),
                             "exit_vwap": vwap.round_dp(4).to_string(),
-                            "realized_gross": realized_gross.round_dp(4).to_string(),
+                            // UNROUNDED (2026-07-12): the backtest fidelity anchor sums these
+                            // against the snapshot realized_pnl, which accumulates unrounded
+                            // per-fill deltas — 4dp rounding here left ±$0.0003 of dust that made
+                            // exact tie-outs impossible. Display rounding stays in the log line.
+                            "realized_gross": realized_gross.to_string(),
                             "fees": fees.round_dp(4).to_string(),
                             "held_days": held_days.round_dp(2).to_string(),
                             "move_pct_at_decision": move_pct.round_dp(4).to_string(),
