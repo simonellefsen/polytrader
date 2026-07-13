@@ -286,9 +286,17 @@ prediction, is where this system's edge has ever appeared.
   are one correlated underlying event, but `risk::cluster_key` drops them in the exempt "uncorrelated"
   bucket, so up to ~$120 (6 × $20 cap) can concentrate on one binary. Add an event_id-derived cluster
   key so the concentration cap groups a ladder as one bet. *Low priority at paper scale (~1.2% bankroll).*
-- [ ] **Signal-calibration `(1−p)` ceiling clamp** (2026-07-05). `fuse_net` can report a large net edge on
-  a ceiling-priced side (16% on a 0.9995 No); Kelly correctly zeroes it, but the phantom edge pollutes
-  the scorecard. Clamp fused edge by the remaining price headroom in the DR generator. *Signal-quality, not urgent.*
+- [x] **Signal-calibration `(1−p)` ceiling clamp** (2026-07-05) → *DONE 2026-07-12. New pure
+  `clamp_edge_to_price_headroom(edge, price)` in `strategy/mod.rs`: a positive fused edge is capped
+  at `(1−p)/p` — the maximum possible return per $1 staked when a share bought at `p` pays out 1
+  (the 16%-on-0.9995 case caps to +0.05%). Applied INSIDE `fuse_net` (not just the DR generator as
+  originally sketched — that way the journaled attribution, the DR scorecard, the exits' flip
+  check, and the server candidates all read the honest edge from one place) and mirrored at
+  `target_mid` in the backtest counterfactual so replays stay in lockstep. When the clamp binds,
+  attribution records `headroom_capped: true` + `gross_edge_uncapped` so Hermes can treat it as a
+  calibration-error signal rather than losing the information. Negative edges pass through (the
+  loss floor is real); the degraded no-fee_ctx path can't clamp (no price) and says so. 2 new tests
+  incl. an end-to-end fuse_net fixture at price 0.999.*
 - [ ] **Maker-execution simulation** (2026-07-04). Posting resting limit orders pays ZERO taker fee and
   earns the 20–25% maker rebate — a real lever on fee-enabled markets (sports/crypto). Needs resting-order
   queue + fill-probability modeling, which honest snapshot-based ingestion can't do. *Blocked on a WebSocket feed.*

@@ -436,7 +436,7 @@ impl FusionEngine {
     ) -> Result<(Decimal, Decimal, serde_json::Value)> {
         let (gross, mut attribution) = self.fuse(snapshot, ctx)?;
 
-        let (net, fee_note) = if let Some(f) = fee_ctx {
+        let (gross_final, net, fee_note) = if let Some(f) = fee_ctx {
             // Polymarket's real taker fee, expressed as a FRACTION of notional so units match the
             // fractional `gross` edge. (The old code subtracted raw USDC from the fraction — on a
             // $10 notional that over-penalized every DR ~10×, and its flat-bps model ignored that
@@ -451,28 +451,36 @@ impl FusionEngine {
             } else {
                 (Decimal::ZERO, Decimal::ZERO)
             };
-            let n = gross - cost_frac;
+            // Ceiling clamp: a positive edge can never exceed the price headroom (1−p)/p — see
+            // clamp_edge_to_price_headroom. The raw fused value stays in attribution (below) for
+            // Hermes signal-calibration analysis; everything downstream sees the honest edge.
+            let gross_capped = clamp_edge_to_price_headroom(gross, f.price);
+            let n = gross_capped - cost_frac;
 
             // Enrich attribution (jsonb ready for journal; explicit, no silent).
             // `fee_cost_frac` is the value actually subtracted (fraction-of-notional; the backtest
             // harness prefers it); `est_fees_and_gas` stays as the USDC amount for audit and as the
             // historical-report fallback key.
             if let Some(map) = attribution.as_object_mut() {
-                map.insert(
-                    "fee_impact".to_string(),
-                    json!({
-                        "taker_fee_rate_used": f.taker_fee_rate.to_string(),
-                        "price": f.price.to_string(),
-                        "fee_cost_frac": cost_frac.to_string(),
-                        "est_fees_and_gas": (fee_usdc + f.est_gas_usdc).to_string(),
-                        "notional_for_cost": notional.to_string(),
-                        "gross_edge": gross.to_string(),
-                        "net_edge_after_fees": n.to_string(),
-                        "note": "PRIMARY signal for deliberate 5-min tier (see fees wiki + 4-6% min net in goals). Real Polymarket taker model: shares × rate × p × (1−p); makers pay nothing (we always cross = taker)."
-                    }),
-                );
+                let mut fee_impact = json!({
+                    "taker_fee_rate_used": f.taker_fee_rate.to_string(),
+                    "price": f.price.to_string(),
+                    "fee_cost_frac": cost_frac.to_string(),
+                    "est_fees_and_gas": (fee_usdc + f.est_gas_usdc).to_string(),
+                    "notional_for_cost": notional.to_string(),
+                    "gross_edge": gross_capped.to_string(),
+                    "net_edge_after_fees": n.to_string(),
+                    "note": "PRIMARY signal for deliberate 5-min tier (see fees wiki + 4-6% min net in goals). Real Polymarket taker model: shares × rate × p × (1−p); makers pay nothing (we always cross = taker)."
+                });
+                if gross_capped != gross {
+                    // Signal-calibration record: the fusion wanted more edge than the price can
+                    // mathematically pay. Hermes should read this as a calibration error signal.
+                    fee_impact["gross_edge_uncapped"] = json!(gross.to_string());
+                    fee_impact["headroom_capped"] = json!(true);
+                }
+                map.insert("fee_impact".to_string(), fee_impact);
             }
-            (n, "fee_ctx provided; net computed")
+            (gross_capped, n, "fee_ctx provided; net computed")
         } else {
             if let Some(map) = attribution.as_object_mut() {
                 map.insert(
@@ -483,7 +491,8 @@ impl FusionEngine {
                     }),
                 );
             }
-            (gross, "no fee_ctx; net=gross (degraded)")
+            // No price known → no headroom clamp possible (degraded path; callers validate mids).
+            (gross, gross, "no fee_ctx; net=gross (degraded)")
         };
 
         // Also surface a DecisionReport-shaped view in attribution for downstream 5-min generators
@@ -491,7 +500,7 @@ impl FusionEngine {
             map.insert(
                 "decision_report_summary".to_string(),
                 json!({
-                    "fused_gross_edge": gross.to_string(),
+                    "fused_gross_edge": gross_final.to_string(),
                     "net_edge_after_fees": net.to_string(),
                     "fee_note": fee_note,
                     "primary_for_deliberate_tier": true
@@ -500,7 +509,7 @@ impl FusionEngine {
         }
 
         let attr_json = attribution; // already a Value (from inner fuse); mutated in place via as_object_mut when Object
-        Ok((gross, net, attr_json))
+        Ok((gross_final, net, attr_json))
     }
 }
 
@@ -551,6 +560,25 @@ where
     } else {
         (fused, false)
     }
+}
+
+/// Signal-calibration ceiling clamp (2026-07-12, roadmap TODO): buying at price `p` and holding to
+/// resolution returns at most `(1−p)/p` per $1 staked (a winning share bought at `p` pays out 1).
+/// Any positive fused edge above that headroom is a mathematical impossibility — e.g. a 16% net
+/// edge reported on a 0.9995-priced No, whose best case is +0.05%. Kelly already zeroes such
+/// trades, but the phantom edge polluted the DR scorecard and Hermes' calibration data. Applied in
+/// [`FusionEngine::fuse_net`] (live DRs, where the side's price is known via `FeeContext`) and in
+/// the backtest counterfactual (same clamp at `target_mid`) so replay and live stay in lockstep.
+/// Negative edges pass through untouched (there is no phantom UPSIDE to cap — the loss floor is
+/// real), and a degenerate price ≥ 1 has zero headroom.
+pub fn clamp_edge_to_price_headroom(edge: Decimal, price: Decimal) -> Decimal {
+    if edge <= Decimal::ZERO || price <= Decimal::ZERO {
+        return edge; // negative/zero edge, or no meaningful price (callers validate mids)
+    }
+    if price >= Decimal::ONE {
+        return Decimal::ZERO;
+    }
+    edge.min((Decimal::ONE - price) / price)
 }
 
 /// Pure weighted-average fusion — the single source of truth for how per-signal scores combine.
@@ -779,6 +807,60 @@ mod processor_tests {
         assert_eq!(
             fuse_weighted(vec![(dec!(0.9), dec!(0), dec!(1.5))]),
             Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn edge_clamped_to_price_headroom() {
+        use super::clamp_edge_to_price_headroom;
+        // The roadmap incident: a 16% edge reported on a 0.9995-priced side whose max possible
+        // return is 0.0005/0.9995 ≈ 0.05%.
+        let capped = clamp_edge_to_price_headroom(dec!(0.16), dec!(0.9995));
+        assert_eq!(capped, dec!(0.0005) / dec!(0.9995));
+        assert!(capped < dec!(0.001));
+        // Mid prices have ample headroom — a realistic edge passes through untouched.
+        assert_eq!(
+            clamp_edge_to_price_headroom(dec!(0.16), dec!(0.50)),
+            dec!(0.16)
+        );
+        // Negative edges are real downside, never capped; degenerate p ≥ 1 has zero headroom.
+        assert_eq!(
+            clamp_edge_to_price_headroom(dec!(-0.5), dec!(0.9995)),
+            dec!(-0.5)
+        );
+        assert_eq!(
+            clamp_edge_to_price_headroom(dec!(0.16), dec!(1)),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn fuse_net_caps_gross_at_price_headroom() {
+        // A bid-heavy book fires momentum positively; price the side at 0.999 so the headroom
+        // (~0.1%) is far below the fused edge. Both the returned gross and the attribution's
+        // net must be capped, with the raw value preserved for calibration analysis.
+        let engine = FusionEngine::new();
+        let snapshot = json!({
+            "bids": [{"price": "0.40", "size": "9000"}],
+            "asks": [{"price": "0.41", "size": "1000"}],
+        });
+        let fee_ctx = FeeContext {
+            taker_fee_rate: Decimal::ZERO,
+            price: dec!(0.999),
+            est_gas_usdc: Decimal::ZERO,
+        };
+        let (gross_uncapped, _) = engine.fuse(&snapshot, &json!({})).unwrap();
+        assert!(gross_uncapped > dec!(0.001), "test premise: momentum fires");
+        let (gross, net, attr) = engine
+            .fuse_net(&snapshot, &json!({}), Some(&fee_ctx), dec!(10))
+            .unwrap();
+        let headroom = dec!(0.001) / dec!(0.999);
+        assert_eq!(gross, headroom);
+        assert_eq!(net, headroom); // zero fees/gas in this fixture
+        assert_eq!(attr["fee_impact"]["headroom_capped"], json!(true));
+        assert_eq!(
+            attr["fee_impact"]["gross_edge_uncapped"],
+            json!(gross_uncapped.to_string())
         );
     }
 

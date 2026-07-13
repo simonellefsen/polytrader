@@ -370,7 +370,12 @@ pub fn simulate_counterfactual(
             continue;
         }
 
-        let gross = fuse_from_attribution(&rep.attribution, &cfg.weights);
+        // Same ceiling clamp as live fuse_net: a positive edge can't exceed the price headroom
+        // (1−p)/p, so replayed counterfactuals don't act on phantom edges either.
+        let gross = crate::strategy::clamp_edge_to_price_headroom(
+            fuse_from_attribution(&rep.attribution, &cfg.weights),
+            rep.target_mid,
+        );
         let net = gross - report_fee(&rep.attribution);
         // win_prob ≈ target_mid + net (same crude estimate as the live DR generator).
         let win_prob = (rep.target_mid + net).min(dec!(0.99)).max(dec!(0.01));
