@@ -245,6 +245,25 @@ pub fn cluster_key(slug: &str) -> &'static str {
     "uncorrelated"
 }
 
+/// Cluster key incorporating Polymarket's own event grouping (2026-07-05 TODO, built 2026-07-12).
+/// The named slug-clusters above still win — they group ACROSS events (every Iran market is one bet
+/// regardless of which Gamma event it lives in). But a slug the classifier doesn't know falls back
+/// to `event:<gamma_event_id>` instead of straight to "uncorrelated": markets sharing an event —
+/// e.g. a rotation-promoted ladder like 6× `gpt-5pt6-released-by-july-N` (one live event currently
+/// holds 26 markets) — resolve off the same underlying question, so the concentration cap must size
+/// the ladder as ONE bet, not 6 independent per-market caps (~$120 on one binary). No slug match
+/// and no event_id → "uncorrelated" (cap N/A), as before.
+pub fn cluster_key_with_event(slug: &str, event_id: Option<&str>) -> String {
+    let named = cluster_key(slug);
+    if named != "uncorrelated" {
+        return named.to_string();
+    }
+    match event_id.map(str::trim) {
+        Some(e) if !e.is_empty() => format!("event:{e}"),
+        _ => "uncorrelated".to_string(),
+    }
+}
+
 /// Portfolio state for risk calculations. In production this is loaded from Postgres by
 /// `RiskManager::load_exposure`; the offline backtest harness constructs it from its simulated
 /// portfolio and feeds it straight to the pure [`RiskManager::gate`].
@@ -254,8 +273,9 @@ pub struct PortfolioExposure {
     pub total_locked: Decimal,
     pub total_pnl: Decimal,
     pub market_locked: Decimal,
-    /// Correlated-cluster key of the candidate market ("uncorrelated" = cap N/A).
-    pub cluster_key: &'static str,
+    /// Correlated-cluster key of the candidate market ("uncorrelated" = cap N/A). Named slug
+    /// cluster or `event:<id>` — see [`cluster_key_with_event`].
+    pub cluster_key: String,
     /// Total collateral already locked across ALL open positions in the candidate's cluster.
     pub cluster_locked: Decimal,
 }
@@ -596,19 +616,20 @@ impl RiskManager {
         .await
         .unwrap_or(Decimal::ZERO);
 
-        // Candidate market's slug → cluster key. If we can't resolve a slug, treat as uncorrelated
-        // (no cluster cap) rather than guessing.
-        let candidate_slug: Option<String> =
-            sqlx::query_scalar("SELECT slug FROM market_data.markets WHERE gamma_id = $1")
+        // Candidate market's slug + Gamma event_id → cluster key (named slug cluster, else
+        // event:<id>, else uncorrelated). If we can't resolve the market at all, treat as
+        // uncorrelated (no cluster cap) rather than guessing.
+        let candidate: Option<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT slug, event_id FROM market_data.markets WHERE gamma_id = $1")
                 .bind(market_id)
                 .fetch_optional(pool)
                 .await
                 .ok()
                 .flatten();
-        let cluster_key = candidate_slug
-            .as_deref()
-            .map(cluster_key)
-            .unwrap_or("uncorrelated");
+        let cluster_key = match &candidate {
+            Some((Some(slug), event_id)) => cluster_key_with_event(slug, event_id.as_deref()),
+            _ => "uncorrelated".to_string(),
+        };
 
         // Sum collateral across every OPEN position whose market shares the candidate's cluster.
         // Done in Rust (the classifier is slug-based) over the open-position rows.
@@ -616,8 +637,8 @@ impl RiskManager {
             // No cross-market aggregation for the catch-all bucket; per-market cap still applies.
             market_locked
         } else {
-            let rows: Vec<(Option<String>, Decimal)> = sqlx::query_as(
-                "SELECT m.slug, p.collateral_locked
+            let rows: Vec<(Option<String>, Option<String>, Decimal)> = sqlx::query_as(
+                "SELECT m.slug, m.event_id, p.collateral_locked
                  FROM paper_trading.paper_positions p
                  JOIN market_data.markets m ON m.gamma_id = p.market_id
                  WHERE p.shares > 0",
@@ -626,12 +647,12 @@ impl RiskManager {
             .await
             .unwrap_or_default();
             rows.into_iter()
-                .filter(|(slug, _)| {
+                .filter(|(slug, event_id, _)| {
                     slug.as_deref()
-                        .map(|s| self::cluster_key(s) == cluster_key)
+                        .map(|s| cluster_key_with_event(s, event_id.as_deref()) == cluster_key)
                         .unwrap_or(false)
                 })
-                .map(|(_, c)| c)
+                .map(|(_, _, c)| c)
                 .sum()
         };
 
@@ -661,7 +682,7 @@ mod gate_tests {
         total_locked: Decimal,
         total_pnl: Decimal,
         market_locked: Decimal,
-        cluster_key: &'static str,
+        cluster_key: &str,
         cluster_locked: Decimal,
     ) -> PortfolioExposure {
         PortfolioExposure {
@@ -669,9 +690,32 @@ mod gate_tests {
             total_locked,
             total_pnl,
             market_locked,
-            cluster_key,
+            cluster_key: cluster_key.to_string(),
             cluster_locked,
         }
+    }
+
+    #[test]
+    fn event_cluster_key_groups_ladders_and_defers_to_named_clusters() {
+        // An unknown slug WITH an event id → event cluster (the ladder-as-one-bet case).
+        assert_eq!(
+            cluster_key_with_event("gpt-5pt6-released-by-july-20", Some("672710")),
+            "event:672710"
+        );
+        // Named slug clusters win even when an event id exists (they group ACROSS events).
+        assert_eq!(
+            cluster_key_with_event("will-iran-close-the-strait-of-hormuz", Some("999")),
+            "iran_geopolitics"
+        );
+        // No slug match and no (or blank) event id → uncorrelated, as before.
+        assert_eq!(
+            cluster_key_with_event("some-obscure-market", None),
+            "uncorrelated"
+        );
+        assert_eq!(
+            cluster_key_with_event("some-obscure-market", Some("  ")),
+            "uncorrelated"
+        );
     }
 
     #[test]

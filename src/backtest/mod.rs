@@ -24,7 +24,7 @@
 
 #![allow(dead_code)]
 
-use crate::risk::{cluster_key, PortfolioExposure, RiskConfig, RiskManager};
+use crate::risk::{cluster_key_with_event, PortfolioExposure, RiskConfig, RiskManager};
 use crate::strategy::fuse_from_attribution;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -139,6 +139,15 @@ struct Position {
     cost: Decimal,
 }
 
+/// Market metadata for cluster classification: slug + Gamma event_id. Mirrors what the live
+/// `RiskManager::load_exposure` reads per market, so [`SimPortfolio::exposure`] classifies with
+/// the same [`cluster_key_with_event`] (named slug cluster, else `event:<id>`, else uncorrelated).
+#[derive(Debug, Clone)]
+pub struct MarketMeta {
+    pub slug: String,
+    pub event_id: Option<String>,
+}
+
 /// In-memory paper portfolio. Accounting mirrors `paper::PaperTradingEngine` +
 /// `settle_resolved_positions` for the fields the gate and settlement care about.
 #[derive(Clone, Debug, Default)]
@@ -248,16 +257,21 @@ impl SimPortfolio {
     }
 
     /// Build the [`PortfolioExposure`] the pure gate expects, mirroring `RiskManager::load_exposure`
-    /// but from sim state. `slug_of` maps gamma_id → slug for cluster classification.
-    fn exposure(&self, market_id: &str, slug_of: &BTreeMap<String, String>) -> PortfolioExposure {
+    /// but from sim state. `slug_of` maps gamma_id → slug + event_id for cluster classification
+    /// (named slug cluster, else event:<id> — same [`cluster_key_with_event`] as live).
+    fn exposure(
+        &self,
+        market_id: &str,
+        slug_of: &BTreeMap<String, MarketMeta>,
+    ) -> PortfolioExposure {
         let total_locked = self.total_locked();
         // total_value (= virtual_usdc + total_locked) == base + realized, mirroring live's
         // (10000 − locked + realized) + locked.
         let virtual_usdc = SIM_BASE_USDC + self.realized - total_locked;
         let ckey = slug_of
             .get(market_id)
-            .map(|s| cluster_key(s))
-            .unwrap_or("uncorrelated");
+            .map(|m| cluster_key_with_event(&m.slug, m.event_id.as_deref()))
+            .unwrap_or_else(|| "uncorrelated".to_string());
         let market_locked = self.market_locked(market_id);
         let cluster_locked = if ckey == "uncorrelated" {
             market_locked
@@ -268,7 +282,9 @@ impl SimPortfolio {
                     p.shares > dec!(0)
                         && slug_of
                             .get(m)
-                            .map(|s| cluster_key(s) == ckey)
+                            .map(|meta| {
+                                cluster_key_with_event(&meta.slug, meta.event_id.as_deref()) == ckey
+                            })
                             .unwrap_or(false)
                 })
                 .map(|(_, p)| p.cost)
@@ -336,7 +352,7 @@ pub struct CounterfactualConfig {
 pub fn simulate_counterfactual(
     reports: &[ReportRow],
     resolutions: &[Resolution],
-    slug_of: &BTreeMap<String, String>,
+    slug_of: &BTreeMap<String, MarketMeta>,
     marks: &Marks,
     cfg: &CounterfactualConfig,
 ) -> SimResult {
@@ -557,7 +573,7 @@ pub struct SweepRow {
 pub fn run_sweep(
     reports: &[ReportRow],
     resolutions: &[Resolution],
-    slug_of: &BTreeMap<String, String>,
+    slug_of: &BTreeMap<String, MarketMeta>,
     marks: &Marks,
     configs: &[(String, CounterfactualConfig)],
 ) -> Vec<SweepRow> {
@@ -837,7 +853,7 @@ pub async fn run(pool: &sqlx::PgPool, args: &[String]) -> anyhow::Result<()> {
 fn run_sweep_report(
     reports: &[ReportRow],
     resolutions: &[Resolution],
-    slug_of: &BTreeMap<String, String>,
+    slug_of: &BTreeMap<String, MarketMeta>,
     marks: &Marks,
     base_weights: &BTreeMap<String, Decimal>,
     base_risk: &RiskConfig,
@@ -1110,14 +1126,22 @@ async fn load_resolutions(pool: &sqlx::PgPool) -> anyhow::Result<Vec<Resolution>
         .collect())
 }
 
-async fn load_slug_map(pool: &sqlx::PgPool) -> anyhow::Result<BTreeMap<String, String>> {
-    let rows: Vec<(String, Option<String>)> =
-        sqlx::query_as("SELECT gamma_id, slug FROM market_data.markets")
+async fn load_slug_map(pool: &sqlx::PgPool) -> anyhow::Result<BTreeMap<String, MarketMeta>> {
+    let rows: Vec<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT gamma_id, slug, event_id FROM market_data.markets")
             .fetch_all(pool)
             .await?;
     Ok(rows
         .into_iter()
-        .filter_map(|(g, s)| Some((g, s?)))
+        .filter_map(|(g, s, e)| {
+            Some((
+                g,
+                MarketMeta {
+                    slug: s?,
+                    event_id: e,
+                },
+            ))
+        })
         .collect())
 }
 
@@ -1343,7 +1367,7 @@ mod tests {
             winning_outcome: "Yes".into(),
             at: None,
         }];
-        let slug_of: BTreeMap<String, String> = BTreeMap::new();
+        let slug_of: BTreeMap<String, MarketMeta> = BTreeMap::new();
 
         // gross = 0.30*0.5 / 0.5 = 0.30 ; net = 0.30 − 0.05 = 0.25 ⇒ clears a 2% gate.
         let mut cfg = CounterfactualConfig {
@@ -1385,7 +1409,7 @@ mod tests {
             winning_outcome: "Yes".into(),
             at: None,
         }];
-        let slug_of: BTreeMap<String, String> = BTreeMap::new();
+        let slug_of: BTreeMap<String, MarketMeta> = BTreeMap::new();
 
         // Equal-and-opposite signals ⇒ gross 0 ⇒ net negative after fee ⇒ no trade.
         let cfg_balanced = CounterfactualConfig {
@@ -1567,7 +1591,7 @@ mod tests {
             winning_outcome: "Yes".into(),
             at: None,
         }];
-        let slug_of: BTreeMap<String, String> = BTreeMap::new();
+        let slug_of: BTreeMap<String, MarketMeta> = BTreeMap::new();
 
         let mk = |edge: Decimal| CounterfactualConfig {
             weights: BTreeMap::new(),

@@ -282,10 +282,17 @@ prediction, is where this system's edge has ever appeared.
   (default 2) requires the flip to persist across N consecutive decision reports. Verified in the
   2026-07-10 diagnostic: the one post-deploy flip exit had a NEGATIVE edge at the two prior cycles,
   only qualified once it held positive (2.05% → 2.10%) for two consecutive reports before firing.
-- [ ] **event_id-based cluster key** (2026-07-05). Rotation ladder promotions (e.g. 6× `gpt-5pt6-released-by-july-N`)
-  are one correlated underlying event, but `risk::cluster_key` drops them in the exempt "uncorrelated"
-  bucket, so up to ~$120 (6 × $20 cap) can concentrate on one binary. Add an event_id-derived cluster
-  key so the concentration cap groups a ladder as one bet. *Low priority at paper scale (~1.2% bankroll).*
+- [x] **event_id-based cluster key** (2026-07-05) → *DONE 2026-07-12. New
+  `cluster_key_with_event(slug, event_id)` in `risk/mod.rs`: the named slug-clusters still win
+  (they group ACROSS events — every Iran market is one bet regardless of event), but an unknown
+  slug now falls back to `event:<gamma_event_id>` instead of straight to "uncorrelated", so a
+  ladder sharing one Gamma event hits the 35% cluster cap as ONE bet. `market_data.markets.event_id`
+  was already synced (1,853/2,031 markets; one live event holds 26 markets). `PortfolioExposure.
+  cluster_key` became `String`; live `load_exposure` reads slug+event_id for the candidate and all
+  open positions; the backtest `SimPortfolio::exposure` classifies via the same fn through a new
+  `MarketMeta` (slug + event_id) map so counterfactuals stay in lockstep. Live book at build time
+  already showed real event concentrations the old key missed: event 591973 = $250/2 positions,
+  event 30615 = $110/4. No slug match + no event_id still → "uncorrelated". 1 new test.*
 - [x] **Signal-calibration `(1−p)` ceiling clamp** (2026-07-05) → *DONE 2026-07-12. New pure
   `clamp_edge_to_price_headroom(edge, price)` in `strategy/mod.rs`: a positive fused edge is capped
   at `(1−p)/p` — the maximum possible return per $1 staked when a share bought at `p` pays out 1
