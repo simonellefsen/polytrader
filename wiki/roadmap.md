@@ -102,14 +102,33 @@ the dated Decision-log entry below; this is the at-a-glance index.
   bounded-by-default fix. Streaming/paginating `load_reports` stays as the escalation if replay
   volume ever outgrows 1Gi; the slim server-side projection (~200B/row) already covers the main
   blowup vector.*
+- [ ] **Dead bootstrap slug spam** (2026-07-13). `will-the-us-announce-withdrawal-from-mou-
+  negotiations-by-july-31-20260622192122521-644` is in `POLYTRADER_BOOTSTRAP_MARKETS` but Gamma
+  returns no market for it even with `closed=true` (renamed/delisted) — it WARN-logs every ingest
+  cycle. Prune it from the env list (confirm it's truly gone, not a transient Gamma hiccup, first).
+  *Cosmetic — log noise only, no trading impact.*
+- [ ] **Per-market scorecard query just over slow threshold** (2026-07-13). The settled-market
+  hit-rate lookup (`row_number() … rn <= 20` over decision_report JSONB for `ANY($1)` markets)
+  clocked ~1.04s (488 rows) — barely past the 1s alert. Runs per dashboard load, uncached. If it
+  creeps up, cache it like the 7d baseline (1h TTL) or add a partial index on
+  `(payload->>'market_id', created_at)` for `event_type='decision_report'`. *Low priority; the big
+  7d-baseline scan is already cached.*
+- [x] **Advisory domination cap** (2026-07-13) → *DONE same day, see CHECKPOINT #5. Extends the
+  advisory-only policy: market-internal signals OWN the direction, advisories only tilt. `fuse_named`
+  now bounds `|advisory numerator| ≤ |market-internal numerator|`. Root cause was news' raw score
+  running 14× momentum's, so its weighted contribution flipped the fused sign in 100% of the 1,028
+  reports where they disagreed — overriding momentum's 91% win rate. Origination now falls out of the
+  same cap (no market direction ⇒ advisory clamped to 0). `FusionOutcome` struct + `advisory_capped`
+  journaling; 133/133 tests.*
 - [x] **Advisory-only opportunities policy** (2026-07-12) → *DONE same day — decided YES, built as
   `fuse_named` in `strategy/mod.rs`: a directional edge requires ≥1 market-internal signal
   (momentum/spike/theta) firing with nonzero score AND confidence; advisory-only firing sets fuse to
   a suppressed 0 with an `advisory_only_policy` attribution note (so Hermes can tell "no signal"
-  from "suppressed"). A market-internal signal reading score 0 (momentum `balanced_book`) does NOT
-  count as firing — the book explicitly says no-edge and an advisory can't overrule it alone. Shared
-  by live fuse and `fuse_from_attribution`, so backtest counterfactuals apply the identical policy
-  and the 07-12 saturation-day reports replay to edge 0. Validation of need: the FIRST post-5ad406f
+  from "suppressed"). **Superseded 2026-07-13 by the advisory domination cap above — origination is
+  now a special case of the magnitude cap.** A market-internal signal reading score 0 (momentum
+  `balanced_book`) does NOT count as firing — the book explicitly says no-edge and an advisory can't
+  overrule it alone. Shared by live fuse and `fuse_from_attribution`, so backtest counterfactuals
+  apply the identical policy and the 07-12 saturation-day reports replay to edge 0. Validation of need: the FIRST post-5ad406f
   DR cycle (20:26 UTC) showed max |net edge| 0.164 — exactly the lone-advisory confidence bound the
   denominator floor leaves through, which this policy now zeroes. Bonus fidelity fix found while
   wiring: the backtest `load_reports` slim projection carried retired `overreaction_fade` but had
@@ -662,6 +681,33 @@ prediction, is where this system's edge has ever appeared.
   exempt "uncorrelated" bucket) — an event_id-based cluster key would close this; at paper scale
   (1.2% of bankroll) it's low priority. Also added `crint-` (cricket international) to the keyword
   prefilter with a regression test.
+
+- **📈 CHECKPOINT #5 + diagnostic — advisory DOMINATION: news flipped the fused direction 100% of
+  the time, overriding our best predictor (2026-07-13, ~19:40 UTC).** Deploy verification first:
+  aaacfde (event-id cluster key) healthy, 0 errors/restarts; realized improved −24.60 → −9.69 as
+  settlements landed; P6 turnover budget + advisory-only suppression both confirmed firing live (39
+  advisory-only reports suppressed in a 40-min window). **The dashboard tell: news_sentiment showed
+  the HIGHEST "avg influence" of any signal (0.72) and read "elevated".** `avg influence` is the mean
+  absolute RAW score when a signal fires (server.rs) — and there the disparity is enormous: momentum
+  averages ~0.05, news ~0.71 (**14×**). The advisory confidence cap (news ~0.22 vs momentum ~0.35)
+  only claws back 1.6×, so news' *weighted* contribution runs ~8× momentum's. **Root-caused with a
+  direct query: in 1,028 of the last-24h reports where momentum and news DISAGREED on direction, the
+  fused sign followed news in 1,028 (100%) and momentum in 0.** So the advisory we explicitly distrust
+  (−1.18 settled P&L) was overriding orderbook_momentum — our single best predictor at **91% settled
+  win rate (32-3)** — on the trade *direction*, every single time they conflicted. Confirmed still
+  live post-deploy (37/37 in a fresh 40-min window). The 2026-07-12 advisory-ONLY policy stopped news
+  from *originating* a trade but did nothing about it *flipping* one once any market-internal signal
+  fired (even a weak momentum at 0.05 satisfies the origination gate while news at 0.71 owns the
+  outcome). **Fix — advisory domination cap in the shared `fuse_named` core:** split the fused
+  numerator into market-internal vs advisory sums and bound `|advisory numerator| ≤ |market-internal
+  numerator|`. Market-internal signals now OWN the direction; an advisory can at most cancel the
+  edge (opposing) or double it (agreeing), never flip the sign. Origination falls out of the same
+  arithmetic (no market-internal direction ⇒ advisory clamped to 0). Attribution records
+  `advisory_only_policy.{suppressed,capped}` so Hermes keeps the signal. Shared by live fuse +
+  backtest replay; `FusionOutcome` struct replaces the old `(Decimal, bool)`; 2 tests rewritten +
+  1 added (133/133). *Expected effect: the directional book stops trading against momentum on news
+  conviction — the highest-leverage correctness fix since the stop-loss widening. Measure realized
+  divergence over the next few days before drawing the P5 conclusion.*
 
 - **📈 CHECKPOINT #4 + diagnostic — fusion saturation bug: a lone advisory fused to a "99.9% edge"
   (2026-07-12, ~20:30 UTC).** Deploy verification first: ebc5ba7 healthy 9h (0 errors, 0 restarts),

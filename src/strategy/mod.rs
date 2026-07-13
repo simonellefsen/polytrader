@@ -393,22 +393,26 @@ impl FusionEngine {
             }
         }
 
-        let (fused, advisory_only_suppressed) = fuse_named(contributions.iter().copied());
-        if advisory_only_suppressed {
-            // Journal WHY the edge is 0 so Hermes/diagnostics can distinguish "no signal" from
-            // "advisory-only impulse suppressed by policy". No score/confidence keys, so replay
-            // paths skip this entry as a non-signal.
+        let outcome = fuse_named(contributions.iter().copied());
+        if outcome.advisory_suppressed || outcome.advisory_capped {
+            // Journal WHY so Hermes/diagnostics can distinguish "no signal" from a policy action.
+            // No score/confidence keys, so replay paths skip this entry as a non-signal.
             attribution.insert(
                 "advisory_only_policy".to_string(),
                 json!({
-                    "suppressed": true,
-                    "note": "directional impulse came only from advisory signals (news/yahoo); requires >=1 market-internal signal (momentum/spike/theta) firing to originate an edge"
+                    "suppressed": outcome.advisory_suppressed,
+                    "capped": outcome.advisory_capped,
+                    "note": if outcome.advisory_suppressed {
+                        "directional impulse came only from advisory signals (news/yahoo); requires >=1 market-internal signal (momentum/spike/theta) firing to originate an edge"
+                    } else {
+                        "advisory signals outweighed the market-internal signals and were scaled down to their magnitude; the market keeps ownership of direction (advisories tilt, never flip)"
+                    }
                 }),
             );
         }
 
         let attr_json = serde_json::Value::Object(attribution);
-        Ok((fused, attr_json))
+        Ok((outcome.fused, attr_json))
     }
 
     /// Extended path exposing **net edge after fees/gas** (the primary signal for the deliberate
@@ -527,38 +531,87 @@ fn is_market_internal(name: &str) -> bool {
     MARKET_INTERNAL_SIGNALS.contains(&name)
 }
 
-/// Named fusion + the advisory-only opportunities policy (2026-07-12, roadmap TODO): a directional
-/// opportunity requires at least one market-internal signal actually firing (nonzero score AND
-/// nonzero confidence). If the entire directional impulse comes from advisories, the fused edge is
-/// suppressed to 0 and the second return value is `true` so callers can journal why.
+/// Result of [`fuse_named`]: the fused edge plus flags describing how the advisory-only policy acted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FusionOutcome {
+    pub fused: Decimal,
+    /// The entire directional impulse was advisory (no market-internal direction), so the edge was
+    /// forced to 0 — an advisory can never ORIGINATE a trade.
+    pub advisory_suppressed: bool,
+    /// Advisories outweighed the market-internal signals and were scaled DOWN to the market-internal
+    /// magnitude — the market keeps ownership of the direction; the advisory only tilted conviction.
+    pub advisory_capped: bool,
+}
+
+/// Named fusion + the advisory-only opportunities policy. Market-internal signals (order book, price
+/// history, time-to-resolution) OWN the directional decision; advisory signals (news, yahoo) may
+/// only TILT it. Two rules, both enforced here so the live [`FusionEngine::fuse`] and the backtest
+/// replay [`fuse_from_attribution`] behave identically:
 ///
-/// Rationale: even with the `max(Σw, 1)` denominator floor in [`fuse_weighted`], a lone advisory
-/// fuses to ~its own confidence (0.17–0.30) — honest, but still enough to clear the 2% min-edge
-/// gate and cheap-band friction floors on stale/off-topic headlines (the "banana art pricing"
-/// class of incident). News/finance context is only evidence FOR a market move when the market
-/// itself shows something; it should tilt sizing/direction, never conjure a trade from nothing.
-/// A market-internal signal present with score 0 (e.g. momentum's `balanced_book`) does NOT count
-/// as firing — the book explicitly says "no edge", and an advisory must not overrule it alone.
+///  1. **Origination** (2026-07-12): a directional edge requires ≥1 market-internal signal actually
+///     firing. If the whole impulse is advisory, the edge is forced to 0 (`advisory_suppressed`).
+///     This killed the "banana art pricing" class where a lone stale headline fused to its own
+///     confidence and cleared the 2% gate on a `balanced_book` market.
 ///
-/// Shared by the live [`FusionEngine::fuse`] and the backtest replay [`fuse_from_attribution`], so
-/// counterfactuals apply the identical policy and stored advisory-only reports auto-correct.
-pub fn fuse_named<'a, I>(signals: I) -> (Decimal, bool)
+///  2. **Domination cap** (2026-07-13): even WITH a market-internal signal firing, advisories were
+///     still flipping the *direction*. Diagnostic #5 found that when momentum and news disagreed,
+///     the fused sign followed news in 1028 of 1028 reports (100%) — because news' raw score
+///     averages ~0.71 vs momentum's ~0.05 (14×), and the advisory confidence cap (~0.22 vs ~0.35)
+///     only claws back 1.6×, so news' weighted contribution runs ~8× momentum's. This overrode our
+///     single best predictor (momentum: 91% settled win rate) every time. The cap bounds the summed
+///     advisory numerator to the summed market-internal numerator in magnitude, so an advisory can
+///     at most cancel the market-internal edge (opposing) or double it (agreeing) — it can never
+///     flip the sign. When the cap bites with the market still owning a direction, `advisory_capped`.
+///
+/// A market-internal signal present with score 0 (momentum's `balanced_book`) contributes nothing to
+/// the market-internal numerator, so it does NOT grant a direction — rule 1 still suppresses.
+pub fn fuse_named<'a, I>(signals: I) -> FusionOutcome
 where
     I: IntoIterator<Item = (&'a str, Decimal, Decimal, Decimal)>,
 {
-    let mut contributions: Vec<(Decimal, Decimal, Decimal)> = Vec::new();
-    let mut internal_fired = false;
+    let mut num_mi = Decimal::ZERO; // Σ score·conf·learned over market-internal signals
+    let mut num_adv = Decimal::ZERO; // …over advisory signals
+    let mut total_weight = Decimal::ZERO; // Σ conf·learned over ALL (the normalizer)
     for (name, score, confidence, learned) in signals {
-        if is_market_internal(name) && score != Decimal::ZERO && confidence > Decimal::ZERO {
-            internal_fired = true;
+        let w = confidence * learned;
+        let contrib = score * w;
+        total_weight += w;
+        if is_market_internal(name) {
+            num_mi += contrib;
+        } else {
+            num_adv += contrib;
         }
-        contributions.push((score, confidence, learned));
     }
-    let fused = fuse_weighted(contributions);
-    if fused != Decimal::ZERO && !internal_fired {
-        (Decimal::ZERO, true)
+    if total_weight <= Decimal::ZERO {
+        return FusionOutcome {
+            fused: Decimal::ZERO,
+            advisory_suppressed: false,
+            advisory_capped: false,
+        };
+    }
+    // Advisories tilt but never own direction: cap |advisory numerator| at |market-internal
+    // numerator|. When there is no market-internal direction (num_mi == 0) this clamps the advisory
+    // contribution to 0, which is exactly rule 1 (origination) falling out of the same arithmetic.
+    let mi_mag = num_mi.abs();
+    let capped = num_adv.abs() > mi_mag;
+    // Only reached when |num_adv| > mi_mag ≥ 0, so num_adv is nonzero here; preserve its sign.
+    let num_adv_eff = if capped {
+        if num_adv.is_sign_negative() {
+            -mi_mag
+        } else {
+            mi_mag
+        }
     } else {
-        (fused, false)
+        num_adv
+    };
+    let fused = (num_mi + num_adv_eff) / total_weight.max(Decimal::ONE);
+    // Distinguish the two policy actions for journaling: a fully-suppressed advisory impulse (no
+    // market direction at all) vs. an advisory that was merely scaled down under a real direction.
+    let advisory_suppressed = num_mi == Decimal::ZERO && num_adv != Decimal::ZERO;
+    FusionOutcome {
+        fused,
+        advisory_suppressed,
+        advisory_capped: capped && !advisory_suppressed,
     }
 }
 
@@ -648,7 +701,7 @@ pub fn fuse_from_attribution(
     }
     // fuse_named applies the advisory-only policy identically to the live path, so replayed
     // advisory-only reports (e.g. the 2026-07-12 saturation-day batch) auto-correct to edge 0.
-    fuse_named(contributions).0
+    fuse_named(contributions).fused
 }
 
 impl Default for FusionEngine {
@@ -867,12 +920,13 @@ mod processor_tests {
     #[test]
     fn advisory_only_set_cannot_originate_directional_edge() {
         // The 2026-07-12 policy: news/yahoo alone — even both agreeing — fuse to a suppressed 0.
-        let (fused, suppressed) = fuse_named(vec![
+        let out = fuse_named(vec![
             ("news_sentiment", dec!(0.8), dec!(0.30), dec!(1.0)),
             ("yahoo_finance", dec!(0.5), dec!(0.25), dec!(1.0)),
         ]);
-        assert_eq!(fused, Decimal::ZERO);
-        assert!(suppressed);
+        assert_eq!(out.fused, Decimal::ZERO);
+        assert!(out.advisory_suppressed);
+        assert!(!out.advisory_capped);
 
         // Same via the replay path: a stored advisory-only report auto-corrects to edge 0.
         let attr = json!({
@@ -887,18 +941,45 @@ mod processor_tests {
     }
 
     #[test]
-    fn market_internal_firing_lets_advisories_adjust() {
-        // Momentum fires ⇒ the advisory contributes normally (policy is presence-gated, not a veto).
+    fn advisory_within_market_internal_magnitude_adjusts_freely() {
+        // An advisory whose contribution is SMALLER than the market-internal numerator tilts the
+        // edge normally — identical to the plain weighted average (no cap bites). momentum contrib
+        // = 0.30·0.5 = 0.15 ; news contrib = -0.10·0.4 = -0.04 (|.| < 0.15).
         let signals = vec![
-            ("orderbook_momentum", dec!(0.10), dec!(0.5), dec!(1.0)),
-            ("news_sentiment", dec!(-0.20), dec!(0.4), dec!(2.0)),
+            ("orderbook_momentum", dec!(0.30), dec!(0.5), dec!(1.0)),
+            ("news_sentiment", dec!(-0.10), dec!(0.4), dec!(1.0)),
         ];
-        let (fused, suppressed) = fuse_named(signals.clone());
-        assert!(!suppressed);
+        let out = fuse_named(signals.clone());
+        assert!(!out.advisory_suppressed && !out.advisory_capped);
         assert_eq!(
-            fused,
+            out.fused,
             fuse_weighted(signals.into_iter().map(|(_, s, c, w)| (s, c, w)))
         );
+    }
+
+    #[test]
+    fn advisory_cannot_flip_direction_against_market_internal() {
+        // Diagnostic #5 (2026-07-13): weak-but-accurate momentum vs a much larger opposing news
+        // score. News' contribution (0.71·0.22 ≈ 0.156) dwarfs momentum's (0.05·0.35 ≈ 0.0175) and,
+        // unclamped, flips the fused sign negative (news' direction) — which the 100%-follow-news
+        // data showed. The cap scales news to momentum's magnitude, so they cancel to a neutral 0
+        // (never news' direction), and advisory_capped is set for Hermes.
+        let out = fuse_named(vec![
+            ("orderbook_momentum", dec!(0.05), dec!(0.35), dec!(1.0)), // num_mi = +0.0175
+            ("news_sentiment", dec!(-0.71), dec!(0.22), dec!(1.0)), // num_adv = -0.1562 → -0.0175
+        ]);
+        assert_eq!(out.fused, Decimal::ZERO);
+        assert!(out.advisory_capped);
+        assert!(!out.advisory_suppressed);
+
+        // An AGREEING advisory can amplify, but only up to 2× the market-internal numerator.
+        let out = fuse_named(vec![
+            ("orderbook_momentum", dec!(0.05), dec!(0.35), dec!(1.0)), // num_mi = +0.0175, w=0.35
+            ("news_sentiment", dec!(0.71), dec!(0.22), dec!(1.0)),     // num_adv +0.1562 → +0.0175
+        ]);
+        // (0.0175 + 0.0175) / max(0.57, 1) = 0.035
+        assert_eq!(out.fused, dec!(0.035));
+        assert!(out.advisory_capped);
     }
 
     #[test]
@@ -906,37 +987,39 @@ mod processor_tests {
         // Momentum present but score 0 ("balanced_book") = the market explicitly reads no-edge;
         // an advisory must not overrule it alone. A zero-CONFIDENCE internal reading is equally
         // non-firing (contributes no weight at all).
-        let (fused, suppressed) = fuse_named(vec![
+        let out = fuse_named(vec![
             ("orderbook_momentum", Decimal::ZERO, dec!(0.5), dec!(1.0)),
             ("news_sentiment", dec!(0.6), dec!(0.30), dec!(1.0)),
         ]);
-        assert_eq!(fused, Decimal::ZERO);
-        assert!(suppressed);
+        assert_eq!(out.fused, Decimal::ZERO);
+        assert!(out.advisory_suppressed);
 
-        let (fused, suppressed) = fuse_named(vec![
+        let out = fuse_named(vec![
             ("theta_convergence", dec!(0.4), Decimal::ZERO, dec!(1.0)),
             ("news_sentiment", dec!(0.6), dec!(0.30), dec!(1.0)),
         ]);
-        assert_eq!(fused, Decimal::ZERO);
-        assert!(suppressed);
+        assert_eq!(out.fused, Decimal::ZERO);
+        assert!(out.advisory_suppressed);
 
         // But an all-zero fusion result is plain "no signal", not a policy suppression.
-        let (fused, suppressed) = fuse_named(vec![(
+        let out = fuse_named(vec![(
             "news_sentiment",
             Decimal::ZERO,
             dec!(0.30),
             dec!(1.0),
         )]);
-        assert_eq!(fused, Decimal::ZERO);
-        assert!(!suppressed);
+        assert_eq!(out.fused, Decimal::ZERO);
+        assert!(!out.advisory_suppressed && !out.advisory_capped);
     }
 
     #[test]
     fn fuse_from_attribution_skips_nonsignals_and_applies_candidate_weights() {
         // A realistic attribution map: two signals plus the non-signal book-keeping entries that
-        // fuse_net adds. Only the two signals should drive the result.
+        // fuse_net adds. Only the two signals drive the result. Momentum dominates the numerator so
+        // the advisory stays within bounds (no domination cap) and the candidate weight is what
+        // moves the fused value — the harness's whole point.
         let attr = json!({
-            "orderbook_momentum": {"score": "0.10", "confidence": "0.5"},
+            "orderbook_momentum": {"score": "0.40", "confidence": "0.5"},   // num_mi = 0.20
             "news_sentiment": {"score": "-0.20", "confidence": "0.4"},
             "spike_divergence": {"error": "boom"},          // skipped (no score/confidence)
             "fee_impact": {"gross_edge": "0.01"},            // skipped
@@ -944,13 +1027,14 @@ mod processor_tests {
         });
         let mut weights = BTreeMap::new();
         weights.insert("orderbook_momentum".to_string(), dec!(1.0));
-        weights.insert("news_sentiment".to_string(), dec!(2.0));
-        // momentum: w=0.5 contrib 0.05 ; news: w=0.4·2=0.8 contrib -0.16 ; same as the manual case.
-        let expected = dec!(-0.11) / dec!(1.3);
+        weights.insert("news_sentiment".to_string(), dec!(1.0));
+        // momentum contrib 0.20 ; news contrib -0.20·0.4 = -0.08 (|.| < 0.20, uncapped).
+        // fused = (0.20 - 0.08) / max(0.9, 1) = 0.12.
+        let expected = dec!(0.12);
         assert_eq!(fuse_from_attribution(&attr, &weights), expected);
 
         // Changing a candidate weight changes the fused edge (the harness's whole point).
-        weights.insert("news_sentiment".to_string(), dec!(0.5));
+        weights.insert("news_sentiment".to_string(), dec!(2.0));
         assert_ne!(fuse_from_attribution(&attr, &weights), expected);
     }
 
