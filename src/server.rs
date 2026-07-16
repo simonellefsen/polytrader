@@ -1222,6 +1222,17 @@ fn health_7d_baseline_cache(
     C.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// Per-signal 24h/3h scorecard aggregate cache: (24h report total, 3h report total, per-attribution-
+/// key rows of (name, fired_24h, avg_abs_score_24h, fired_3h)). Same rationale as the 7d baseline
+/// cache — the full-day JSONB scan must not run on every 5-min dashboard poll. 300s TTL.
+type ScorecardAgg = (i64, i64, Vec<(String, i64, Decimal, i64)>);
+#[allow(clippy::type_complexity)]
+fn scorecard_agg_cache() -> &'static std::sync::Mutex<Option<(std::time::Instant, ScorecardAgg)>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, ScorecardAgg)>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 /// JSON backing the /trades visualization: portfolio summary, open positions with live unrealized
 /// P&L (current mid vs avg entry), and the recent autonomous execution feed. Read-only, paper-only.
 async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1646,26 +1657,72 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
         "yahoo_finance",
         "news_sentiment",
     ];
-    let dr_attrs: Vec<serde_json::Value> = sqlx::query_scalar(
-        "SELECT payload->'report'->'attribution' FROM journal.events
-         WHERE event_type = 'decision_report' AND created_at > now() - interval '24 hours'
-         ORDER BY created_at DESC LIMIT 3000",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-    let reports_total = dr_attrs.len();
-    // Recent sub-window (last 3h) for per-signal health: a fire-rate that collapses vs the 24h baseline
-    // flags a silently-degrading signal (e.g. a stale news feed) without manual eyeballing across checks.
-    let recent_attrs: Vec<serde_json::Value> = sqlx::query_scalar(
-        "SELECT payload->'report'->'attribution' FROM journal.events
-         WHERE event_type = 'decision_report' AND created_at > now() - interval '3 hours'
-         ORDER BY created_at DESC LIMIT 1000",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-    let recent_total = recent_attrs.len();
+    // 24h + 3h fire-rate/influence aggregates, computed SERVER-SIDE (2026-07-15). The old code
+    // pulled the most recent 3,000 attribution blobs and looped in Rust — fine when a day held
+    // <3,000 reports, but DR volume grew to ~11,000/day, silently shrinking the "LAST 24H"
+    // scorecard to ~6.3 hours. That mislabeled window showed spike_divergence as "0% (0)" while it
+    // had actually fired 40× in the true 24h — a healthy signal one diagnostic away from being
+    // debugged as dead. SQL aggregation over the full window costs no Rust memory; a 300s cache
+    // keeps the JSONB scan off the 5-min dashboard poll path (same pattern as the 7d baseline).
+    let (reports_total_i64, recent_total_i64, per_signal_agg) = {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(300);
+        let cache = scorecard_agg_cache();
+        let cached = cache.lock().ok().and_then(|g| {
+            g.as_ref()
+                .filter(|(t, _)| t.elapsed() < TTL)
+                .map(|(_, v)| v.clone())
+        });
+        if let Some(v) = cached {
+            v
+        } else {
+            let totals: Option<(i64, i64)> = sqlx::query_as(
+                "SELECT count(*)::bigint,
+                        count(*) FILTER (WHERE created_at > now() - interval '3 hours')::bigint
+                 FROM journal.events
+                 WHERE event_type = 'decision_report' AND created_at > now() - interval '24 hours'",
+            )
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+            // Per attribution KEY: fired count (nonzero score, digit-regex — mirrors the 7d
+            // baseline's cast-free check), avg |score| when fired (numeric-shape guard before the
+            // cast so a stray non-numeric string can't error the whole scan), and 3h fired count.
+            // Non-signal keys (fee_impact, advisory_only_policy, …) have no 'score' → NULL → false.
+            let rows: Vec<(String, i64, Decimal, i64)> = sqlx::query_as(
+                r#"SELECT e.key,
+                          count(*) FILTER (WHERE e.value->>'score' ~ '[1-9]')::bigint,
+                          COALESCE(avg(abs((e.value->>'score')::numeric))
+                                   FILTER (WHERE e.value->>'score' ~ '^-?[0-9]+(\.[0-9]+)?$'
+                                             AND e.value->>'score' ~ '[1-9]'), 0),
+                          count(*) FILTER (WHERE e.value->>'score' ~ '[1-9]'
+                                             AND s.created_at > now() - interval '3 hours')::bigint
+                   FROM (SELECT created_at, payload->'report'->'attribution' AS a
+                         FROM journal.events
+                         WHERE event_type = 'decision_report'
+                           AND created_at > now() - interval '24 hours') s,
+                        LATERAL jsonb_each(s.a) e
+                   GROUP BY e.key"#,
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            let v = (
+                totals.map(|(t, _)| t).unwrap_or(0),
+                totals.map(|(_, r)| r).unwrap_or(0),
+                rows,
+            );
+            // Only cache a real (successful) computation, not a DB-error fallback.
+            if totals.is_some() {
+                if let Ok(mut g) = cache.lock() {
+                    *g = Some((std::time::Instant::now(), v.clone()));
+                }
+            }
+            v
+        }
+    };
+    let reports_total = reports_total_i64 as usize;
+    let recent_total = recent_total_i64 as usize;
     // Long baseline (7d) per-signal fire-rate — a SLIM count-only aggregate (no payloads pulled into
     // memory) so multi-day GRADUAL decay is caught too. The 3h-vs-24h check only sees SUDDEN shifts: when
     // a signal erodes slowly the 24h baseline erodes with it, so the recent/baseline ratio stays ~1 and
@@ -1836,44 +1893,20 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
         .iter()
         .enumerate()
         .map(|(idx, name)| {
-            let mut fired = 0usize;
-            let mut abs_sum = Decimal::ZERO;
-            for attr in &dr_attrs {
-                if let Some(score) = attr
-                    .pointer(&format!("/{name}/score"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<Decimal>().ok())
-                {
-                    if !score.is_zero() {
-                        fired += 1;
-                        abs_sum += score.abs();
-                    }
-                }
-            }
+            // Per-signal numbers from the cached full-window SQL aggregate (true 24h/3h — see the
+            // scorecard_agg_cache comment for the LIMIT-3000 window-shrink bug this replaced).
+            let (fired, avg_abs_score, recent_fired) = per_signal_agg
+                .iter()
+                .find(|(k, _, _, _)| k == name)
+                .map(|(_, f24, avg, f3)| (*f24 as usize, avg.round_dp(3), *f3 as usize))
+                .unwrap_or((0, Decimal::ZERO, 0));
             let fire_rate = if reports_total > 0 {
                 (Decimal::from(fired) / Decimal::from(reports_total) * Decimal::from(100))
                     .round_dp(1)
             } else {
                 Decimal::ZERO
             };
-            let avg_abs_score = if fired > 0 {
-                (abs_sum / Decimal::from(fired)).round_dp(3)
-            } else {
-                Decimal::ZERO
-            };
             // Recent-window (3h) fire-rate + health classification vs the 24h baseline.
-            let mut recent_fired = 0usize;
-            for attr in &recent_attrs {
-                if let Some(score) = attr
-                    .pointer(&format!("/{name}/score"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<Decimal>().ok())
-                {
-                    if !score.is_zero() {
-                        recent_fired += 1;
-                    }
-                }
-            }
             let recent_fire_rate = if recent_total > 0 {
                 (Decimal::from(recent_fired) / Decimal::from(recent_total) * Decimal::from(100))
                     .round_dp(1)

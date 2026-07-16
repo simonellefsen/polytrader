@@ -1377,13 +1377,17 @@ async fn settle_resolved_positions(
         tracing::info!(market = %market_id, outcome = %outcome, won, pnl = %pnl, "paper position settled to realized P&L");
     }
 
-    // Recompute the portfolio snapshot with the updated cumulative realized P&L.
-    let prev_realized: rust_decimal::Decimal = sqlx::query_scalar(
-        "SELECT realized_pnl FROM paper_trading.virtual_portfolio_snapshots ORDER BY as_of DESC LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await?
-    .unwrap_or(dec!(0));
+    // Recompute the portfolio snapshot with the updated cumulative realized P&L. Unrealized is
+    // carried forward from the latest snapshot (2026-07-15 — was hardcoded 0, spiking the P&L
+    // chart toward realized-only at every settlement; the next 5-min mark_to_market recomputes it
+    // live, so the carry is stale by at most one cycle).
+    let (prev_realized, prev_unrealized): (rust_decimal::Decimal, rust_decimal::Decimal) =
+        sqlx::query_as(
+            "SELECT realized_pnl, unrealized_pnl FROM paper_trading.virtual_portfolio_snapshots ORDER BY as_of DESC LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await?
+        .unwrap_or((dec!(0), dec!(0)));
     let new_realized = prev_realized + realized_delta;
     let locked: rust_decimal::Decimal = sqlx::query_scalar(
         "SELECT COALESCE(SUM(collateral_locked), 0) FROM paper_trading.paper_positions WHERE shares > 0",
@@ -1391,19 +1395,28 @@ async fn settle_resolved_positions(
     .fetch_one(pool)
     .await
     .unwrap_or(dec!(0));
-    let fees: rust_decimal::Decimal =
-        sqlx::query_scalar("SELECT COALESCE(SUM(fee), 0) FROM paper_trading.paper_fills")
-            .fetch_one(pool)
-            .await
-            .unwrap_or(dec!(0));
+    // Fees SINCE THE LAST PAPER RESET only (2026-07-15): this writer was the last one still
+    // summing LIFETIME fees — every settlement snapshot transiently re-subtracted pre-reset fees
+    // from the $10k seed until the next mark_to_market corrected it. Same reset-boundary rule as
+    // write_mark_to_market_snapshot and the engine's post-fill path (see their comments).
+    let fees: rust_decimal::Decimal = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(fee), 0) FROM paper_trading.paper_fills
+         WHERE created_at >= COALESCE(
+           (SELECT max(as_of) FROM paper_trading.virtual_portfolio_snapshots
+            WHERE snapshot_reason = 'manual_paper_reset'), '-infinity'::timestamptz)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(dec!(0));
     let new_usdc = (dec!(10000) - locked - fees + new_realized).max(dec!(0));
     sqlx::query(
         "INSERT INTO paper_trading.virtual_portfolio_snapshots
          (as_of, virtual_usdc, total_locked, unrealized_pnl, realized_pnl, snapshot_reason, positions)
-         VALUES (now(), $1, $2, 0, $3, 'settlement', '[]'::jsonb)",
+         VALUES (now(), $1, $2, $3, $4, 'settlement', '[]'::jsonb)",
     )
     .bind(new_usdc)
     .bind(locked)
+    .bind(prev_unrealized)
     .bind(new_realized)
     .execute(pool)
     .await?;

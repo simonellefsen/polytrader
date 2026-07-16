@@ -102,6 +102,12 @@ the dated Decision-log entry below; this is the at-a-glance index.
   bounded-by-default fix. Streaming/paginating `load_reports` stays as the escalation if replay
   volume ever outgrows 1Gi; the slim server-side projection (~200B/row) already covers the main
   blowup vector.*
+- [ ] **Scorecard "avg influence" is pre-cap raw score** (2026-07-14). The dashboard column that
+  correctly triggered diagnostic #5 (news at 0.72–0.85, "elevated") now OVERSTATES news' real
+  influence: since the domination cap, its fused contribution is bounded by the market-internal
+  numerator, but the metric still averages raw |score|. Add a post-cap contribution column (or
+  rename the current one "raw score") so the alarm doesn't re-fire on already-fixed behavior.
+  *Display-only; see CHECKPOINT #6.*
 - [ ] **Dead bootstrap slug spam** (2026-07-13). `will-the-us-announce-withdrawal-from-mou-
   negotiations-by-july-31-20260622192122521-644` is in `POLYTRADER_BOOTSTRAP_MARKETS` but Gamma
   returns no market for it even with `closed=true` (renamed/delisted) — it WARN-logs every ingest
@@ -681,6 +687,88 @@ prediction, is where this system's edge has ever appeared.
   exempt "uncorrelated" bucket) — an event_id-based cluster key would close this; at paper scale
   (1.2% of bankroll) it's low priority. Also added `crint-` (cricket international) to the keyword
   prefilter with a regression test.
+
+- **📈 CHECKPOINT #9 — quiet and correct: realized climbs to +$10.49 (2026-07-16, ~06:00 UTC).**
+  d31274c healthy (0 errors/restarts). One event since #8: **England World-Cup No settled won
+  +$6.01** (00:16) — the basket's second realizing leg (France +14.17, England +6.01). Ledger ties
+  out to the cent: 4.48 + 6.01 = 10.49 ✓. No fills, no exits — the honest-edge regime remains
+  self-limiting (momentum settled record now 34-3, 92%; theta 21-3). Both open directional watch
+  trades are converging AS THESIZED: MOU No @ 0.944 → marked 0.964 (+0.39, resolves by Jul 17),
+  WTI-110 No @ 0.958 → 0.973 (+0.29). The World-Cup final is Spain vs Argentina — the two
+  remaining No legs resolve together at the final (~Jul 19): one pays 36×$1, the other expires;
+  judge the basket's TOTAL (across all its legs incl. the two realized wins) then, not the
+  mark-to-market of individual legs now. NOTE: the checkpoint-#8 fixes (snapshot unrealized
+  carry-forward, settlement fee reset-filter, true-24h scorecard) are still uncommitted/undeployed
+  — the dashboard's remaining green spikes and "3000 reports" header are the KNOWN, already-fixed
+  bugs awaiting rollout, not new findings.
+
+- **📈 CHECKPOINT #8 + diagnostic — two observability bugs root-caused: the green-spike chart
+  artifact (snapshots hardcoding unrealized=0) and a scorecard whose "24h" had silently shrunk to
+  ~6.3h (2026-07-15, ~22:00 UTC).** Health: 0 errors/restarts; realized unchanged (+4.48);
+  activity since #7 = 1 directional fill (WTI-110 No, $19.35) + a 5-leg Fed-rates negrisk basket
+  (~$250, the P3 executor's biggest). **Finding 1 — the recurring green spikes are NOT
+  "leg-settlement timing":** the five 1D-chart spikes timestamp-match the day's five
+  `post_fill_tx`/`settlement` snapshots exactly, and both writers HARDCODED `unrealized_pnl = 0`
+  (engine.rs post-fill tx; main.rs settlement pass — `write_mark_to_market_snapshot`'s own comment
+  even acknowledged it). Every fill/settlement wrote a one-point unrealized=0 row and the chart
+  spiked to realized-only. Fixed: both writers now carry forward the latest snapshot's unrealized
+  (stale ≤1 mark-to-market cycle = 5 min). The checkpoint-#2 "±$110 leg-settlement spike" was this
+  same bug. Bonus found in the settlement writer: its fee sum still used LIFETIME fills (no
+  reset-boundary filter — the exact $10k-seed re-subtraction bug fixed elsewhere on 07-03); now
+  reset-filtered like the other two writers. **Finding 2 — spike_divergence "0% (0)" was the
+  scorecard lying, not the signal dying:** DR volume grew to ~11,360/day but the scorecard pulled
+  `LIMIT 3000` most-recent blobs, silently shrinking the "LAST 24H" label to ~6.3h (also explains
+  the fire-rate wobble across checkpoints). True 24h: spike fired 38× (momentum 8,819 / news 4,016 /
+  theta 1,606 / yahoo 558); its 3h quiet is real market quiet. Fixed: per-signal fire counts +
+  avg-|score| now computed server-side over the true windows (LATERAL `jsonb_each` aggregate,
+  ~0.9s, 300s cache — same pattern as the 7d baseline; no payload blobs into Rust). Validated
+  against live DB. 133/133 tests. *Both were observability bugs — the trading path was untouched
+  and behaved correctly throughout.*
+
+- **📈 CHECKPOINT #7 + diagnostic — REALIZED FLIPS POSITIVE (+$4.48) and the first fill under the
+  domination cap is a one-trade showcase of the whole stack (2026-07-15, ~07:00 UTC).** d31274c
+  healthy 35h, 0 errors/restarts. Exactly two events since checkpoint #6, both good: (1) **France
+  World-Cup No settled WON +$14.17** (a P3 negrisk basket leg), flipping realized P&L positive for
+  the first time since the 07-04 reset (−9.69 → **+4.48**). (2) **The first directional entry taken
+  under the new regime** (market 2853039, `…mou-negotiations-by-july-17` No @ 0.941, 01:59 UTC,
+  $10): its attribution shows every fix of the last 72h in one trade — **theta drove it**
+  (market-internal contribution ≈0.067), momentum agreed (+0.0097), **news amplified within its
+  bound** (≈0.026 < 0.067 → correctly NOT capped), the **price-headroom clamp bit** (raw fused
+  9.62% → 6.27% = (1−0.941)/0.941, `headroom_capped:true` with the uncapped value preserved), and
+  the net 6.17% cleared the 3.21% high-band friction floor honestly. Fee-free geopolitics, 2.9d to
+  resolution — settles this week and is a direct test of the theta+cap regime. **Unrealized −20.86
+  fully decomposed, none of it new damage:** −14.29 Spain-WC No is the HEDGED sibling of the France
+  leg that just realized +14.17 (basket resolves ~Jul 19; if Spain wins, every other No leg pays);
+  −9.14 Hormuz-traffic + −7.69 SBF-pardon are bounded pre-P1 dead longshots awaiting resolution;
+  −5.56 the known untitled-market. The 1D chart's two transient green spikes are the known
+  leg-settlement/mark-timing artifact (checkpoint #2 class). Gate sim: lenient +5.89 vs strict
+  −0.85 — the gap is entirely unrealized marks (settled: +15.31 vs +14.58, stable). Turnover
+  budget: never bitten (1 fill/38h — the honest-edge regime self-limits far below 6/day). *Watch:
+  2853039 settles by ~Jul 18, the World-Cup basket by ~Jul 19 — the next diagnostic should judge
+  the realized outcomes of both.*
+
+- **📈 CHECKPOINT #6 + diagnostic — first clean day under the full defense stack: zero friction
+  paid, midnight news reset passed, zero-fill day fully explained (2026-07-14, ~17:00 UTC).**
+  d31274c (advisory domination cap) healthy 21h: 0 errors, 0 restarts. **The standing watch item
+  CLOSED: the midnight-UTC news quota reset produced ZERO exits and no mass flip** (vs 7 exits/
+  −$10.4 on 07-12) — cooldown + direction awareness + relevance filter + fusion floor + domination
+  cap all held. The relevance filter logged 100 off-topic drop events in 24h, including whole
+  queries where EVERY article was off-topic ("wti dip july" → kept 0). **Cap telemetry: 2,196 of
+  9,040 DRs (24%) advisory-capped, 514 suppressed.** The striking headline is what DIDN'T happen:
+  **zero fills, zero exits, zero settlements in 21h — realized unchanged (−9.69), unrealized
+  recovered −4.62 → +0.98.** Decomposed the zero-fill day completely and every skip is correct:
+  (a) the high-edge DRs ≥2% live on already-positioned markets (one-per-market), one cooldown
+  market, and non-curated discovery markets that are arb-only by design (701554 at 6.2% — not
+  tradeable directionally, correctly ignored); (b) the 41 gate rejections were honest edges at
+  1.3–1.7% below the 2% min, plus 2.0% edges killed by the 3.21% friction floor at price 0.97.
+  Post-cap, the fake-edge supply is gone and genuinely-clearing edges on tradeable markets are
+  scarce — the system is DISCIPLINED, not broken; it paid $0 in friction while the book drifted
+  +$5.60. Gate sim: lenient total P&L +12.96 now BEATS strict +7.22 (both improved). One display
+  artifact noted for the backlog: the scorecard's "avg influence" (raw |score|) still shows news at
+  0.845/"elevated", overstating its actual post-cap fused contribution — rename or add a post-cap
+  contribution column so the dashboard doesn't re-trigger this alarm. *Verdict: the measurement
+  window for the P5 decision has properly begun — this is the first day the directional book's
+  losses were structurally impossible rather than merely absent.*
 
 - **📈 CHECKPOINT #5 + diagnostic — advisory DOMINATION: news flipped the fused direction 100% of
   the time, overriding our best predictor (2026-07-13, ~19:40 UTC).** Deploy verification first:

@@ -190,23 +190,28 @@ impl PaperTradingEngine {
         .await?;
         // Carry forward cumulative realized P&L from settlements (do NOT reset to 0 on each fill,
         // else a fill after a settlement would wipe realized P&L — the input the "proven" gate needs),
-        // plus any P&L this order just realized by selling at market (autonomous exits).
-        let realized_agg: Decimal = sqlx::query_scalar::<_, Decimal>(
-            "SELECT realized_pnl FROM paper_trading.virtual_portfolio_snapshots ORDER BY as_of DESC LIMIT 1",
+        // plus any P&L this order just realized by selling at market (autonomous exits). Unrealized
+        // is carried forward too (2026-07-15): this snapshot used to hardcode unrealized_pnl = 0,
+        // which made the /trades P&L chart spike toward realized-only for one point at EVERY fill
+        // and settlement (five green spikes in one day once the arb executor got busy). Stale by at
+        // most one 5-min cycle until the next mark_to_market snapshot recomputes it live.
+        let (last_realized, last_unrealized): (Decimal, Decimal) = sqlx::query_as(
+            "SELECT realized_pnl, unrealized_pnl FROM paper_trading.virtual_portfolio_snapshots ORDER BY as_of DESC LIMIT 1",
         )
         .fetch_optional(&mut *tx)
         .await?
-        .unwrap_or(dec!(0))
-            + realized_delta;
+        .unwrap_or((dec!(0), dec!(0)));
+        let realized_agg = last_realized + realized_delta;
         // Cash identity: seed − open cost basis − fees + realized P&L (settlements + market exits).
         let new_usdc = (Decimal::from(10000u64) - total_locked_agg - total_fees_agg + realized_agg)
             .max(dec!(0));
         sqlx::query(
             r#"INSERT INTO paper_trading.virtual_portfolio_snapshots (as_of, virtual_usdc, total_locked, unrealized_pnl, realized_pnl, snapshot_reason, positions)
-               VALUES (now(), $1, $2, 0, $3, 'post_fill_tx', '[]'::jsonb)"#,
+               VALUES (now(), $1, $2, $3, $4, 'post_fill_tx', '[]'::jsonb)"#,
         )
         .bind(new_usdc)
         .bind(total_locked_agg)
+        .bind(last_unrealized)
         .bind(realized_agg)
         .execute(&mut *tx)
         .await?;
