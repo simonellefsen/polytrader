@@ -688,6 +688,36 @@ prediction, is where this system's edge has ever appeared.
   (1.2% of bankroll) it's low priority. Also added `crint-` (cricket international) to the keyword
   prefilter with a regression test.
 
+- **📈 CHECKPOINT #11 — realized +$32.16 and the P&L curve holds green; the Musk-ladder basket
+  pays +$15.40 (2026-07-17, ~20:20 UTC).** 29b72f0 healthy (0 errors/restarts). Three event
+  classes since #10, all healthy: (1) **Elon-Musk tweet-count ladder settled** 18:14–18:24 — the
+  count landed in the 160-179 bucket (that No lost −14.15), the other three Nos paid (+24.77,
+  +4.60, +0.18) → event net **+$15.40** for the P3 negrisk executor. (2) **First take-profit exit
+  in the new regime: +$4.25** on the long-carried untitled-market No (was −5.56 mark two days
+  ago — the TP evaluator caught the recovery). (3) One new directional fill (Fed
+  decide-differently No, 3.45% net edge). **Ledger forensics:** the dashboard's +41.53 was a
+  MID-WAVE read at 18:19 — after the +24.77 leg but before the 18:24 batch (net −9.37); the true
+  post-wave realized is 12.51 + 15.40 + 4.25 = **+32.16 ✓ exact**. The −74 chart dip is the
+  resolution moment where to-be-settled legs' marks die before settlement credits (one 5-min
+  point, self-corrects; distinct from the FIXED zero-write bug — this one is real mark mechanics
+  during resolution). MOU No marked 0.995 (deadline passed, no announcement — awaiting UMA
+  resolution, will settle ≈+1.13); WTI-110 marked 0.947. **Trajectory since the domination cap
+  deployed (07-13): realized −9.69 → +32.16 (+$41.85 in 4 days).** Gate sim lenient +15.17 vs
+  strict +6.66 (12·12w). Third consecutive diagnostic with zero trading-path findings.
+
+- **📈 CHECKPOINT #10 — both #8 fixes PROVEN live; realized +$12.51 (2026-07-16, ~20:15 UTC).**
+  29b72f0 deployed 04:13 UTC, healthy 16h (0 errors/restarts). **Fix proof 1:** the dashboard
+  scorecard now reads the TRUE window — "11360 REPORTS · LAST 24H" (was the shrunken "3000") and
+  spike_divergence shows its real 22 fires/`ok` instead of a false 0%. **Fix proof 2:** the
+  06:26:17 settlement (`mojtaba-khamenei-seen-in-public-by-july-15` No, won **+$2.02** — an older
+  Iran-cluster position; also news_sentiment's first settled credit, 1-0) wrote its snapshot with
+  unrealized **−20.07 carried forward** instead of the old hardcoded 0 — and the 1D chart shows NO
+  green spike at that moment (the window's one remaining spike is the pre-deploy England
+  settlement). Ledger ties: 10.49 + 2.02 = 12.51 ✓. Momentum settled record 35-3 (92%). Watch
+  trades converging as thesized: MOU No @ 0.944 → 0.978 (deadline Jul 17), WTI-110 No @ 0.958 →
+  0.979. Gate sim: lenient +14.19 vs strict +3.79 (12·12w settled on lenient). Second consecutive
+  diagnostic with zero trading-path findings.
+
 - **📈 CHECKPOINT #9 — quiet and correct: realized climbs to +$10.49 (2026-07-16, ~06:00 UTC).**
   d31274c healthy (0 errors/restarts). One event since #8: **England World-Cup No settled won
   +$6.01** (00:16) — the basket's second realizing leg (France +14.17, England +6.01). Ledger ties
