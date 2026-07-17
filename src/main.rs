@@ -1699,6 +1699,20 @@ async fn produce_arb_scan_journal(
 /// Execute a NegRisk buy-all-No basket in paper: buy `units` No shares in every leg. At most one
 /// member of the event resolves Yes, so the basket pays at least (legs−1)×units at resolution —
 /// risk-free on price, same snapshot caveats as the two-leg arb. Paper-only; journaled.
+/// Pure: units for a negrisk basket = thinnest-leg depth bound, further bounded so the basket's
+/// total collateral (units × Σ leg asks) stays within the basket collateral cap. Degenerate
+/// non-positive cost → 0 (callers also guard).
+fn negrisk_basket_units(
+    max_units: rust_decimal::Decimal,
+    collateral_cap: rust_decimal::Decimal,
+    total_cost: rust_decimal::Decimal,
+) -> rust_decimal::Decimal {
+    if total_cost <= dec!(0) {
+        return dec!(0);
+    }
+    max_units.min(collateral_cap / total_cost).round_dp(2)
+}
+
 async fn execute_negrisk_opportunity(
     pool: &sqlx::PgPool,
     journal: &Arc<JournalWriter>,
@@ -1725,16 +1739,25 @@ async fn execute_negrisk_opportunity(
         return Ok(());
     }
 
-    // Units bounded by the thinnest leg's depth and the arb notional cap (shared with the two-leg
-    // executor: risk-free trades wear the arb cap, not the $20 directional cap).
-    let arb_notional_cap = std::env::var("POLYTRADER_ARB_NOTIONAL_CAP")
+    // Sizing on WORST-CASE LOSS, not notional (2026-07-17, operator-approved): a COMPLETE
+    // buy-all-No basket's capital-at-risk is NOT its notional — mutual exclusivity guarantees a
+    // payout of (legs−1) per unit, so the resolution worst case is the guaranteed spread (a PROFIT
+    // ≥ MIN_NET_PROFIT per unit). The notional is collateral temporarily locked, not money that
+    // can be lost. The generic $250 ARB_NOTIONAL_CAP therefore over-restricted the one
+    // consistently-paying strategy (checkpoint #11: the Musk ladder was cap-bound and still paid
+    // +$15.40). Baskets now wear their own collateral cap, POLYTRADER_ARB_MAX_BASKET_COLLATERAL
+    // (default $750 = 3× the old bound), still bounded by (a) the thinnest leg's book depth via
+    // max_units — deeper size than the book shows simply doesn't fill — and (b) the residual risk
+    // that DOES scale with size: a PARTIAL fill (some legs unfilled) degrades the payout floor to
+    // filled_legs−1, journaled as basket_partial_or_unfilled below. Accepted at paper scale; real
+    // money needs P5 simultaneous multi-leg fills first (roadmap). The two-leg YES+NO executor
+    // keeps the generic cap — same principle applies there but it is not the proven earner; see
+    // the roadmap TODO before scaling it too.
+    let basket_collateral_cap = std::env::var("POLYTRADER_ARB_MAX_BASKET_COLLATERAL")
         .ok()
         .and_then(|v| v.trim().parse::<rust_decimal::Decimal>().ok())
-        .unwrap_or(dec!(250));
-    let units = opp
-        .max_units
-        .min(arb_notional_cap / opp.total_cost)
-        .round_dp(2);
+        .unwrap_or(dec!(750));
+    let units = negrisk_basket_units(opp.max_units, basket_collateral_cap, opp.total_cost);
     if units <= dec!(0) {
         return Ok(());
     }
@@ -2390,6 +2413,23 @@ mod tests {
         assert!(drawdown_breaker_tripped(dec!(22.5), Some(dec!(15))));
         // At/near peak (0% drawdown) never trips a positive threshold.
         assert!(!drawdown_breaker_tripped(dec!(0), Some(dec!(15))));
+    }
+
+    #[test]
+    fn negrisk_basket_units_bounded_by_depth_and_collateral() {
+        use super::negrisk_basket_units;
+        // Collateral cap binds: $750 cap / $2.85 basket cost = 263.15 units (depth allows more).
+        assert_eq!(
+            negrisk_basket_units(dec!(1000), dec!(750), dec!(2.85)),
+            dec!(263.16)
+        );
+        // Depth binds when the book is thin.
+        assert_eq!(
+            negrisk_basket_units(dec!(50), dec!(750), dec!(2.85)),
+            dec!(50)
+        );
+        // Degenerate cost → 0 (no divide-by-zero).
+        assert_eq!(negrisk_basket_units(dec!(50), dec!(750), dec!(0)), dec!(0));
     }
 
     #[test]

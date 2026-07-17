@@ -127,6 +127,12 @@ spec:
             # 107bps above $0.80) -- this is what actually stopped the cheap-share losses. 0 disables.
             - name: POLYTRADER_ROUNDTRIP_COST_MULTIPLIER
               value: "1.5"
+            # NegRisk basket collateral cap (2026-07-17): complete buy-all-No baskets are sized on
+            # worst-case loss (the guaranteed spread), not notional — the notional is temporarily
+            # locked collateral. 3x the old generic $250 arb cap; the proven earner gets room while
+            # partial-fill residual risk stays journaled. Two-leg arb keeps POLYTRADER_ARB_NOTIONAL_CAP.
+            - name: POLYTRADER_ARB_MAX_BASKET_COLLATERAL
+              value: "750"
             # P6 turnover budget (2026-07-12): max autonomous directional ENTRIES per UTC day.
             # Friction is paid per trade while the directional book runs ~flat gross, so the
             # marginal entry is usually P&L-negative. Exits + risk-free arb are NOT capped. 0 = off.

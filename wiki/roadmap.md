@@ -102,6 +102,37 @@ the dated Decision-log entry below; this is the at-a-glance index.
   bounded-by-default fix. Streaming/paginating `load_reports` stays as the escalation if replay
   volume ever outgrows 1Gi; the slim server-side projection (~200B/row) already covers the main
   blowup vector.*
+- [x] **NegRisk baskets sized on worst-case loss, not notional** (2026-07-17, from the operator-
+  requested "what would you improve" review) → *DONE same day. A COMPLETE buy-all-No basket's
+  capital-at-risk is the guaranteed spread (a profit), not its notional — the notional is
+  collateral temporarily locked. The generic $250 `ARB_NOTIONAL_CAP` therefore over-restricted the
+  one consistently-paying strategy (the Musk ladder was cap-bound and still paid +$15.40). Baskets
+  now wear `POLYTRADER_ARB_MAX_BASKET_COLLATERAL` (default $750 = 3×, in the k8s yaml), still
+  bounded by thinnest-leg depth; the residual partial-fill risk (payout floor degrades to
+  filled_legs−1) DOES scale with size and stays journaled — accepted at paper scale, needs P5
+  simultaneous fills before real money. Two-leg YES+NO arb deliberately kept on the old cap (same
+  principle, but it is not the proven earner). Pure `negrisk_basket_units` + test; 134/134.*
+- [ ] **Re-baseline Hermes learning to post-domination-cap data** (2026-07-17 review, #2). The
+  signal weights (~1.0×) and settled records were learned across TWO different systems — the
+  pre-07-13 era of fabricated edges/news domination and the honest regime since. Averaging across
+  them poisons the weight loop. Window Hermes' attribution learning to ≥ 2026-07-13 (domination-cap
+  deploy) or segment by regime; `advisory_capped`/`gross_edge_uncapped` are already journaled for
+  exactly this.
+- [ ] **Pre-register the P5 decision criterion** (2026-07-17 review, #3). Write the go/no-go test
+  BEFORE the data arrives, e.g.: "after 20 settled directional trades under the cap regime, net-of-
+  friction expectancy > 0 → build P5; otherwise directional goes arb-only." At ~1 trade/day that is
+  a ~3-week window. Note the arb side may justify P5 INDEPENDENTLY (honest multi-leg fills +
+  in-play overrounds) — the criterion should state both paths so the sample can't be read as
+  whatever confirms the mood of the week.
+- [ ] **Recurring-ladder detection** (2026-07-17 review, #4). The Musk tweet-count ladder is a
+  WEEKLY recurring event family (july-10-july-17 just paid +$15.40; july-17-july-24 presumably
+  listed now); Fed-rate ladders recur per meeting. The rotation/negrisk scanners find these
+  opportunistically — a small detector for recurring slug families (same pattern, rolling dates)
+  would put the best trade class on a schedule instead of leaving it to chance.
+- [ ] **Calibrate Kelly win_prob from settled records** (2026-07-17 review, #5). Sizing uses the
+  crude `win_prob ≈ mid + net_edge`; with honestly-small edges (1–6%) sizing precision now matters.
+  Calibrate against the settled record by price band (momentum runs 92% settled) once the post-cap
+  sample is big enough — pairs naturally with the Hermes re-baseline above.
 - [ ] **Scorecard "avg influence" is pre-cap raw score** (2026-07-14). The dashboard column that
   correctly triggered diagnostic #5 (news at 0.72–0.85, "elevated") now OVERSTATES news' real
   influence: since the domination cap, its fused contribution is bounded by the market-internal
