@@ -719,6 +719,23 @@ prediction, is where this system's edge has ever appeared.
   (1.2% of bankroll) it's low priority. Also added `crint-` (cricket international) to the keyword
   prefilter with a regression test.
 
+- **📈 CHECKPOINT #12 — MOU trade settles WON (+$1.13): the domination-cap regime's first realized
+  directional verdict; basket-collateral-cap deploy (6c01902) healthy (2026-07-18, ~21:00 UTC).**
+  0 errors/restarts. **The 07-13 checkpoint-#5 trade** (theta-driven, momentum-agreeing, news
+  amplified-within-bound, price-headroom-clamped 9.62%→6.27%) **settled WON +$1.13** at 06:17 —
+  ledger ties exactly (32.16 + 1.13 = 33.29 ✓). One new fill (WTI-115 No, 3.23% edge). No basket
+  executions since the collateral-cap deploy yet (no qualifying 3+ leg mispriced event scanned) —
+  the 3× headroom is live but unexercised; watch the next Musk-ladder cycle or Fed-meeting basket.
+  **Investigated: theta_convergence fire-rate more than DOUBLED (16.7%→40.7%, tagged "elevated")
+  — confirmed benign, not a bug.** 22 DISTINCT markets are genuinely firing (not one market
+  looping), with real decrementing `days_to_resolution` (~10.2d and falling for the sampled
+  Fed-pause market) inside the 14-day horizon — this week's rotation universe happens to hold an
+  unusually large cluster converging on resolution simultaneously (Fed meeting, MOU/WTI, Musk
+  ladder rotation, WC final). The health classifier did exactly its job (flag a real regime shift);
+  no code change warranted. P&L curve has now held green for a full 25h window (+13.04 steady
+  state) — first fully green day since the domination cap deployed. Gate sim: lenient +13.93 vs
+  strict +8.29 (13·13w settled).
+
 - **📈 CHECKPOINT #11 — realized +$32.16 and the P&L curve holds green; the Musk-ladder basket
   pays +$15.40 (2026-07-17, ~20:20 UTC).** 29b72f0 healthy (0 errors/restarts). Three event
   classes since #10, all healthy: (1) **Elon-Musk tweet-count ladder settled** 18:14–18:24 — the
