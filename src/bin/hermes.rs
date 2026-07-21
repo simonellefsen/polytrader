@@ -570,10 +570,19 @@ async fn do_reflection(
         m
     };
     let llm_configured = llm_key.is_some();
+    let (model_override, reasoning_effort) = fetch_hermes_config_override(pool).await;
+    let effective_model = model_override.as_deref().unwrap_or(llm_model);
     let mut llm_error: Option<String> = None;
     let (final_summary, recommendations, used_llm) = if let Some(key) = llm_key {
-        match call_llm_for_reflection(llm_endpoint, key, llm_model, &local_summary, &llm_metrics)
-            .await
+        match call_llm_for_reflection(
+            llm_endpoint,
+            key,
+            effective_model,
+            reasoning_effort.as_deref(),
+            &local_summary,
+            &llm_metrics,
+        )
+        .await
         {
             Ok((s, r)) => (s, r, true),
             Err(e) => {
@@ -591,7 +600,7 @@ async fn do_reflection(
         pool,
         llm_configured,
         llm_endpoint,
-        llm_model,
+        effective_model,
         used_llm,
         llm_error.as_deref(),
     )
@@ -1595,6 +1604,15 @@ fn average_pnl_per_market(
     avg
 }
 
+/// Deploy time of the advisory domination cap (commit d31274c: `fuse_named` bounds
+/// `|advisory numerator| <= |market-internal numerator|`). Roadmap TODO #1 (2026-07-17 review, #2):
+/// settled records before this point were learned under the pre-cap regime, where news' raw score
+/// ran 14x momentum's and flipped the fused direction in 100% of the 1,028 reports where they
+/// disagreed — averaging that era's outcomes in with the honest post-cap regime poisons the weight
+/// loop. Windows the realized-P&L learning sample to this regime boundary (or the last manual paper
+/// reset, whichever is later) so Hermes only tunes weights on data generated under current logic.
+const DOMINATION_CAP_DEPLOY_AT: &str = "2026-07-13T19:50:13Z";
+
 /// Load settled positions + their markets' decision-report attribution and compute per-signal
 /// realized P&L. Returns (summary JSON for metrics, per-signal map for weight tuning).
 async fn load_per_signal_realized_pnl(
@@ -1614,13 +1632,18 @@ async fn load_per_signal_realized_pnl(
     // was counting the 2026-06-24 phantom re-settlements: 22 of its 74 rows) and EXCLUDE positions
     // entered by an arb executor (a negrisk/Yes+NO leg's outcome reflects the basket structure,
     // not the fusion signals that happened to fire on that market's decision reports).
+    let domination_cap_deploy_at: DateTime<Utc> = DOMINATION_CAP_DEPLOY_AT
+        .parse()
+        .expect("DOMINATION_CAP_DEPLOY_AT is a valid RFC3339 constant");
     let settled: Vec<(Option<String>, Option<Decimal>)> = sqlx::query_as(
         "WITH reset_boundary AS (
            SELECT COALESCE(max(as_of), '-infinity'::timestamptz) AS t
            FROM paper_trading.virtual_portfolio_snapshots
-           WHERE snapshot_reason = 'manual_paper_reset')
+           WHERE snapshot_reason = 'manual_paper_reset'),
+         regime_boundary AS (
+           SELECT GREATEST(reset_boundary.t, $1) AS t FROM reset_boundary)
          SELECT e.payload->>'market_id', (e.payload->>'realized_pnl')::numeric
-         FROM journal.events e, reset_boundary rb
+         FROM journal.events e, regime_boundary rb
          WHERE e.event_type = 'paper_position_settled' AND e.created_at >= rb.t
            AND NOT EXISTS (SELECT 1 FROM paper_trading.paper_orders o
                             WHERE o.market_id = e.payload->>'market_id' AND o.side = 'Buy'
@@ -1629,9 +1652,10 @@ async fn load_per_signal_realized_pnl(
          UNION ALL
          SELECT e.payload->>'market_id',
                 (e.payload->>'realized_gross')::numeric - (e.payload->>'fees')::numeric
-         FROM journal.events e, reset_boundary rb
+         FROM journal.events e, regime_boundary rb
          WHERE e.event_type = 'autonomous_paper_exit' AND e.created_at >= rb.t",
     )
+    .bind(domination_cap_deploy_at)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
@@ -1712,13 +1736,14 @@ async fn load_per_signal_realized_pnl(
         .collect();
     let summary = json!({
         "settled_positions": settled.len(),
+        "regime_boundary": domination_cap_deploy_at,
         "total_realized_pnl": total_realized.to_string(),
         "per_signal": per_signal_json,
         "per_signal_avg_per_market": avg_json,
         "per_signal_participation": participation_json,
         "per_signal_attribution_window_fire_rate": window_fire_rate_json,
         "unattributed_pnl": unattributed.to_string(),
-        "note": "Realized P&L attributed to signals by the ENTRY decision report's influence (|score×confidence| — intrinsic, no learned-weight feedback) — the report that triggered the position, not a sliding recent-N window, so attribution is causally correct and stable (no re-split as new reports arrive). Weight tuning uses the AVERAGE per market driven (per_signal_avg_per_market), not the cumulative sum, so ubiquitous signals aren't over-credited. per_signal_attribution_window_fire_rate is the fire-rate at those entry decisions — weight tuning discounts a signal's boost/trim when its RECENT fire-rate has collapsed below it (stale attribution). Empty until positions resolve.",
+        "note": "Realized P&L attributed to signals by the ENTRY decision report's influence (|score×confidence| — intrinsic, no learned-weight feedback) — the report that triggered the position, not a sliding recent-N window, so attribution is causally correct and stable (no re-split as new reports arrive). Weight tuning uses the AVERAGE per market driven (per_signal_avg_per_market), not the cumulative sum, so ubiquitous signals aren't over-credited. per_signal_attribution_window_fire_rate is the fire-rate at those entry decisions — weight tuning discounts a signal's boost/trim when its RECENT fire-rate has collapsed below it (stale attribution). Empty until positions resolve. Sample is windowed to regime_boundary (max of the last manual paper reset and the 2026-07-13 advisory-domination-cap deploy) so pre-cap settlements — learned under news' 14x-momentum raw-score regime — don't poison the post-cap weight loop.",
     });
     (summary, avg_per_signal, window_fire_rate)
 }
@@ -2263,6 +2288,47 @@ async fn maybe_update_processor_weights(
     }
 }
 
+/// Fixed allow-list of OpenRouter models the dashboard may select (src/server.rs owns the same
+/// list for the picker UI; no shared lib crate between the two binaries, so kept in sync by hand).
+const HERMES_ALLOWED_MODELS: &[&str] = &[
+    "openai/gpt-5.6-luna",
+    "openai/gpt-5.6-terra",
+    "~x-ai/grok-latest",
+    "~google/gemini-flash-latest",
+    "~google/gemini-pro-latest",
+    "~anthropic/claude-sonnet-latest",
+];
+const HERMES_ALLOWED_REASONING_LEVELS: &[&str] = &["none", "low", "medium", "high"];
+
+/// Latest operator-set model/reasoning override from the dashboard (journal.events, event_type
+/// 'hermes_config'; append-only, same idiom as strategy_weights/llm_health). Re-read every
+/// reflection cycle so a dashboard change takes effect within ~10min, no redeploy required.
+/// Falls back silently to (env model, no reasoning) on any missing/invalid/unreadable row --
+/// this only controls the optional LLM narrative layer, never trading/risk behavior.
+async fn fetch_hermes_config_override(pool: &sqlx::PgPool) -> (Option<String>, Option<String>) {
+    let row: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload FROM journal.events WHERE event_type = 'hermes_config' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some(payload) = row else {
+        return (None, None);
+    };
+    let model = payload
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|m| HERMES_ALLOWED_MODELS.contains(m))
+        .map(|s| s.to_string());
+    let reasoning_effort = payload
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .filter(|r| HERMES_ALLOWED_REASONING_LEVELS.contains(r) && *r != "none")
+        .map(|s| s.to_string());
+    (model, reasoning_effort)
+}
+
 /// Classify an LLM error string into a coarse, UI-friendly cause.
 fn classify_llm_error(e: &str) -> &'static str {
     let l = e.to_lowercase();
@@ -2366,6 +2432,7 @@ async fn call_llm_for_reflection(
     endpoint: &str,
     key: &str,
     model: &str,
+    reasoning_effort: Option<&str>,
     local_summary: &str,
     metrics: &serde_json::Value,
 ) -> Result<(String, Vec<String>)> {
@@ -2381,7 +2448,7 @@ async fn call_llm_for_reflection(
         local_summary, metrics
     );
 
-    let body = json!({
+    let mut body = json!({
         "model": model,
         "messages": [
             {"role": "system", "content": "You are a precise Rust trading system analyst. Output valid JSON only."},
@@ -2390,6 +2457,11 @@ async fn call_llm_for_reflection(
         "temperature": 0.2,
         "max_tokens": 300
     });
+    // OpenRouter's unified reasoning field; omitted entirely for "none"/unsupported models rather
+    // than sending an empty object (some providers reject an empty `reasoning: {}`).
+    if let Some(effort) = reasoning_effort {
+        body["reasoning"] = json!({ "effort": effort });
+    }
 
     // OpenRouter-friendly headers (harmless for OpenAI). Capture status + body on non-2xx so the
     // health event can distinguish "out of credits" (402) from auth (401) / rate-limit (429).

@@ -70,14 +70,19 @@ pub async fn ingest_tick(
 
     // (3) held-position markets not already in the universe (settlement-tracking guarantee), PLUS
     //     active directional-rotation promotions — a promoted market needs orderbook snapshots and
-    //     decision reports even when it sits outside the volume-ranked discovery top-N (UNION keeps
-    //     this one query; both sets share the "must never go blind" property).
+    //     decision reports even when it sits outside the volume-ranked discovery top-N, PLUS
+    //     predicted next-period recurring-ladder slugs (rotation::ladder) — force-tracks a new
+    //     ladder instance the moment Gamma lists it, instead of waiting for it to organically rank
+    //     into the volume-based discovery (UNION keeps this one query; all three sets share the
+    //     "must never go blind to a market we care about" property).
     let must_track_slugs: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT m.slug FROM paper_trading.paper_positions p
          JOIN market_data.markets m ON m.gamma_id = p.market_id
          WHERE p.shares > 0 AND COALESCE(m.slug, '') <> ''
          UNION
-         SELECT slug FROM market_data.directional_universe WHERE demoted_at IS NULL",
+         SELECT slug FROM market_data.directional_universe WHERE demoted_at IS NULL
+         UNION
+         SELECT slug FROM market_data.ladder_watchlist",
     )
     .fetch_all(pool)
     .await

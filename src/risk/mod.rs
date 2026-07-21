@@ -280,6 +280,56 @@ pub struct PortfolioExposure {
     pub cluster_locked: Decimal,
 }
 
+/// Minimum settled samples a reliability bucket needs before its empirical win-rate is trusted
+/// enough to override the crude `mid + net_edge` win_prob estimate for Kelly sizing. See wiki/
+/// roadmap "Calibrate Kelly win_prob from settled records" (2026-07-17 review #5): with honestly-
+/// small edges (1-6%) sizing precision matters, but a band with a handful of settlements is noise,
+/// not signal. Ships enabled-by-default but inert until each band individually clears this bar, so
+/// it self-activates as the post-domination-cap sample grows rather than needing a manual flip.
+pub const CALIBRATION_MIN_SAMPLES_PER_BUCKET: i64 = 15;
+
+/// Calibrate a raw `win_prob` estimate (crude `mid + net_edge`, see src/main.rs) against Hermes's
+/// reliability-bucket scorecard (`journal.reflections.metrics->'calibration'->'reliability_buckets'`,
+/// produced by `compute_calibration` in src/bin/hermes.rs — same fixed 5-band grid: [0,.2) [.2,.4)
+/// [.4,.6) [.6,.8) [.8,1]). If the raw estimate's band has >= `min_n` settled observations, returns
+/// the band's empirical `actual_win_freq` (clamped 0.01..0.99) instead — the observed win rate IS
+/// the calibration curve for that band. Otherwise returns `raw` unchanged: too few observations in
+/// that band to trust over the naive formula. `buckets` is the raw `reliability_buckets` JSON array
+/// (or `Value::Null` if no reflection has run yet); malformed/missing entries fail OPEN to `raw` —
+/// this only ever REFINES sizing when there's enough evidence, never blocks it.
+pub fn calibrate_win_prob(raw: Decimal, buckets: &serde_json::Value, min_n: i64) -> Decimal {
+    let Some(arr) = buckets.as_array() else {
+        return raw;
+    };
+    // Same 5-band grid + boundary rule as compute_calibration (hermes.rs): [0,.2) .. [.8,1.0].
+    for b in 0..5i64 {
+        let lo = Decimal::from(b) / dec!(5);
+        let hi = Decimal::from(b + 1) / dec!(5);
+        let in_band = raw >= lo && (raw < hi || (b == 4 && raw <= hi));
+        if !in_band {
+            continue;
+        }
+        let expected_range = format!("{}-{}", lo.round_dp(1), hi.round_dp(1));
+        let Some(entry) = arr
+            .iter()
+            .find(|e| e.get("range").and_then(|v| v.as_str()) == Some(expected_range.as_str()))
+        else {
+            return raw; // no data for this band yet
+        };
+        let n = entry.get("n").and_then(|v| v.as_i64()).unwrap_or(0);
+        if n < min_n {
+            return raw; // band exists but too thin to trust
+        }
+        return entry
+            .get("actual_win_freq")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .map(|freq| freq.min(dec!(0.99)).max(dec!(0.01)))
+            .unwrap_or(raw);
+    }
+    raw
+}
+
 pub struct RiskManager {
     config: RiskConfig,
 }
@@ -874,5 +924,55 @@ mod gate_tests {
         // net_edge 0.05 would fail the friction floor at the default multiplier but the gate is off.
         let r = rm.gate("m", dec!(0.05), dec!(10), dec!(0.10), &e);
         assert!(r.approved);
+    }
+
+    fn bucket(range: &str, n: i64, actual_win_freq: &str) -> serde_json::Value {
+        serde_json::json!({"range": range, "n": n, "avg_predicted": "0", "actual_win_freq": actual_win_freq})
+    }
+
+    #[test]
+    fn calibrate_passes_through_raw_when_no_buckets() {
+        assert_eq!(
+            calibrate_win_prob(dec!(0.65), &serde_json::Value::Null, 15),
+            dec!(0.65)
+        );
+        assert_eq!(
+            calibrate_win_prob(dec!(0.65), &serde_json::json!([]), 15),
+            dec!(0.65)
+        );
+    }
+
+    #[test]
+    fn calibrate_passes_through_raw_when_band_too_thin() {
+        let buckets = serde_json::json!([bucket("0.6-0.8", 7, "0.9")]);
+        // n=7 < min_n=15 -> too thin to trust; raw estimate wins.
+        assert_eq!(calibrate_win_prob(dec!(0.65), &buckets, 15), dec!(0.65));
+    }
+
+    #[test]
+    fn calibrate_uses_empirical_win_freq_when_band_has_enough_samples() {
+        let buckets = serde_json::json!([bucket("0.6-0.8", 20, "0.9")]);
+        // orderbook_momentum's real profile per checkpoint notes: high-conviction bets underpriced.
+        assert_eq!(calibrate_win_prob(dec!(0.65), &buckets, 15), dec!(0.9));
+    }
+
+    #[test]
+    fn calibrate_matches_raw_to_the_correct_band_boundaries() {
+        // Range strings match rust_decimal's actual round_dp(1) Display output for these exact
+        // divisions — "0-0.2" and "0.8-1", NOT zero-padded "0.0-0.2"/"0.8-1.0" — because
+        // compute_calibration (hermes.rs) builds its real bucket ranges with the identical
+        // `format!("{}-{}", lo.round_dp(1), hi.round_dp(1))` call, so this must match byte-for-byte.
+        let buckets =
+            serde_json::json!([bucket("0-0.2", 20, "0.05"), bucket("0.8-1", 20, "0.95"),]);
+        assert_eq!(calibrate_win_prob(dec!(0.10), &buckets, 15), dec!(0.05));
+        // top band is inclusive of 1.0 (matches compute_calibration's b==4 special case).
+        assert_eq!(calibrate_win_prob(dec!(1.0), &buckets, 15), dec!(0.95));
+        assert_eq!(calibrate_win_prob(dec!(0.85), &buckets, 15), dec!(0.95));
+    }
+
+    #[test]
+    fn calibrate_clamps_extreme_empirical_frequencies() {
+        let buckets = serde_json::json!([bucket("0.8-1", 20, "1.0")]);
+        assert_eq!(calibrate_win_prob(dec!(0.9), &buckets, 15), dec!(0.99));
     }
 }

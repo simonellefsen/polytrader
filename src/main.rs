@@ -226,6 +226,48 @@ async fn main() -> Result<()> {
         });
         info!("Directional market-rotation task spawned (6h cadence; promote short-dated liquid non-sports, demote resolved)");
     }
+
+    // Recurring-ladder detection (see wiki/roadmap "Recurring-ladder detection", 2026-07-17 review
+    // #4): weekly NegRisk families (e.g. the Musk tweet-count ladder) get a new event/slug set days
+    // before the prior period resolves, but only enter our tracked universe once volume ranks them
+    // in — missing the early-book-inefficiency window. This predicts + watchlists the next period's
+    // slugs (market_data.ladder_watchlist, UNIONed into ingest_tick's must-track query) ahead of
+    // that. Runs ~4 min after boot then every 6h (offset from rotation so they don't contend for the
+    // same tick). Journals a `ladder_watchlist_update` event. Lookahead window via
+    // POLYTRADER_LADDER_LOOKAHEAD_DAYS (default 3 — only extends families actually nearing
+    // resolution, not the whole tracked universe every pass).
+    {
+        let pool = pool.clone();
+        let journal = journal.clone();
+        let lookahead_days = std::env::var("POLYTRADER_LADDER_LOOKAHEAD_DAYS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(3);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(240)).await;
+            loop {
+                match rotation::ladder::detect_and_extend_ladders(&pool, lookahead_days).await {
+                    Ok(stats) => {
+                        tracing::info!(?stats, "ladder detection pass complete");
+                        let _ = journal
+                            .record_journal_event(
+                                "ladder_watchlist_update",
+                                "polytrader_ladder",
+                                "info",
+                                serde_json::to_value(&stats).unwrap_or(serde_json::json!({})),
+                            )
+                            .await;
+                    }
+                    Err(e) => tracing::warn!(error = %e, "ladder detection pass failed"),
+                }
+                if let Err(e) = rotation::ladder::prune_stale_ladder_watchlist(&pool, 21).await {
+                    tracing::warn!(error = %e, "ladder watchlist prune failed (non-fatal)");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+            }
+        });
+        info!("Recurring-ladder detection task spawned (6h cadence; predicts + watchlists next-period NegRisk ladder slugs)");
+    }
     info!(
         "Background ingestion task spawned (Gamma + CLOB public, {}s interval, rate-limited)",
         cfg.ingest_interval_secs
@@ -591,6 +633,21 @@ async fn produce_5min_decision_report(
     let learned_weights = crate::strategy::load_processor_weights(pool).await;
     let engine = FusionEngine::with_weights(learned_weights);
 
+    // Load Hermes's calibration reliability buckets (closed loop, same pattern as processor
+    // weights): refines the crude win_prob estimate below once a probability band has enough
+    // settled evidence (roadmap "Calibrate Kelly win_prob from settled records", 2026-07-17 review
+    // #5). Ships enabled but inert until `risk::CALIBRATION_MIN_SAMPLES_PER_BUCKET` clears per band
+    // — Null/empty (no reflection yet, or too thin) falls open to the raw estimate unchanged.
+    let calibration_buckets: serde_json::Value = sqlx::query_scalar(
+        "SELECT metrics->'calibration'->'reliability_buckets' FROM journal.reflections
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(serde_json::Value::Null);
+
     // External advisory signals (Yahoo Finance + Google News RSS), gated by env. Build one HTTP
     // client with a short timeout; fetches are best-effort and never block a decision.
     let external_enabled = std::env::var("POLYTRADER_EXTERNAL_SIGNALS")
@@ -728,10 +785,17 @@ async fn produce_5min_decision_report(
         };
 
         // Kelly sizing recommendation (for Hermes attribution; no auto-submit).
-        // win_prob ≈ target_mid + net_edge (crude but directionally correct).
+        // win_prob ≈ target_mid + net_edge (crude but directionally correct), refined by Hermes's
+        // reliability buckets where a band has enough settled evidence (see calibration_buckets
+        // above; a no-op until then).
         // RISK: this is a rough estimate; always apply fractional Kelly + caps.
         let portfolio_usdc = current_portfolio_usdc(pool).await;
-        let win_prob = (target_mid + net).min(dec!(0.99)).max(dec!(0.01));
+        let win_prob_raw = (target_mid + net).min(dec!(0.99)).max(dec!(0.01));
+        let win_prob = crate::risk::calibrate_win_prob(
+            win_prob_raw,
+            &calibration_buckets,
+            crate::risk::CALIBRATION_MIN_SAMPLES_PER_BUCKET,
+        );
         let risk_mgr = RiskManager::from_env();
         let sizing = risk_mgr.kelly_size(win_prob, target_mid, portfolio_usdc);
 
@@ -749,6 +813,8 @@ async fn produce_5min_decision_report(
                 "rationale": sizing.rationale,
                 "portfolio_usdc": portfolio_usdc.to_string(),
                 "win_prob_estimate": win_prob.to_string(),
+                "win_prob_estimate_raw": win_prob_raw.to_string(),
+                "win_prob_calibrated": win_prob != win_prob_raw,
             },
             "market_id": gamma_id,
             "target_outcome": target_outcome,

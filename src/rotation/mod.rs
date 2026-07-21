@@ -16,6 +16,8 @@ use anyhow::Result;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 
+pub mod ladder; // recurring-ladder (weekly NegRisk family) next-period slug prediction
+
 use crate::ingester::GammaClient;
 
 /// Row counts from one rotation pass (journaled for observability).

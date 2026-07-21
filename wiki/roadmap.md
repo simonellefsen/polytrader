@@ -83,6 +83,30 @@ conclusive — but there is *zero* evidence of positive directional edge and cle
 - `news_sentiment` fire-rate is volatile (19.9% → 4.5% → 10.1% across checks) — caught by eye, should
   be an automated alert.
 
+## 🚦 P5 (real-money) go/no-go criterion — pre-registered 2026-07-21
+
+Written BEFORE the deciding data arrives (roadmap TODO, 2026-07-17 review #3), so the eventual read
+can't be shaped by whatever mood/narrative is dominant the week the sample fills up. Two
+**independent** paths — either one alone justifies building P5 (real-money dispatch infra); if both
+read NO-GO at their respective sample sizes, directional trading stays arb-only permanently (already
+the executor default) and P5 is deferred until a new signal or market class changes the picture.
+
+- **Path A — Directional.** Over settlements with `created_at >= regime_boundary` (= `GREATEST(last
+  manual_paper_reset, 2026-07-13T19:50:13Z)` — the advisory-domination-cap deploy, same boundary
+  `load_per_signal_realized_pnl` now uses; excludes arb-executor entries), once **≥20** positions have
+  settled (`paper_position_settled` + `autonomous_paper_exit`): compute net-of-friction expectancy =
+  `total_realized_pnl / settled_count`. **GO if strictly > 0; NO-GO otherwise.** Baseline at
+  registration (2026-07-21): **7/20** settled (2 + 5) — at ~1 trade/day this reads out in ~2 weeks
+  (see also #4 below).
+- **Path B — Arb (negrisk + two-leg).** Independently, once **≥10** arb fills have completed under the
+  current $750 negrisk collateral cap (2026-07-17) and $250 two-leg cap: compute the same net-of-
+  friction expectancy over arb fills alone. **GO if > 0 AND ≥2 distinct market families represented**
+  (guards against reading a single lucky ladder as durable edge).
+- **Anti-gaming clause:** the sample sizes and thresholds above are fixed at registration time and may
+  not be moved, re-interpreted, or cherry-picked after seeing partial data. If new information later
+  suggests the *criterion itself* (not just the number) was wrong, that requires its own dated roadmap
+  entry explaining the change — written before looking at the would-be-decisive data point.
+
 ## 📋 Open items / TODO (live backlog, most recent first)
 
 Deferred follow-ups surfaced during diagnostic checks but not yet built. Each has a full writeup in
@@ -112,33 +136,58 @@ the dated Decision-log entry below; this is the at-a-glance index.
   filled_legs−1) DOES scale with size and stays journaled — accepted at paper scale, needs P5
   simultaneous fills before real money. Two-leg YES+NO arb deliberately kept on the old cap (same
   principle, but it is not the proven earner). Pure `negrisk_basket_units` + test; 134/134.*
-- [ ] **Re-baseline Hermes learning to post-domination-cap data** (2026-07-17 review, #2). The
-  signal weights (~1.0×) and settled records were learned across TWO different systems — the
-  pre-07-13 era of fabricated edges/news domination and the honest regime since. Averaging across
-  them poisons the weight loop. Window Hermes' attribution learning to ≥ 2026-07-13 (domination-cap
-  deploy) or segment by regime; `advisory_capped`/`gross_edge_uncapped` are already journaled for
-  exactly this.
-- [ ] **Pre-register the P5 decision criterion** (2026-07-17 review, #3). Write the go/no-go test
-  BEFORE the data arrives, e.g.: "after 20 settled directional trades under the cap regime, net-of-
-  friction expectancy > 0 → build P5; otherwise directional goes arb-only." At ~1 trade/day that is
-  a ~3-week window. Note the arb side may justify P5 INDEPENDENTLY (honest multi-leg fills +
-  in-play overrounds) — the criterion should state both paths so the sample can't be read as
-  whatever confirms the mood of the week.
-- [ ] **Recurring-ladder detection** (2026-07-17 review, #4). The Musk tweet-count ladder is a
-  WEEKLY recurring event family (july-10-july-17 just paid +$15.40; july-17-july-24 presumably
-  listed now); Fed-rate ladders recur per meeting. The rotation/negrisk scanners find these
-  opportunistically — a small detector for recurring slug families (same pattern, rolling dates)
-  would put the best trade class on a schedule instead of leaving it to chance.
-- [ ] **Calibrate Kelly win_prob from settled records** (2026-07-17 review, #5). Sizing uses the
-  crude `win_prob ≈ mid + net_edge`; with honestly-small edges (1–6%) sizing precision now matters.
-  Calibrate against the settled record by price band (momentum runs 92% settled) once the post-cap
-  sample is big enough — pairs naturally with the Hermes re-baseline above.
-- [ ] **Scorecard "avg influence" is pre-cap raw score** (2026-07-14). The dashboard column that
-  correctly triggered diagnostic #5 (news at 0.72–0.85, "elevated") now OVERSTATES news' real
-  influence: since the domination cap, its fused contribution is bounded by the market-internal
-  numerator, but the metric still averages raw |score|. Add a post-cap contribution column (or
-  rename the current one "raw score") so the alarm doesn't re-fire on already-fixed behavior.
-  *Display-only; see CHECKPOINT #6.*
+- [x] **Re-baseline Hermes learning to post-domination-cap data** (2026-07-17 review, #2) → *DONE
+  2026-07-21. `load_per_signal_realized_pnl`'s settled-sample query now windows to
+  `regime_boundary = GREATEST(last manual_paper_reset, 2026-07-13T19:50:13Z)` (the
+  advisory-domination-cap deploy, commit d31274c) instead of only the reset boundary, so pre-cap
+  settlements learned under news' 14×-momentum raw-score regime no longer poison the post-cap weight
+  loop. `regime_boundary` is now journaled in the reflection summary for auditability. Current regime
+  sample as of 2026-07-21: 7 directional settlements (2 `paper_position_settled` + 5
+  `autonomous_paper_exit`).*
+- [x] **Pre-register the P5 decision criterion** (2026-07-17 review, #3) → *DONE 2026-07-21, see the
+  dedicated "P5 (real-money) go/no-go criterion" section above — written before the deciding sample
+  arrives, states both the directional and arb paths (either alone justifies P5), and includes an
+  anti-gaming clause against moving the goalposts once partial data is visible.*
+- [x] **Recurring-ladder detection** (2026-07-17 review, #4) → *DONE 2026-07-21. Confirmed live
+  against Gamma while building: the july-21-to-28 Musk ladder event was already listed (3 days
+  before the july-14-to-21 one closed) but invisible to us — not yet ranked into the volume-based
+  arb-discovery top-N. New `rotation::ladder` module: pure `parse_date_range_slug`/
+  `next_ladder_window` predict a fixed-cadence date-range family's next period from its
+  soon-to-resolve instance (window repeats at its own length; handles year-boundary wraps), and
+  `detect_and_extend_ladders` (6h cadence, `POLYTRADER_LADDER_LOOKAHEAD_DAYS` default 3) writes
+  predicted slugs to new table `market_data.ladder_watchlist`, UNIONed into `ingest_tick`'s
+  must-track query (same force-track mechanism as `directional_universe`) so predicted slugs get
+  fetched-by-slug the moment Gamma lists them — independent of volume rank. A wrong prediction is
+  harmless (Gamma returns nothing for an unlisted slug); normal edge/Kelly/exposure gates still
+  apply to anything tradeable that results. `prune_stale_ladder_watchlist` keeps the table bounded.
+  **Scope:** only fixed-cadence families (the Musk ladder); variable-cadence ones (Fed-rate ladders,
+  which recur per-FOMC-meeting, not at a fixed interval) are explicitly out of scope for this cut —
+  left as a follow-up. 8 new unit tests (incl. against the live-confirmed july-14→21 / july-21→28
+  Gamma pair); 141/141 passing.*
+- [x] **Calibrate Kelly win_prob from settled records** (2026-07-17 review, #5) → *DONE 2026-07-21,
+  built inert-until-ready (honest about the current 7-settlement sample being far too thin to
+  calibrate on). New `risk::calibrate_win_prob` reuses Hermes's existing reliability-bucket
+  scorecard (`compute_calibration`, hermes.rs — Brier + avg-predicted-vs-actual-win-freq per 5-band
+  grid, journaled in `journal.reflections.metrics`) as the calibration curve: for the raw
+  `mid + net_edge` estimate's band, if that band has `>= CALIBRATION_MIN_SAMPLES_PER_BUCKET` (15)
+  settled observations, replaces it with the band's empirical `actual_win_freq`; otherwise passes
+  the raw estimate through unchanged. `produce_5min_decision_report` (main.rs) loads the latest
+  buckets once per cycle (same closed-loop pattern as Hermes-learned processor weights) and journals
+  both `win_prob_estimate` (final) and `win_prob_estimate_raw` + `win_prob_calibrated` (audit trail —
+  Hermes/dashboard can see exactly when calibration kicked in). Ships enabled by default: with every
+  band currently under 15 samples it is a documented no-op today, and self-activates band-by-band as
+  the post-domination-cap sample grows — no manual flip needed, and no risk of tuning sizing on
+  noise in the meantime. 5 new unit tests (incl. exact-byte-match coverage of rust_decimal's
+  unpadded `round_dp` Display format, e.g. `"0.8-1"` not `"0.8-1.0"`, caught failing before the fix);
+  146/146 passing.*
+- [x] **Scorecard "avg influence" is pre-cap raw score** (2026-07-14) → *DONE 2026-07-21, took the
+  cheap option the entry itself offered. A true post-cap contribution column would need re-running
+  fuse_named per report (11k+ decision_reports/24h — a real per-poll cost, not worth it for a
+  display-only fix). Instead: renamed the column "Avg influence" → "Raw score", and its tooltip +
+  the scorecard note now say plainly that it's the average |score| BEFORE the 2026-07-13 advisory
+  domination cap, that it overstates news_sentiment/yahoo_finance's real sway, and points at Weight
+  (Hermes's learned trust) as the honest post-cap read. Pure string change — no query/behavior
+  touched; 146/146 passing.*
 - [ ] **Dead bootstrap slug spam** (2026-07-13). `will-the-us-announce-withdrawal-from-mou-
   negotiations-by-july-31-20260622192122521-644` is in `POLYTRADER_BOOTSTRAP_MARKETS` but Gamma
   returns no market for it even with `closed=true` (renamed/delisted) — it WARN-logs every ingest

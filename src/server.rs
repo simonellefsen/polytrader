@@ -135,6 +135,28 @@ struct PaperResetRequest {
     operator: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+struct HermesConfigRequest {
+    model: String,
+    reasoning_effort: Option<String>,
+}
+
+/// Fixed allow-list of OpenRouter models operators may pick for Hermes reflection synthesis.
+/// Hermes (src/bin/hermes.rs) re-reads the latest `hermes_config` journal event each cycle, so
+/// changes here take effect within one reflection interval — no redeploy needed. Keep in sync
+/// with the identical list in src/bin/hermes.rs (no shared lib crate between the two binaries).
+const HERMES_ALLOWED_MODELS: &[&str] = &[
+    "openai/gpt-5.6-luna",
+    "openai/gpt-5.6-terra",
+    "~x-ai/grok-latest",
+    "~google/gemini-flash-latest",
+    "~google/gemini-pro-latest",
+    "~anthropic/claude-sonnet-latest",
+];
+
+/// OpenRouter's unified `reasoning.effort` field; "none" omits the field entirely (plain models).
+const HERMES_ALLOWED_REASONING_LEVELS: &[&str] = &["none", "low", "medium", "high"];
+
 #[derive(sqlx::FromRow)]
 struct PaperOrderMarketReadinessRow {
     gamma_id: String,
@@ -308,6 +330,7 @@ pub async fn start_server(
         .route("/paper/rejections", get(paper_rejections_handler))
         .route("/paper/reset", post(paper_reset_handler))
         .route("/paper/reconciliation", get(paper_reconciliation_handler))
+        .route("/trades/hermes-config", post(hermes_config_set_handler))
         // AUTH (Next Phase): login/callback/logout/whoami. Optional for paper (dual edge+app).
         // Relative links in UI + <base> ensure subpath compat. /health untouched (public).
         .route("/auth/login", get(auth_login_handler))
@@ -1467,6 +1490,25 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     .ok()
     .flatten();
 
+    // Latest operator-set Hermes model/reasoning override (append-only, same idiom as llm_health/
+    // strategy_weights above). None means Hermes falls back to its LLM_MODEL/no-reasoning env defaults.
+    let hermes_config_row: Option<(serde_json::Value, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT payload, created_at FROM journal.events WHERE event_type = 'hermes_config' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let hermes_config_json = serde_json::json!({
+        "models": HERMES_ALLOWED_MODELS,
+        "reasoning_levels": HERMES_ALLOWED_REASONING_LEVELS,
+        "current": hermes_config_row.map(|(payload, created_at)| serde_json::json!({
+            "model": payload.get("model"),
+            "reasoning_effort": payload.get("reasoning_effort"),
+            "updated_at": created_at,
+        })),
+    });
+
     // Total-P&L time series for the live equity chart: running P&L = realized + unrealized at each
     // snapshot (zero at inception, independent of starting bankroll). Ascending for left-to-right plot.
     let series_rows: Vec<(chrono::DateTime<chrono::Utc>, Decimal, Decimal)> = sqlx::query_as(
@@ -1964,10 +2006,13 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
                  SUDDEN shifts); health_7d compares the 24h fire-rate to the 7d baseline (catches \
                  multi-day GRADUAL decay the 3h-vs-24h check is blind to — the 24h baseline erodes with \
                  the signal). Both: 'degraded' = fire-rate more than halved, 'dormant' = went silent, \
-                 'elevated' = doubled, 'insufficient_data' = too few reports to judge. Weight is Hermes's \
-                 current confidence multiplier. Settled record = win/loss of settled markets where the \
-                 signal fired in the final decision report (count-based, overlapping). Realized P&L \
-                 populates at 10 settled.",
+                 'elevated' = doubled, 'insufficient_data' = too few reports to judge. Raw score is the \
+                 average |score| BEFORE the advisory domination cap (2026-07-13) — for news_sentiment/ \
+                 yahoo_finance this overstates real sway on the fused decision, since fuse_named bounds \
+                 their actual contribution to at most the market-internal numerator's magnitude; Weight \
+                 (Hermes's learned trust) is the more honest read of real influence post-cap. Settled \
+                 record = win/loss of settled markets where the signal fired in the final decision \
+                 report (count-based, overlapping). Realized P&L populates at 10 settled.",
     });
 
     let gate_simulation = serde_json::json!({
@@ -1990,6 +2035,7 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
         "recent_executions": executions,
         "real_account": real_account,
         "llm_health": llm_health,
+        "hermes_config": hermes_config_json,
         "settlements": {
             "count": settled_count,
             "wins": wins,
@@ -2130,6 +2176,8 @@ fn render_trades_page(prefix: &str) -> String {
   <div id="gatesim"></div>
   <h2>Parameters <span class="pill" id="params-mode">paper · read-only</span></h2>
   <div id="params"></div>
+  <h2>Hermes AI <span class="pill" id="hermes-config-status"></span></h2>
+  <div id="hermes-config"></div>
   <h2>Open Positions</h2>
   <div id="positions"></div>
   <h2>Settlements <span class="pill dir" id="settle-summary"></span></h2>
@@ -2305,7 +2353,7 @@ function renderSignals(s){
     </tr>`;
   };
   el.innerHTML = `<table>
-    <tr><th>Signal</th><th title="Share of recent decision reports where this signal contributed a non-zero score">Fire rate</th><th title="Average absolute contribution when it fires">Avg influence</th><th title="Hermes's current confidence multiplier (1.00× = neutral)">Weight</th><th title="Win-loss record of settled markets (by net realized P&amp;L) where this signal fired in the final decision report. Available now, independent of Hermes.">Settled record</th><th title="Realized P&amp;L attributed to this signal (Hermes proportional split); populates at 10 settled">Settled P&amp;L</th></tr>
+    <tr><th>Signal</th><th title="Share of recent decision reports where this signal contributed a non-zero score">Fire rate</th><th title="Average absolute RAW score when it fires, BEFORE the advisory domination cap (2026-07-13). For news_sentiment/yahoo_finance this OVERSTATES real influence on the fused decision — their raw score can run far above market-internal signals, but fuse_named bounds their actual contribution to at most the market-internal numerator's magnitude. Compare against Weight (Hermes's learned trust), not this column, to judge real sway.">Raw score</th><th title="Hermes's current confidence multiplier (1.00× = neutral)">Weight</th><th title="Win-loss record of settled markets (by net realized P&amp;L) where this signal fired in the final decision report. Available now, independent of Hermes.">Settled record</th><th title="Realized P&amp;L attributed to this signal (Hermes proportional split); populates at 10 settled">Settled P&amp;L</th></tr>
     ${s.rows.map(row).join("")}
   </table>
   <div class="t" style="padding:8px 2px;">${s.note||""}</div>`;
@@ -2355,6 +2403,61 @@ function renderParams(c){
        <div class="val" style="font-size:16px">${v}</div>
        <div class="t" style="margin-top:6px;line-height:1.35;color:#6e7681;">${desc||''}</div>
      </div>`).join("")}</div>`;
+}
+
+// Hermes AI model/reasoning picker — the only mutable (non-read-only) control on this dashboard.
+// Writes go to POST /trades/hermes-config (validated server-side against the same fixed lists);
+// hermes.rs re-reads the latest choice each reflection cycle (~10min), no redeploy needed.
+let hermesConfigSaving = false;
+let hermesConfigBuilt = false; // build the form once; polling only refreshes the status pill so an
+                                // unsaved dropdown pick isn't clobbered by the next 15s refresh.
+function renderHermesConfig(hc){
+  const el = document.getElementById("hermes-config");
+  const statusEl = document.getElementById("hermes-config-status");
+  if (!hc) { el.innerHTML = `<div class="empty">No config.</div>`; statusEl.textContent=""; return; }
+  const cur = hc.current || {};
+  const curModel = cur.model || null;
+  const curReasoning = cur.reasoning_effort || "none";
+  statusEl.textContent = curModel ? `active: ${curModel}${curReasoning!=="none" ? " · "+curReasoning : ""}` : "default (env)";
+  if (hermesConfigBuilt) return;
+  hermesConfigBuilt = true;
+  el.innerHTML = `<div class="card" style="max-width:420px;">
+    <div class="label">Model <span style="opacity:.5">&#9432;</span></div>
+    <select id="hermes-model-select" style="width:100%;margin:4px 0 10px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px;">
+      ${(hc.models||[]).map(m => `<option value="${m}" ${m===curModel?'selected':''}>${m}</option>`).join("")}
+    </select>
+    <div class="label">Reasoning effort <span style="opacity:.5">&#9432;</span></div>
+    <select id="hermes-reasoning-select" style="width:100%;margin:4px 0 10px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px;">
+      ${(hc.reasoning_levels||[]).map(r => `<option value="${r}" ${r===curReasoning?'selected':''}>${r}</option>`).join("")}
+    </select>
+    <button id="hermes-config-save" style="cursor:pointer;padding:6px 14px;border-radius:6px;border:1px solid #30363d;background:#1f6feb22;color:#58a6ff;">Save</button>
+    <span id="hermes-config-msg" style="margin-left:10px;font-size:12px;"></span>
+    <div class="t" style="margin-top:8px;line-height:1.35;color:#6e7681;">
+      Controls only the optional LLM narrative layer for Hermes's reflection loop (paper-only self-improvement agent) — never trading/risk decisions, which are market-internal signals only. "none" reasoning omits the field for models that don't support it.
+    </div>
+  </div>`;
+  document.getElementById("hermes-config-save").onclick = async () => {
+    if (hermesConfigSaving) return;
+    hermesConfigSaving = true;
+    const msgEl = document.getElementById("hermes-config-msg");
+    msgEl.textContent = "saving…"; msgEl.style.color = "#8b949e";
+    const model = document.getElementById("hermes-model-select").value;
+    const reasoning_effort = document.getElementById("hermes-reasoning-select").value;
+    try {
+      const r = await fetch(PREFIX + "/trades/hermes-config", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({model, reasoning_effort}),
+      });
+      const j = await r.json();
+      if (r.ok && j.ok) { msgEl.textContent = "saved"; msgEl.style.color = "#3fb950"; }
+      else { msgEl.textContent = "error: " + (j.error||"save failed"); msgEl.style.color = "#f85149"; }
+    } catch (e) {
+      msgEl.textContent = "error: " + e; msgEl.style.color = "#f85149";
+    } finally {
+      hermesConfigSaving = false;
+    }
+  };
 }
 
 // Executions feed with filtering (hide the rejection noise).
@@ -2461,6 +2564,7 @@ async function load() {
     llmEl.style.color = s==="ok" ? "#3fb950" : (s==="disabled" ? "#8b949e" : "#f85149");
     llmEl.title = (llm.error||"")+" ("+fmt(llm.provider)+"/"+fmt(llm.model)+")";
   }
+  renderHermesConfig(d.hermes_config);
 
   lastExec = d.recent_executions || [];
   renderExec();
@@ -2970,6 +3074,77 @@ async fn paper_reset_handler(
                 "post_order_called": false,
                 "post_orders_called": false,
                 "error": format!("Failed to reset paper simulator state: {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Set which OpenRouter model (and reasoning effort) Hermes uses for reflection synthesis.
+/// Writes an append-only `hermes_config` journal event; Hermes (src/bin/hermes.rs) re-reads the
+/// latest one each reflection cycle (~10min), so this takes effect without a redeploy. Paper-only
+/// dashboard control — never touches trading/risk config, only the optional LLM narrative layer.
+async fn hermes_config_set_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<HermesConfigRequest>,
+) -> impl IntoResponse {
+    let model = request.model.trim();
+    if !HERMES_ALLOWED_MODELS.contains(&model) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "unknown model",
+                "allowed_models": HERMES_ALLOWED_MODELS,
+            })),
+        )
+            .into_response();
+    }
+    let reasoning_effort = request
+        .reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("none");
+    if !HERMES_ALLOWED_REASONING_LEVELS.contains(&reasoning_effort) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "unknown reasoning_effort",
+                "allowed_reasoning_levels": HERMES_ALLOWED_REASONING_LEVELS,
+            })),
+        )
+            .into_response();
+    }
+
+    let payload = serde_json::json!({
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "paper_only": true,
+        "note": "Operator-set override for Hermes LLM synthesis (dashboard). Read by hermes each reflection cycle.",
+    });
+    let insert = sqlx::query(
+        "INSERT INTO journal.events (id, event_type, source, severity, payload)
+         VALUES ($1, 'hermes_config', 'dashboard_ui', 'info', $2)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(&payload)
+    .execute(&state.pool)
+    .await;
+
+    match insert {
+        Ok(_) => Json(serde_json::json!({
+            "ok": true,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("Failed to write hermes_config event: {e}"),
             })),
         )
             .into_response(),
