@@ -2086,8 +2086,9 @@ async fn trades_pnl_handler(
         .map(|s| s.trim().to_lowercase())
         .unwrap_or_else(|| "1d".to_string());
     // (window_secs, bucket_secs) per range. window 0 = no lower bound ("all"). Buckets chosen to keep
-    // ~300-360 points: 5-min (1d), 30-min (1w), 2-h (1m), 1-day (1y/all).
+    // ~300-360 points: 1-min (1h), 5-min (1d), 30-min (1w), 2-h (1m), 1-day (1y/all).
     let (window_secs, bucket_secs): (i64, i64) = match range.as_str() {
+        "1h" => (3600, 60),
         "1w" => (7 * 86400, 1800),
         "1m" => (30 * 86400, 7200),
         "1y" => (365 * 86400, 86400),
@@ -2221,6 +2222,46 @@ const sign = (v) => { const n = parseFloat(v); return (n>0?"+":"") + (isNaN(n)?"
 // Live P&L area chart: per-segment coloring — green above the zero line, red below (so an early
 // underwater dip reads red even when the latest value is positive). Plots the running
 // realized+unrealized series. Pure inline SVG (no chart lib) so it stays self-contained.
+// Hover state for the P&L chart (set at the end of renderPnlChart each redraw). Kept as plain data
+// + closures so the crosshair/tooltip can be drawn by mutating just the #pnl-hover-g group instead
+// of re-rendering the whole SVG on every mousemove.
+let pnlChartState = null;
+function pnlHover(evt){
+  if (!pnlChartState) return;
+  const {pts, sx, sy, W, H, padL, padR, padT, padB} = pnlChartState;
+  const svg = evt.currentTarget.ownerSVGElement;
+  if (!svg) return;
+  const rect = svg.getBoundingClientRect();
+  if (!rect.width) return;
+  const relX = (evt.clientX - rect.left) / rect.width * W;
+  let best = 0, bestD = Infinity;
+  for (let i=0; i<pts.length; i++){
+    const d = Math.abs(sx(pts[i].t) - relX);
+    if (d < bestD){ bestD = d; best = i; }
+  }
+  const p = pts[best];
+  const px = sx(p.t), py = sy(p.v);
+  const g = document.getElementById("pnl-hover-g");
+  if (!g) return;
+  const dateStr = new Date(p.t*1000).toLocaleString([], {month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
+  const valStr = (p.v>=0?"+":"") + p.v.toFixed(2);
+  const color = p.v>=0 ? "#3fb950" : "#f85149";
+  const boxW = 112, boxH = 36;
+  let bx = px + 10; if (bx + boxW > W - padR) bx = px - boxW - 10;
+  let by = py - boxH - 10; if (by < padT) by = py + 10;
+  if (by + boxH > H - padB) by = H - padB - boxH;
+  g.innerHTML = `
+    <line x1="${px.toFixed(1)}" y1="${padT}" x2="${px.toFixed(1)}" y2="${(H-padB).toFixed(1)}" stroke="#8b949e" stroke-width="1" stroke-dasharray="3 3"/>
+    <circle cx="${px.toFixed(1)}" cy="${py.toFixed(1)}" r="4" fill="${color}" stroke="#0d1117" stroke-width="1.5"/>
+    <rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${boxW}" height="${boxH}" rx="4" fill="#161b22" stroke="#30363d"/>
+    <text x="${(bx+8).toFixed(1)}" y="${(by+15).toFixed(1)}" fill="#8b949e" font-size="10">${dateStr}</text>
+    <text x="${(bx+8).toFixed(1)}" y="${(by+29).toFixed(1)}" fill="${color}" font-size="14" font-weight="600">${valStr}</text>
+  `;
+}
+function pnlHoverEnd(){
+  const g = document.getElementById("pnl-hover-g");
+  if (g) g.innerHTML = "";
+}
 function renderPnlChart(series, meta){
   const box = document.getElementById("pnl-chart");
   const pts = (series||[]).map(s => ({t: s.t, v: parseFloat(s.pnl)})).filter(p => !isNaN(p.v));
@@ -2265,7 +2306,11 @@ function renderPnlChart(series, meta){
     <path d="${line}" fill="none" stroke="${G_STROKE}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" clip-path="url(#pnlPos)"/>
     <path d="${line}" fill="none" stroke="${R_STROKE}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" clip-path="url(#pnlNeg)"/>
     <circle cx="${sx(pts[pts.length-1].t).toFixed(1)}" cy="${sy(last).toFixed(1)}" r="3.5" fill="${stroke}"/>
+    <rect x="${padL}" y="${padT}" width="${(W-padL-padR).toFixed(1)}" height="${(H-padT-padB).toFixed(1)}" fill="transparent" style="cursor:crosshair;" onmousemove="pnlHover(event)" onmouseleave="pnlHoverEnd()"/>
+    <g id="pnl-hover-g"></g>
   </svg>`;
+  // Hover crosshair/tooltip state — see pnlHover/pnlHoverEnd above.
+  pnlChartState = {pts, sx, sy, W, H, padL, padR, padT, padB};
   // X axis = time (snapshot timestamp). Labels + caption rendered as HTML below the SVG so they are
   // not horizontally stretched by preserveAspectRatio="none". Resolution ≈ one point per 5-min cycle.
   const tLabel = (ts)=> new Date(ts*1000).toLocaleString([], {month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
@@ -2284,7 +2329,7 @@ function renderPnlChart(series, meta){
 
 // P&L interval selector. 1d is served inline by /trades/data (pnl_series); wider ranges fetch the
 // downsampled /trades/pnl endpoint. Selection is remembered and re-applied on each 15s poll.
-const PNL_RANGES = [["1d","1D","5-min cycle"],["1w","1W","30-min bucket"],["1m","1M","2-hour bucket"],["1y","1Y","1-day bucket"],["all","ALL","1-day bucket"]];
+const PNL_RANGES = [["1h","1H","1-min bucket"],["1d","1D","5-min cycle"],["1w","1W","30-min bucket"],["1m","1M","2-hour bucket"],["1y","1Y","1-day bucket"],["all","ALL","1-day bucket"]];
 let pnlRange = "1d";
 function renderPnlRangeButtons(){
   const host = document.getElementById("pnl-ranges");

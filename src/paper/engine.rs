@@ -190,18 +190,41 @@ impl PaperTradingEngine {
         .await?;
         // Carry forward cumulative realized P&L from settlements (do NOT reset to 0 on each fill,
         // else a fill after a settlement would wipe realized P&L — the input the "proven" gate needs),
-        // plus any P&L this order just realized by selling at market (autonomous exits). Unrealized
-        // is carried forward too (2026-07-15): this snapshot used to hardcode unrealized_pnl = 0,
-        // which made the /trades P&L chart spike toward realized-only for one point at EVERY fill
-        // and settlement (five green spikes in one day once the arb executor got busy). Stale by at
-        // most one 5-min cycle until the next mark_to_market snapshot recomputes it live.
-        let (last_realized, last_unrealized): (Decimal, Decimal) = sqlx::query_as(
-            "SELECT realized_pnl, unrealized_pnl FROM paper_trading.virtual_portfolio_snapshots ORDER BY as_of DESC LIMIT 1",
+        // plus any P&L this order just realized by selling at market (autonomous exits).
+        let last_realized: Decimal = sqlx::query_scalar(
+            "SELECT realized_pnl FROM paper_trading.virtual_portfolio_snapshots ORDER BY as_of DESC LIMIT 1",
         )
         .fetch_optional(&mut *tx)
         .await?
-        .unwrap_or((dec!(0), dec!(0)));
+        .unwrap_or(dec!(0));
         let realized_agg = last_realized + realized_delta;
+        // Unrealized is recomputed LIVE (2026-07-21 fix — same root cause as the 2026-07-20
+        // settlement fix, see compute_live_unrealized_pnl's doc comment in main.rs), not carried
+        // forward: the prior "carry forward last_unrealized" (2026-07-15 fix, replacing an earlier
+        // hardcoded 0) still double-counted an autonomous EXIT sell for one cycle — a closing sell's
+        // gain/loss landed in the fresh realized_delta above AND stayed in the stale carried-forward
+        // unrealized (which still counted the position at its pre-sale mark) until the next
+        // mark_to_market tick recomputed it, spiking the P&L chart and snapping back ~5min later
+        // (confirmed live 2026-07-21 12:45 UTC: a post_fill_tx snapshot read +20.41 total, the next
+        // mark_to_market read +15.50). The position upsert above already zeroed this order's shares
+        // if it was a full close, so this recompute (within the same tx, reading its own write)
+        // naturally excludes it — same `shares > 0` query, run against `&mut *tx` instead of the pool
+        // so it sees the just-updated row before commit.
+        let last_unrealized: Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(
+                 p.shares * (
+                     CASE WHEN p.outcome = 'Yes' THEN m.last_mid_yes ELSE m.last_mid_no END
+                     - p.avg_entry_price
+                 )
+             ), 0)
+             FROM paper_trading.paper_positions p
+             JOIN market_data.markets m ON m.gamma_id = p.market_id
+             WHERE p.shares > 0
+               AND (CASE WHEN p.outcome = 'Yes' THEN m.last_mid_yes ELSE m.last_mid_no END) IS NOT NULL",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap_or(dec!(0));
         // Cash identity: seed − open cost basis − fees + realized P&L (settlements + market exits).
         let new_usdc = (Decimal::from(10000u64) - total_locked_agg - total_fees_agg + realized_agg)
             .max(dec!(0));

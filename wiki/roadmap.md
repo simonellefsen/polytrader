@@ -112,6 +112,29 @@ the executor default) and P5 is deferred until a new signal or market class chan
 Deferred follow-ups surfaced during diagnostic checks but not yet built. Each has a full writeup in
 the dated Decision-log entry below; this is the at-a-glance index.
 
+- [x] **Third instance of the settlement/exit P&L double-counting bug, in `post_fill_tx`** (found
+  2026-07-21, operator-reported chart spike) → *DONE same day. Same root cause as the 2026-07-20
+  settlement fix (commit 57d256d), but in a different snapshot writer: `PaperTradingEngine::
+  submit_order`'s per-fill snapshot (`src/paper/engine.rs`) carried forward the PRIOR snapshot's
+  `unrealized_pnl` verbatim when an autonomous exit closed a position, so the closing sale's gain
+  landed in the fresh `realized_delta` AND stayed in the stale carried-forward unrealized (which
+  still counted the position at its pre-sale mark) until the next mark_to_market tick recomputed it
+  live ~5min later. Confirmed live: a `post_fill_tx` snapshot at 2026-07-21 12:45 UTC read +$20.41
+  total P&L; the next `mark_to_market` read +$15.50 — the exact spike-then-snap-back the operator
+  saw on the /trades chart. Fix: recompute unrealized LIVE within the same transaction (reads its
+  own just-updated `paper_positions` row, so a fully-closed position is naturally excluded via the
+  existing `shares > 0` filter) instead of carrying it forward — same `compute_live_unrealized_pnl`
+  query, inlined against `&mut *tx`. 146/146 tests passing (the one parallel-run flake,
+  `place_limit_order_bails_early_on_non_limit`, is the pre-existing known issue below — passes
+  clean single-threaded).
+- [x] **P&L chart: 1H range + hover tooltip** (2026-07-21, operator-requested) → *DONE same day.
+  Added `"1h"` to `PNL_RANGES` (1-min buckets, `/trades/pnl?range=1h`) alongside the existing
+  1D/1W/1M/1Y/ALL. Added a hover crosshair + tooltip to the inline-SVG chart (`src/server.rs`): a
+  transparent capture `<rect>` over the plot area drives `pnlHover`/`pnlHoverEnd`, which mutate a
+  dedicated `#pnl-hover-g` group (crosshair line, highlighted dot, timestamp+value box clamped to
+  stay inside the plot) without re-rendering the whole chart per mousemove. Verified via a
+  dispatched `mousemove` event (the remote browser tool's synthetic `hover` doesn't fire real
+  mousemove DOM events) — tooltip renders correctly positioned with the right timestamp/value.
 - [x] **Universe throughput pass — parameter/dashboard review** (2026-07-21) → *DONE same day, a
   throughput lever, not a risk-parameter change (edge/Kelly/exposure stayed untouched, protecting the
   P5 criterion above). Three changes: (1) Pruned 6 dead-weight bootstrap slugs — all `*-2028-*`
