@@ -44,8 +44,15 @@ spec:
             # 2026-07-04: pruned 26 resolved/eliminated slugs (all June/July/Aug/Dec Iran-Hormuz
             # deadline variants — resolved early with the June deal — plus NBA finals and eliminated
             # WC teams). They only produced closed=true fallback churn each ingest tick.
+            # 2026-07-21: pruned 6 more — the 2028 US presidential nomination/election slugs (end
+            # date 2028-11-07, ~2.3 years out). Verified zero open paper positions in any of them
+            # first. They were structurally incapable of ever contributing a settlement to the
+            # pre-registered P5 sample (wiki/roadmap "P5 go/no-go criterion") and were occupying
+            # DR_MARKET_LIMIT slots (bootstrap ranks FIRST in produce_5min_decision_report's ORDER
+            # BY) that short-dated, resolvable markets could use instead. Paired with raising
+            # POLYTRADER_ROTATION_LIMIT below — a throughput fix, not a risk-parameter change.
             - name: POLYTRADER_BOOTSTRAP_MARKETS
-              value: "strait-of-hormuz-traffic-returns-to-normal-by-end-of-june,strait-of-hormuz-traffic-returns-to-normal-by-july-31,will-benjamin-netanyahu-be-the-next-prime-minister-of-israel,will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568,will-jd-vance-win-the-2028-us-presidential-election,will-jd-vance-win-the-2028-republican-presidential-nomination,will-marco-rubio-win-the-2028-republican-presidential-nomination,will-the-republicans-win-the-2028-us-presidential-election,will-the-democrats-win-the-2028-us-presidential-election,will-the-republican-party-control-the-house-after-the-2026-midterm-elections,will-the-democratic-party-control-the-senate-after-the-2026-midterm-elections,2026-balance-of-power-d-senate-d-house-949,will-luiz-incio-lula-da-silva-win-the-2026-brazilian-presidential-election,will-flvio-bolsonaro-win-the-2026-brazilian-presidential-election,will-jordan-bardella-win-the-2027-french-presidential-election,will-douard-philippe-win-the-2027-french-presidential-election,will-gadi-eizenkot-be-the-next-prime-minister-of-israel,will-china-invade-taiwan-by-december-31-2027,will-no-fed-rate-cuts-happen-in-2026,fed-rate-hike-in-2026,will-bitcoin-reach-90000-by-december-31-2026-113-862-581-343,will-ethereum-dip-to-800-by-december-31-2026-568,will-france-win-the-2026-fifa-world-cup-924,will-spain-win-the-2026-fifa-world-cup-963,will-usa-win-the-2026-fifa-world-cup-467,will-england-win-the-2026-fifa-world-cup-937,will-argentina-win-the-2026-fifa-world-cup-245,will-portugal-win-the-2026-fifa-world-cup-912,will-brazil-win-the-2026-fifa-world-cup-183"
+              value: "strait-of-hormuz-traffic-returns-to-normal-by-end-of-june,strait-of-hormuz-traffic-returns-to-normal-by-july-31,will-benjamin-netanyahu-be-the-next-prime-minister-of-israel,will-the-republican-party-control-the-house-after-the-2026-midterm-elections,will-the-democratic-party-control-the-senate-after-the-2026-midterm-elections,2026-balance-of-power-d-senate-d-house-949,will-luiz-incio-lula-da-silva-win-the-2026-brazilian-presidential-election,will-flvio-bolsonaro-win-the-2026-brazilian-presidential-election,will-jordan-bardella-win-the-2027-french-presidential-election,will-douard-philippe-win-the-2027-french-presidential-election,will-gadi-eizenkot-be-the-next-prime-minister-of-israel,will-china-invade-taiwan-by-december-31-2027,will-no-fed-rate-cuts-happen-in-2026,fed-rate-hike-in-2026,will-bitcoin-reach-90000-by-december-31-2026-113-862-581-343,will-ethereum-dip-to-800-by-december-31-2026-568,will-france-win-the-2026-fifa-world-cup-924,will-spain-win-the-2026-fifa-world-cup-963,will-usa-win-the-2026-fifa-world-cup-467,will-england-win-the-2026-fifa-world-cup-937,will-argentina-win-the-2026-fifa-world-cup-245,will-portugal-win-the-2026-fifa-world-cup-912,will-brazil-win-the-2026-fifa-world-cup-183"
             # Arb-only markets (sports/World Cup): directional executor skips these; only risk-free
             # YES+NO arbitrage may trade them.
             - name: POLYTRADER_ARB_ONLY_MARKETS
@@ -67,8 +74,15 @@ spec:
             # trades ONLY (bootstrap slugs ∪ active rotation rows) — everything else stays arb-only.
             # This keeps the tradeable set short-dated and fresh (the profile the June 2026 curated
             # set proved out) instead of decaying as hand-picked markets resolve. 0 disables.
+            # 2026-07-21: 20→40. Was maxed at 20/20 active rows (real throughput ceiling on reaching
+            # the pre-registered P5 sample size — "data-starved" per wiki/roadmap). Zero extra Gamma
+            # load: discover_directional_markets already fetches ~5 pages (~500 candidates)
+            # regardless of this cap; raising it only lets more of that already-fetched pool get
+            # promoted. Extra cost is ~1s/market ingest-tick book-fetching (see
+            # POLYTRADER_ARB_DISCOVERY_LIMIT's comment) — current tick ~180s/300s interval, +20
+            # markets ≈ +20s, verify it stays comfortably under budget post-deploy.
             - name: POLYTRADER_ROTATION_LIMIT
-              value: "20"
+              value: "40"
             - name: POLYTRADER_ROTATION_MAX_DAYS
               value: "30"
             - name: POLYTRADER_ROTATION_MIN_VOL24H

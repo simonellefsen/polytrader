@@ -1534,21 +1534,42 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     // === Effective parameters (read-only) for the UI parameters panel ===
     let risk_cfg = crate::risk::RiskConfig::from_env();
     let env_flag = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-    let bootstrap_count = env_flag("POLYTRADER_BOOTSTRAP_MARKETS")
-        .map(|v| v.split(',').filter(|s| !s.trim().is_empty()).count())
-        .unwrap_or(0);
-    let arb_only_count = env_flag("POLYTRADER_ARB_ONLY_MARKETS")
-        .map(|v| v.split(',').filter(|s| !s.trim().is_empty()).count())
-        .unwrap_or(0);
+    let ingest_interval_secs: i64 = env_flag("POLYTRADER_INGEST_INTERVAL_SECS")
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(300);
+    // Live "markets tracked" (fixes a stale stat — this used to be just the static
+    // POLYTRADER_BOOTSTRAP_MARKETS/ARB_ONLY_MARKETS env list lengths, e.g. "29 (7 arb-only)",
+    // ignoring rotation-promoted markets, the volume-ranked arb-discovery pool, and the ladder
+    // watchlist entirely — the real scan universe runs ~170 markets, ~6x higher). `updated_at`
+    // within 2x the ingest interval is a reliable live-universe proxy: ingest_tick upserts
+    // (refreshing updated_at) EVERY market in its candidate list every tick, so anything not
+    // recently refreshed has fallen out of bootstrap/rotation/discovery and is a stale historical
+    // row from a market we no longer poll, not currently tracked. 2x (not 1x) gives headroom against
+    // tick-processing-time jitter (a market processed early in a slow tick can be ~tick_duration
+    // stale before the next cycle even starts). arb-only uses the real `is_arb_only_market`
+    // classifier (main.rs) against the live set, not the incomplete static allowlist, so sports AND
+    // the broader arb_category-routed markets (crypto/finance/geopolitics/etc.) both count.
+    let tracked_slugs: Vec<String> = sqlx::query_scalar(
+        "SELECT slug FROM market_data.markets WHERE updated_at > now() - ($1 || ' seconds')::interval",
+    )
+    .bind((ingest_interval_secs * 2).to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let markets_tracked = tracked_slugs.len();
+    let arb_only_count = tracked_slugs
+        .iter()
+        .filter(|s| crate::is_arb_only_market(s))
+        .count();
     let config_json = serde_json::json!({
         "risk": risk_cfg.to_json(),
         "autonomous_paper_execution": env_flag("POLYTRADER_AUTONOMOUS_PAPER_EXECUTION")
             .map(|v| v.to_lowercase() == "on").unwrap_or(false),
         "external_signals": env_flag("POLYTRADER_EXTERNAL_SIGNALS")
             .map(|v| v.to_lowercase() == "on").unwrap_or(false),
-        "ingest_interval_secs": env_flag("POLYTRADER_INGEST_INTERVAL_SECS").unwrap_or_else(|| "300".into()),
+        "ingest_interval_secs": ingest_interval_secs.to_string(),
         "decision_cadence_secs": "300",
-        "markets_tracked": bootstrap_count,
+        "markets_tracked": markets_tracked,
         "arb_only_markets": arb_only_count,
         "real_orders_enabled": false,
     });

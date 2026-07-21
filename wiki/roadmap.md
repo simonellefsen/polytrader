@@ -112,6 +112,22 @@ the executor default) and P5 is deferred until a new signal or market class chan
 Deferred follow-ups surfaced during diagnostic checks but not yet built. Each has a full writeup in
 the dated Decision-log entry below; this is the at-a-glance index.
 
+- [x] **Universe throughput pass — parameter/dashboard review** (2026-07-21) → *DONE same day, a
+  throughput lever, not a risk-parameter change (edge/Kelly/exposure stayed untouched, protecting the
+  P5 criterion above). Three changes: (1) Pruned 6 dead-weight bootstrap slugs — all `*-2028-*`
+  US-election markets, end date 2028-11-07, ~2.3 years out, structurally unable to ever contribute a
+  P5 settlement; confirmed zero open paper positions in any first. (2) `POLYTRADER_ROTATION_LIMIT`
+  20→40 — it was maxed at 20/20 active rows with 500 usable candidates sitting unused in the
+  discovery pool each pass; zero extra Gamma load (`discover_directional_markets` already fetches
+  ~5 pages regardless of the cap). Confirmed live: filled to 40/40 in the very first rotation pass
+  post-deploy. (3) Fixed the "Markets tracked" dashboard stat (`src/server.rs`), which was reporting
+  just `len(POLYTRADER_BOOTSTRAP_MARKETS)`/`len(POLYTRADER_ARB_ONLY_MARKETS)` (29/7) — a ~6x
+  undercount of the real ~170-market scan universe. Now counts `market_data.markets` rows with
+  `updated_at` inside 2x the ingest interval (a verified live-universe proxy) and classifies
+  arb-only via the real `is_arb_only_market` function instead of the incomplete static list.
+  **Verification:** ingest-tick gap stayed stable (~414s → ~428s, no runaway growth) across the
+  universe growing 158→178; pruned slugs confirmed absent from fresh decision_reports; dashboard
+  stat now reads ~163-178 markets tracked (was 29). 146/146 tests passing.*
 - [x] **Spread-aware entry gating** (2026-07-08) → *Built as P1 in the "Path to profitability" plan
   below, DONE 2026-07-10.*
 - [x] **`make backtest` can OOM-kill the live pod** (2026-07-10) → *DONE 2026-07-12, two-pronged.
