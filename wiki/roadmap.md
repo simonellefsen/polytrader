@@ -242,12 +242,15 @@ the dated Decision-log entry below; this is the at-a-glance index.
   `gamma_id` has a more-recently-promoted active row, so an orphan (including today's pre-existing
   one) gets cleaned up automatically on the next rotation pass, no manual SQL needed. 146/146
   passing.*
-- [ ] **Per-market scorecard query just over slow threshold** (2026-07-13). The settled-market
-  hit-rate lookup (`row_number() … rn <= 20` over decision_report JSONB for `ANY($1)` markets)
-  clocked ~1.04s (488 rows) — barely past the 1s alert. Runs per dashboard load, uncached. If it
-  creeps up, cache it like the 7d baseline (1h TTL) or add a partial index on
-  `(payload->>'market_id', created_at)` for `event_type='decision_report'`. *Low priority; the big
-  7d-baseline scan is already cached.*
+- [x] **Per-market scorecard query just over slow threshold** (2026-07-13) → *Re-checked 2026-07-21:
+  330ms (was ~1.04s when flagged) — comfortably under, not currently a problem. Rather than a
+  one-off manual recheck, added durable self-monitoring instead of just closing the ticket
+  (`src/server.rs`): the query is now timed on every call and WARNs (with elapsed_ms + row/market
+  counts) if it crosses 1s again — visible via the same `kubectl logs` grep as every other
+  diagnostic WARN, independent of any session/cron surviving to remember to look. If it fires, the
+  fix is still the one already written up here: cache it like the 7d baseline (1h TTL) or add a
+  partial index on `(payload->>'market_id', created_at)` for `event_type='decision_report'`.
+  146/146 passing.*
 - [x] **Advisory domination cap** (2026-07-13) → *DONE same day, see CHECKPOINT #5. Extends the
   advisory-only policy: market-internal signals OWN the direction, advisories only tilt. `fuse_named`
   now bounds `|advisory numerator| ≤ |market-internal numerator|`. Root cause was news' raw score

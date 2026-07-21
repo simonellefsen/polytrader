@@ -1896,11 +1896,19 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     // as settled markets age past it — their decision history is mostly older than a few days.) Using
     // the most-recent reports per market also avoids under-crediting signals whose inputs vanish at
     // resolution (e.g. orderbook_momentum: the book empties when a market closes).
+    // Self-monitoring (roadmap "Per-market scorecard query just over slow threshold", 2026-07-13):
+    // this query clocked ~1.04s (488 rows) when flagged — barely past the 1s alert, uncached, runs
+    // every dashboard load. Re-measured 2026-07-21: 330ms, comfortably under. Rather than a one-off
+    // manual recheck (which needs someone to remember to look), time it every call and WARN loudly
+    // if it crosses 1s again — durable, in-app, visible via the same `kubectl logs` grep as every
+    // other diagnostic WARN in this codebase, independent of any external session/cron surviving.
+    const SETTLED_ATTR_SLOW_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
     let market_attrs: Vec<(Option<String>, Option<serde_json::Value>)> =
         if settled_market_ids.is_empty() {
             Vec::new()
         } else {
-            sqlx::query_as(
+            let t0 = std::time::Instant::now();
+            let rows: Vec<(Option<String>, Option<serde_json::Value>)> = sqlx::query_as(
                 "SELECT market_id, attribution FROM (
                      SELECT payload->>'market_id' AS market_id,
                             payload->'report'->'attribution' AS attribution,
@@ -1915,7 +1923,18 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
             .bind(&settled_market_ids)
             .fetch_all(pool)
             .await
-            .unwrap_or_default()
+            .unwrap_or_default();
+            let elapsed = t0.elapsed();
+            if elapsed > SETTLED_ATTR_SLOW_THRESHOLD {
+                tracing::warn!(
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    rows = rows.len(),
+                    markets = settled_market_ids.len(),
+                    "settled-market scorecard attribution query exceeded 1s (see wiki/roadmap \
+                     'Per-market scorecard query just over slow threshold' for the cache/index fix)"
+                );
+            }
+            rows
         };
     // market_id -> set of signal names that fired (non-zero score) in ANY of its decision reports.
     let mut fired_by_market: std::collections::HashMap<String, std::collections::HashSet<String>> =
