@@ -136,6 +136,33 @@ pub async fn run_rotation(
                 .as_deref()
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|d| d.with_timezone(&chrono::Utc));
+            // Gamma occasionally renames a market's slug in place (same gamma_id, e.g. a
+            // disambiguating suffix added later — found 2026-07-21 via WARN-log spam: gamma_id
+            // 2643403 promoted 07-08 as "...-644", renamed by Gamma, re-promoted 07-09 as
+            // "...-644-479"). Since `slug` is the primary key, a naive insert-by-slug creates a
+            // SECOND row for the same market instead of renaming the first — and the old-slug row
+            // can never be demoted by `demote_dead` (its slug lookup against `market_data.markets`,
+            // which was updated in place to the new name, never matches), so it force-tracks a dead
+            // slug and WARN-spams every ingest tick forever. Fix: rename an existing active row for
+            // this gamma_id in place (UPDATE) instead of blindly inserting; only INSERT a new row
+            // when this gamma_id has no active row yet.
+            let renamed = sqlx::query(
+                "UPDATE market_data.directional_universe
+                 SET slug = $1, end_date = $2, volume_24hr = $3
+                 WHERE gamma_id = $4 AND demoted_at IS NULL AND slug <> $1",
+            )
+            .bind(&m.slug)
+            .bind(end_ts)
+            .bind(m.volume_24hr)
+            .bind(&m.id)
+            .execute(pool)
+            .await?
+            .rows_affected();
+            if renamed > 0 {
+                tracing::info!(slug = %m.slug, gamma_id = %m.id,
+                    "rotation: renamed existing directional_universe row in place (Gamma slug rename)");
+                continue; // already active under this gamma_id; not a new promotion
+            }
             // Insert-only: a slug that was demoted (resolved) stays demoted — resolution is final.
             let inserted = sqlx::query(
                 "INSERT INTO market_data.directional_universe
@@ -166,7 +193,11 @@ pub async fn run_rotation(
     Ok(stats)
 }
 
-/// Demote active rows whose market is closed/resolved in our DB or whose end date has passed.
+/// Demote active rows whose market is closed/resolved in our DB or whose end date has passed, OR
+/// whose gamma_id has a more-recently-promoted active row (self-healing belt-and-suspenders for any
+/// gamma-slug-rename duplicate that predates or slips past the in-place rename in `run_rotation` —
+/// keeps only the latest row per gamma_id active, so an orphan can't force-track a dead slug and
+/// WARN-spam forever even if one somehow gets created).
 /// (A just-promoted market may not be in market_data.markets until the next ingest tick — the
 /// LEFT JOIN keeps those alive.)
 async fn demote_dead(pool: &PgPool) -> Result<u64> {
@@ -176,7 +207,11 @@ async fn demote_dead(pool: &PgPool) -> Result<u64> {
            AND (du.end_date < now()
                 OR EXISTS (SELECT 1 FROM market_data.markets m
                             WHERE m.slug = du.slug
-                              AND (m.closed OR m.resolved_outcome IS NOT NULL)))",
+                              AND (m.closed OR m.resolved_outcome IS NOT NULL))
+                OR EXISTS (SELECT 1 FROM market_data.directional_universe du2
+                            WHERE du2.gamma_id = du.gamma_id
+                              AND du2.demoted_at IS NULL
+                              AND du2.promoted_at > du.promoted_at))",
     )
     .execute(pool)
     .await?

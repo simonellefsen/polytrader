@@ -227,11 +227,21 @@ the dated Decision-log entry below; this is the at-a-glance index.
   domination cap, that it overstates news_sentiment/yahoo_finance's real sway, and points at Weight
   (Hermes's learned trust) as the honest post-cap read. Pure string change — no query/behavior
   touched; 146/146 passing.*
-- [ ] **Dead bootstrap slug spam** (2026-07-13). `will-the-us-announce-withdrawal-from-mou-
-  negotiations-by-july-31-20260622192122521-644` is in `POLYTRADER_BOOTSTRAP_MARKETS` but Gamma
-  returns no market for it even with `closed=true` (renamed/delisted) — it WARN-logs every ingest
-  cycle. Prune it from the env list (confirm it's truly gone, not a transient Gamma hiccup, first).
-  *Cosmetic — log noise only, no trading impact.*
+- [x] **Dead bootstrap slug spam** (2026-07-13) → *DONE 2026-07-21, root cause was NOT what the
+  ticket assumed. The slug is not in `POLYTRADER_BOOTSTRAP_MARKETS` (confirmed clean) — it's an
+  ORPHANED `market_data.directional_universe` row. Gamma renamed a market's slug in place (same
+  `gamma_id` 2643403: promoted 07-08 as `...-644`, Gamma renamed it, rotation re-promoted 07-09 as
+  `...-644-479`). Since `slug` is the table's primary key, the insert-by-slug promotion created a
+  SECOND row instead of renaming the first, and `demote_dead`'s cleanup (matching `du.slug` against
+  `market_data.markets`, which was updated in place to the new name) could never match the stale
+  row — an unkillable duplicate that force-tracks a dead slug and WARN-spams every ingest tick
+  forever. This wasn't a one-off: it's a structural gap that can recur for ANY market Gamma renames
+  mid-tracking. Fixed in `src/rotation/mod.rs`: (1) the promotion loop now renames an existing
+  active row for the same `gamma_id` IN PLACE (UPDATE) instead of blindly inserting a new one; (2)
+  `demote_dead` gained a self-healing belt-and-suspenders condition — demote any active row whose
+  `gamma_id` has a more-recently-promoted active row, so an orphan (including today's pre-existing
+  one) gets cleaned up automatically on the next rotation pass, no manual SQL needed. 146/146
+  passing.*
 - [ ] **Per-market scorecard query just over slow threshold** (2026-07-13). The settled-market
   hit-rate lookup (`row_number() … rn <= 20` over decision_report JSONB for `ANY($1)` markets)
   clocked ~1.04s (488 rows) — barely past the 1s alert. Runs per dashboard load, uncached. If it
