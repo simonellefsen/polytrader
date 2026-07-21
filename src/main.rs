@@ -352,12 +352,16 @@ async fn seed_initial_portfolio_if_needed(pool: &sqlx::PgPool, initial_usdc: u64
     Ok(())
 }
 
-/// Write a mark-to-market portfolio snapshot: live unrealized P&L = Σ shares·(current_mid − avg_entry)
-/// over open positions (current_mid from the latest cached market mids), realized carried forward.
-/// This gives the /trades P&L chart a fresh, truthful data point each decision cycle (the per-fill
-/// snapshots stored unrealized_pnl = 0). Paper-only; no wallet or CLOB call.
-async fn write_mark_to_market_snapshot(pool: &sqlx::PgPool) -> Result<()> {
-    let unrealized: rust_decimal::Decimal = sqlx::query_scalar::<_, rust_decimal::Decimal>(
+/// Live mark-to-market unrealized P&L over currently open positions: Σ shares·(current_mid −
+/// avg_entry), current_mid from the latest cached market mids. Shared by the periodic
+/// mark_to_market writer and the settlement writer — settlement calls this AFTER deleting the
+/// just-settled positions so a market's own stale mark isn't double-counted alongside its new
+/// realized delta (2026-07-20 fix: the settlement writer used to carry forward the PRIOR snapshot's
+/// unrealized_pnl verbatim, which still included the settling position's last mark for one cycle —
+/// double-counting it against the fresh realized delta and producing a one-tick spike-and-snap-back
+/// on the P&L chart, self-correcting at the next mark_to_market tick ~5min later).
+async fn compute_live_unrealized_pnl(pool: &sqlx::PgPool) -> rust_decimal::Decimal {
+    sqlx::query_scalar::<_, rust_decimal::Decimal>(
         "SELECT COALESCE(SUM(
              p.shares * (
                  CASE WHEN p.outcome = 'Yes' THEN m.last_mid_yes ELSE m.last_mid_no END
@@ -371,7 +375,14 @@ async fn write_mark_to_market_snapshot(pool: &sqlx::PgPool) -> Result<()> {
     )
     .fetch_one(pool)
     .await
-    .unwrap_or(dec!(0));
+    .unwrap_or(dec!(0))
+}
+
+/// Write a mark-to-market portfolio snapshot: live unrealized P&L over open positions, realized
+/// carried forward. This gives the /trades P&L chart a fresh, truthful data point each decision
+/// cycle (the per-fill snapshots stored unrealized_pnl = 0). Paper-only; no wallet or CLOB call.
+async fn write_mark_to_market_snapshot(pool: &sqlx::PgPool) -> Result<()> {
+    let unrealized = compute_live_unrealized_pnl(pool).await;
 
     let realized: rust_decimal::Decimal = sqlx::query_scalar(
         "SELECT realized_pnl FROM paper_trading.virtual_portfolio_snapshots ORDER BY as_of DESC LIMIT 1",
@@ -1378,17 +1389,20 @@ async fn settle_resolved_positions(
     }
 
     // Recompute the portfolio snapshot with the updated cumulative realized P&L. Unrealized is
-    // carried forward from the latest snapshot (2026-07-15 — was hardcoded 0, spiking the P&L
-    // chart toward realized-only at every settlement; the next 5-min mark_to_market recomputes it
-    // live, so the carry is stale by at most one cycle).
-    let (prev_realized, prev_unrealized): (rust_decimal::Decimal, rust_decimal::Decimal) =
-        sqlx::query_as(
-            "SELECT realized_pnl, unrealized_pnl FROM paper_trading.virtual_portfolio_snapshots ORDER BY as_of DESC LIMIT 1",
-        )
-        .fetch_optional(pool)
-        .await?
-        .unwrap_or((dec!(0), dec!(0)));
+    // recomputed LIVE (2026-07-20), not carried forward from the latest snapshot: carrying forward
+    // (the 2026-07-15 fix, replacing an earlier hardcoded 0) still double-counted a just-settled
+    // position for one cycle -- its P&L landed in the fresh realized delta AND stayed in the stale
+    // carried-forward unrealized until the next mark_to_market tick, spiking the P&L chart down (or
+    // up) and snapping back ~5min later. Positions were already deleted above, so this recompute
+    // naturally excludes them -- see compute_live_unrealized_pnl's doc comment.
+    let prev_realized: rust_decimal::Decimal = sqlx::query_scalar(
+        "SELECT realized_pnl FROM paper_trading.virtual_portfolio_snapshots ORDER BY as_of DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(dec!(0));
     let new_realized = prev_realized + realized_delta;
+    let new_unrealized = compute_live_unrealized_pnl(pool).await;
     let locked: rust_decimal::Decimal = sqlx::query_scalar(
         "SELECT COALESCE(SUM(collateral_locked), 0) FROM paper_trading.paper_positions WHERE shares > 0",
     )
@@ -1416,7 +1430,7 @@ async fn settle_resolved_positions(
     )
     .bind(new_usdc)
     .bind(locked)
-    .bind(prev_unrealized)
+    .bind(new_unrealized.round_dp(2))
     .bind(new_realized)
     .execute(pool)
     .await?;
