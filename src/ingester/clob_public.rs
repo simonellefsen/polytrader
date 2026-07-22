@@ -45,25 +45,41 @@ impl ClobPublicClient {
 
     /// Fetch full orderbook for a specific outcome token (Yes or No share).
     /// Endpoint confirmed public: /book?token_id=...
-    pub async fn get_orderbook(&self, token_id: &str) -> Result<OrderbookSnapshot> {
+    ///
+    /// Returns `Ok(None)` for the CLOB's canonical "no live orderbook for this token" response
+    /// (404 `{"error":"No orderbook exists for the requested token id"}`) — confirmed live
+    /// 2026-07-22 while investigating a ~13/hour "CLOB orderbook fetch failed" WARN pattern: every
+    /// affected token traced back to arb-discovery-pool candidates (5-min BTC updown rounds,
+    /// scheduled-but-not-yet-started esports/tennis matches) that genuinely have zero resting
+    /// orders yet — a real, frequent, and entirely expected state for that pool, not a fetch
+    /// failure. The old code called `.json::<BookResp>()` unconditionally, so this 404's error body
+    /// (which has neither `bids` nor `asks`) failed struct deserialization and surfaced as a WARN
+    /// ("error decoding response body") indistinguishable from an actual problem. `Err` is now
+    /// reserved for genuine failures (network errors, timeouts, unexpected non-JSON bodies) that
+    /// still deserve a caller's attention.
+    pub async fn get_orderbook(&self, token_id: &str) -> Result<Option<OrderbookSnapshot>> {
         let url = format!("{}/book?token_id={}", self.base, token_id);
         #[derive(Deserialize)]
         struct BookResp {
             bids: Vec<PriceSize>,
             asks: Vec<PriceSize>,
         }
-        let resp: BookResp = self.http.get(&url).send().await?.json().await?;
+        let resp = self.http.get(&url).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let body: BookResp = resp.json().await?;
 
         // Try to also fetch authoritative mid (best effort)
         let mid = self.get_midpoint(token_id).await.ok();
 
-        Ok(OrderbookSnapshot {
+        Ok(Some(OrderbookSnapshot {
             token_id: token_id.to_string(),
-            bids: resp.bids,
-            asks: resp.asks,
+            bids: body.bids,
+            asks: body.asks,
             mid,
             fetched_at: chrono::Utc::now(),
-        })
+        }))
     }
 
     /// Ticker-like: current mid price for token (string in response).

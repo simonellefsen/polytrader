@@ -202,7 +202,13 @@ pub async fn ingest_tick(
             };
 
             match clob.get_orderbook(token).await {
-                Ok(book) => {
+                Ok(None) => {
+                    // Genuinely no live orderbook yet (404) — common+expected for arb-discovery-pool
+                    // candidates that haven't started (scheduled esports/tennis matches) or just
+                    // rolled over (5-min BTC updown rounds). Not a failure; debug-only.
+                    tracing::debug!(token = %token, "no live orderbook for token (not yet started/thin; skipping this cycle)");
+                }
+                Ok(Some(book)) => {
                     let bids_j = serde_json::to_value(&book.bids)?;
                     let asks_j = serde_json::to_value(&book.asks)?;
                     let mid = book.mid.or_else(|| ClobPublicClient::mid_from_book(&book));

@@ -112,6 +112,19 @@ the executor default) and P5 is deferred until a new signal or market class chan
 Deferred follow-ups surfaced during diagnostic checks but not yet built. Each has a full writeup in
 the dated Decision-log entry below; this is the at-a-glance index.
 
+- [x] **"CLOB orderbook fetch failed" WARN spam mis-classified an expected 404** (found 2026-07-22,
+  operator status-check follow-up) → *DONE same day. ~13/hour WARN pattern traced to a live API
+  check: every affected token was an arb-discovery-pool candidate (5-min BTC updown rounds,
+  scheduled-but-not-yet-started esports/tennis matches) whose CLOB `/book` endpoint genuinely
+  returns 404 `{"error":"No orderbook exists for the requested token id"}` — a real, frequent,
+  entirely expected state for that pool (none were in `directional_universe` or held positions).
+  `ClobPublicClient::get_orderbook` (`src/ingester/clob_public.rs`) called `.json::<BookResp>()`
+  unconditionally, so this 404 body (no `bids`/`asks` fields) failed struct deserialization and
+  surfaced as "error decoding response body" — indistinguishable from a genuine failure. Now
+  returns `Ok(None)` for a 404 (logged at debug in `ingest_tick`, `src/ingester/mod.rs`); `Err` is
+  reserved for real failures (network errors, timeouts, unexpected bodies) that still WARN. Deployed
+  and verified: zero WARN recurrence over 45min post-deploy (vs ~13/hour before) while other
+  debug-level ingester logs confirmed still emitting normally. 146/146 passing.*
 - [x] **Third instance of the settlement/exit P&L double-counting bug, in `post_fill_tx`** (found
   2026-07-21, operator-reported chart spike) → *DONE same day. Same root cause as the 2026-07-20
   settlement fix (commit 57d256d), but in a different snapshot writer: `PaperTradingEngine::
