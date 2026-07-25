@@ -456,6 +456,18 @@ impl PaperTradingEngine {
                 fee,
                 slippage_bps: slippage_bps.min(500), // cap for bootstrap
                 created_at: now,
+                // Audit trail: the actual level consumed plus the book's best price and depth, so a
+                // later investigation can tell a real book walk from the synthetic fallback below
+                // WITHOUT re-deriving it from orderbook_snapshots (which are not sorted best-first).
+                against_book: Some(serde_json::json!({
+                    "source": "book_walk",
+                    "level_price": level_price.to_string(),
+                    "level_size": level_size.to_string(),
+                    "taken": take.to_string(),
+                    "best_price": levels.first().map(|l| l.price.clone()),
+                    "levels_available": levels.len(),
+                    "mid_at_fill": base_mid.map(|m| m.to_string()),
+                })),
             };
 
             total_cost += gross;
@@ -482,6 +494,16 @@ impl PaperTradingEngine {
                 fee,
                 slippage_bps: ((impact * dec!(10000)).to_u32().unwrap_or(0) as i32).min(200),
                 created_at: now,
+                // Explicitly flagged: NO real liquidity backed this portion — it was priced off the
+                // last known mid. Anything marked `synthetic` should be treated as optimistic and is
+                // the first thing to check when a fill looks too good.
+                against_book: Some(serde_json::json!({
+                    "source": "synthetic_no_book",
+                    "base_mid": base.to_string(),
+                    "impact": impact.to_string(),
+                    "levels_available": levels.len(),
+                    "note": "market order remainder filled off last-known mid; no book liquidity matched",
+                })),
             });
             filled_size += remaining;
             // remaining = 0;

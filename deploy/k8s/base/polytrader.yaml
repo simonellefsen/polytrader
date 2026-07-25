@@ -74,15 +74,17 @@ spec:
             # trades ONLY (bootstrap slugs ∪ active rotation rows) — everything else stays arb-only.
             # This keeps the tradeable set short-dated and fresh (the profile the June 2026 curated
             # set proved out) instead of decaying as hand-picked markets resolve. 0 disables.
-            # 2026-07-21: 20→40. Was maxed at 20/20 active rows (real throughput ceiling on reaching
-            # the pre-registered P5 sample size — "data-starved" per wiki/roadmap). Zero extra Gamma
-            # load: discover_directional_markets already fetches ~5 pages (~500 candidates)
-            # regardless of this cap; raising it only lets more of that already-fetched pool get
-            # promoted. Extra cost is ~1s/market ingest-tick book-fetching (see
-            # POLYTRADER_ARB_DISCOVERY_LIMIT's comment) — current tick ~180s/300s interval, +20
-            # markets ≈ +20s, verify it stays comfortably under budget post-deploy.
+            # 2026-07-21: 20→40 to reach the pre-registered P5 sample size faster ("data-starved").
+            # 2026-07-25: 40→5. THE P5 CRITERION HAS READ OUT AND PATH A IS **NO-GO** — 23 directional
+            # outcomes (≥20 required), net-of-friction expectancy **−$0.4648/trade** (14W/9L). The
+            # criterion (wiki/roadmap "P5 go/no-go", pre-registered 2026-07-21 with an anti-gaming
+            # clause) pre-committed to "directional goes arb-only" on this result, so it is honored
+            # rather than re-interpreted. Held at 5 (not 0) as a deliberate CONTROL ARM: a trickle of
+            # directional outcomes keeps the regime observable, so a returning edge would still be
+            # detected instead of going permanently blind. Paired with MAX_DAILY_ENTRIES=1 below.
+            # Arb executors are untouched — Path B read GO (+$1.005/trade over 103 settlements).
             - name: POLYTRADER_ROTATION_LIMIT
-              value: "40"
+              value: "5"
             - name: POLYTRADER_ROTATION_MAX_DAYS
               value: "30"
             - name: POLYTRADER_ROTATION_MIN_VOL24H
@@ -103,8 +105,14 @@ spec:
             # or the time-stop. See wiki/roadmap "stop-loss widened".
             - name: POLYTRADER_EXIT_STOP_LOSS_PCT
               value: "0.50"
+            # Time-stop DISABLED 2026-07-25 (0 = never; any positive value re-arms it). It was the
+            # largest remaining exit leak — 13 exits / −$17.88 since the domination cap, against
+            # take_profit's +$8.42 — and it sells at the MARK before resolution, which contradicts
+            # the thesis this book's value rests on (arb legs are already hold-to-resolution for the
+            # same reason). "Frees dead capital" no longer applies: exposure sits ~14% of an 80% cap,
+            # so capital isn't the binding constraint and the friction is a pure cost.
             - name: POLYTRADER_EXIT_MAX_HOLD_DAYS
-              value: "14"
+              value: "0"
             # Signal-flip debounce (2026-07-10): the flip must hold across this many consecutive
             # decision reports (~5 min each) before exiting. A single noisy DR was selling bounded,
             # mean-reverting positions and paying round-trip friction: 21 flips / 8 wins / -$13.73
@@ -145,13 +153,23 @@ spec:
             # worst-case loss (the guaranteed spread), not notional — the notional is temporarily
             # locked collateral. 3x the old generic $250 arb cap; the proven earner gets room while
             # partial-fill residual risk stays journaled. Two-leg arb keeps POLYTRADER_ARB_NOTIONAL_CAP.
+            # 2026-07-25: 750→1500. The P5 criterion's Path B read **GO** — 103 arb settlements,
+            # +$1.005/trade expectancy, 22 distinct market families — so this is now the ONLY strategy
+            # with a demonstrated edge (directional read NO-GO the same day). A measured 2x, not more:
+            # the residual partial-fill risk (payout floor degrades to filled_legs−1) DOES scale with
+            # size and still needs P5 simultaneous fills before real money. Total exposure stays
+            # bounded by POLYTRADER_MAX_TOTAL_EXPOSURE_PCT and each basket by thinnest-leg depth.
             - name: POLYTRADER_ARB_MAX_BASKET_COLLATERAL
-              value: "750"
+              value: "1500"
             # P6 turnover budget (2026-07-12): max autonomous directional ENTRIES per UTC day.
             # Friction is paid per trade while the directional book runs ~flat gross, so the
             # marginal entry is usually P&L-negative. Exits + risk-free arb are NOT capped. 0 = off.
+            # 2026-07-25: 6→1, the second half of honoring the P5 Path A NO-GO (see
+            # POLYTRADER_ROTATION_LIMIT above). Rotation caps how many markets are ELIGIBLE; this caps
+            # how many entries actually fire per day. Together they hold directional at a control-arm
+            # trickle (~1 trade/day over ~5 markets) rather than switching it off entirely.
             - name: POLYTRADER_MAX_DAILY_ENTRIES
-              value: "6"
+              value: "1"
             # Correlated-cluster exposure cap: max fraction of the book locked across all markets that
             # resolve off the same underlying event (e.g. the ~15 Iran/Hormuz peace-deal markets). Each
             # passes the 20% per-market cap individually, but together they are one giant correlated bet.

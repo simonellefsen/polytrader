@@ -107,11 +107,95 @@ the executor default) and P5 is deferred until a new signal or market class chan
   suggests the *criterion itself* (not just the number) was wrong, that requires its own dated roadmap
   entry explaining the change — written before looking at the would-be-decisive data point.
 
+### ✅ READ-OUT — 2026-07-25. Path A **NO-GO**, Path B **GO**. Honored as written.
+
+The sample filled on schedule (registration estimated ~2 weeks; it took 4 days). Both paths were
+evaluated exactly as specified above — no threshold moved, no sample re-cut.
+
+| Path | Requirement | Actual | Verdict |
+|---|---|---|---|
+| **A — Directional** | ≥20 outcomes, expectancy > 0 | n=**23** (7 settled + 16 exits), expectancy **−$0.4648/trade**, total −$10.69, 14W/9L | **NO-GO** |
+| **B — Arb** | ≥10 fills, expectancy > 0, ≥2 families | n=**103**, expectancy **+$1.005/trade**, total +$103.47, **22** families | **GO** |
+
+**Supporting decomposition** (post-reset, realized, by entry source) — the reason the verdict is not
+close:
+
+| Source | n | Total | Avg |
+|---|---|---|---|
+| `autonomous_negrisk_arb_executor` | 84 | **+$94.94** | +1.130 |
+| `autonomous_arb_executor` | 18 | **+$37.87** | +2.104 |
+| `autonomous_executor_5min_dr` (directional) | 19 | **−$3.81** | −0.201 |
+| **Autonomous exits (round-trips)** | 79 | **−$126.76** | — |
+
+Two things this makes unambiguous. (1) **Arb is the entire edge.** (2) **Directional loses money even
+at an 18/19 settled win-rate** — a single −$29.34 (Spain, 2026 World Cup) erases eighteen small wins.
+That is textbook negative skew, and it is exactly what an expectancy test catches and a win-rate
+does not. Note the settled-record column on the dashboard scorecard reads 93–94% and is *not wrong* —
+it is just the wrong statistic for this decision.
+
+**Actions taken the same day (2026-07-25):**
+- Directional cut to a **control arm**, not switched off: `POLYTRADER_ROTATION_LIMIT` 40→5,
+  `POLYTRADER_MAX_DAILY_ENTRIES` 6→1. The criterion said "arb-only"; the operator chose to keep a
+  trickle so the regime stays observable and a returning edge would still be detectable rather than
+  going permanently blind. This is a *tightening* of the criterion's intent, not a loosening.
+- Arb capacity raised on the strength of Path B: `POLYTRADER_ARB_MAX_BASKET_COLLATERAL` 750→1500
+  (measured 2×; partial-fill residual risk still scales with size and still wants P5 first).
+- **P5 is now justified and unblocked** — by Path B alone, exactly as the criterion anticipated
+  ("the arb side may justify P5 INDEPENDENTLY"). It is no longer gated on the directional question.
+
+**A caveat recorded honestly:** Path A's n=23 is 7 settlements + 16 exits, and the exit mechanism was
+itself under active repair through the sample window (time-stop disabled the same day, below). So the
+directional read is partly a verdict on *how we were closing positions* rather than purely on signal
+quality. The criterion counted exits by design — a round-trip is a real outcome with real friction —
+and it is honored as written. But the control arm exists precisely so this is falsifiable later: if
+directional expectancy turns positive under the repaired exit regime, that will show up.
+
 ## 📋 Open items / TODO (live backlog, most recent first)
 
 Deferred follow-ups surfaced during diagnostic checks but not yet built. Each has a full writeup in
 the dated Decision-log entry below; this is the at-a-glance index.
 
+- [ ] **P5 — WebSocket CLOB feed. UNBLOCKED 2026-07-25** by the Path B GO above; it is now the
+  headline piece of work, no longer gated on the directional question. A gated skeleton already
+  exists — `ClobWsClient` (`src/ingester/clob_public.rs:159`) behind Cargo feature `clob-ws` +
+  `POLYTRADER_ENABLE_CLOB_WS`; build it out **in that gate**, don't add a parallel path. Unlocks:
+  (a) simultaneous multi-leg fills — the hard prerequisite for arb with real money, since
+  snapshot-based legs can mis-fill and turn a risk-free basket into a directional position;
+  (b) maker rebates (zero taker fee + 20–25% rebate); (c) honest fill simulation. Large.
+- [ ] **Widen the negrisk funnel** (2026-07-25, from the Path B GO). Arb is the only proven earner,
+  so its coverage is now the main throughput lever. Two knobs: `MIN_MEMBERS = 3`
+  (`src/strategy/negrisk.rs:40`) excludes 2-member events, and the scan only sees books the ingester
+  already holds (volume-ranked top-N), so event coverage is incidental rather than deliberate. Move
+  toward scanning *whole events* — the invariant holds for any subset, so partial coverage only
+  shrinks the captured spread.
+- [ ] **Variable-cadence ladder detection** (deferred from 2026-07-21 #4). `src/rotation/ladder.rs`
+  predicts fixed-cadence date-range families only (the weekly Musk ladder). Fed/FOMC ladders recur
+  per *meeting*, not on a fixed interval — needs a schedule-driven variant of `next_ladder_window`.
+- [ ] **Mark vs. realizable value** (2026-07-25, surfaced by the LeBron basket investigation). A won
+  basket leg marks at ~0.999 off a book with **zero asks and a 0.001 bid** — economically correct if
+  held to resolution (which arb legs always are), but not a price anything could be sold into. The
+  dashboard's unrealized therefore implies exitable profit that isn't. Split the display into
+  resolution-value vs. liquidatable-value. *Display-only; the underlying accounting is right.*
+- [x] **Time-stop exit disabled — the largest remaining P&L leak** (2026-07-25) → *DONE same day.
+  13 exits / **−$17.88** since the domination cap, against take_profit's +$8.42 and a lone −$11.45
+  stop_loss (signal_flip is fully quiet post-debounce — 0 exits). Beyond the number, the mechanism
+  contradicted the thesis the surviving edge rests on: a time-stop sells at the MARK before the
+  market resolves, but this book's value materializes AT RESOLUTION — the same reason arb legs have
+  been hold-to-resolution since 2026-07-04. The original "frees dead capital" rationale no longer
+  applies either: exposure sits ~14% of an 80% cap, so capital isn't the binding constraint and the
+  friction is pure cost. `POLYTRADER_EXIT_MAX_HOLD_DAYS` now defaults to 0 (= never; any positive
+  value re-arms it) and is 0 in the yaml. Take-profit and stop-loss stay armed. Extracted
+  `price_or_time_exit_reason` as a pure fn (matching the `flip_row_confirms` pattern) + 2 tests;
+  148/148 passing.*
+- [x] **`against_book` was always written empty** (2026-07-25) → *DONE same day. The column existed
+  but `src/journal/writer.rs` bound `{}` unconditionally ("filled by engine caller if wanted"), so
+  no fill had any record of the liquidity behind it. This directly cost investigation time on
+  2026-07-24 and nearly produced a false "synthetic fill" bug report: the LeBron basket's real book
+  had 102 ask levels with the true best ask at 0.527, but `orderbook_snapshots.asks` is **not sorted
+  best-first** (the engine warns about this) so a naive `asks->0` read showed 0.999 and looked like
+  a fabricated fill. Fills now carry the level consumed, best price, depth, level count, and mid —
+  and critically a `source` of `book_walk` vs `synthetic_no_book`, making the optimistic
+  market-order fallback visible instead of indistinguishable.*
 - [x] **"CLOB orderbook fetch failed" WARN spam mis-classified an expected 404** (found 2026-07-22,
   operator status-check follow-up) → *DONE same day. ~13/hour WARN pattern traced to a live API
   check: every affected token was an arb-discovery-pool candidate (5-min BTC updown rounds,

@@ -81,7 +81,11 @@ impl JournalWriter {
             .bind(f.size)
             .bind(f.fee)
             .bind(f.slippage_bps)
-            .bind(serde_json::json!({})) // against_book filled by engine caller if wanted
+            .bind(
+                f.against_book
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )
             .bind(f.created_at)
             .execute(&self.pool)
             .await?;

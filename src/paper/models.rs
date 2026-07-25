@@ -78,6 +78,15 @@ pub struct PaperFill {
     pub fee: Decimal,
     pub slippage_bps: i32,
     pub created_at: DateTime<Utc>,
+    /// Book evidence this fill was matched against, persisted to `paper_fills.against_book`.
+    /// Added 2026-07-25: the column existed but was always written as `{}`, so fills had NO audit
+    /// trail of the liquidity behind them. That gap made the 2026-07-24 LeBron-basket investigation
+    /// slow and nearly produced a false "synthetic fill" bug report — the real book had 102 ask
+    /// levels, but nothing in the fill record showed it. `source` distinguishes a genuine book walk
+    /// from the market-order synthetic fallback, which is exactly the distinction that was
+    /// unverifiable before. None ⇒ `{}` (unchanged legacy shape).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub against_book: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

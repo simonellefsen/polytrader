@@ -60,7 +60,17 @@ pub async fn evaluate_exits(
     // 2026-07-05→06). The stop only fires when the mid has ALSO moved this much in absolute
     // price. High-priced entries are unaffected (their 50% is already > the floor).
     let min_abs_move = dec_env("POLYTRADER_EXIT_MIN_ABS_MOVE", dec!(0.04));
-    let max_hold_days = dec_env("POLYTRADER_EXIT_MAX_HOLD_DAYS", dec!(14));
+    // Time-stop DISABLED BY DEFAULT 2026-07-25 (0 = never time-stop; any positive value re-arms it).
+    // It was the single largest remaining exit leak: 13 exits for −$17.88 post-domination-cap, vs
+    // take_profit's +$8.42 and a lone −$11.45 stop_loss (signal_flip is fully quiet since the
+    // debounce). More fundamentally it CONTRADICTS the thesis the surviving edge rests on: a
+    // time-stop sells at the MARK before the market resolves, but this book's value materializes AT
+    // RESOLUTION — the same reason arb legs are already hold-to-resolution (see the exclusion below).
+    // "Frees dead capital" was the original rationale, but capital is not the binding constraint
+    // here (exposure sits ~14% of an 80% cap), so paying friction to crystallize an unresolved
+    // mark is a pure cost. Resolution, take-profit, and a genuine thesis-collapse stop still close
+    // positions; nothing is held forever.
+    let max_hold_days = dec_env("POLYTRADER_EXIT_MAX_HOLD_DAYS", dec!(0));
     let min_net_edge = crate::risk::RiskConfig::from_env().min_net_edge;
 
     // Open positions on live (tradeable) markets with a fresh mark. updated_at < 30 min guards
@@ -123,16 +133,22 @@ pub async fn evaluate_exits(
             .map(|t| Decimal::from((chrono::Utc::now() - t).num_seconds()) / dec!(86400))
             .unwrap_or(dec!(0));
 
-        let reason = if move_pct >= take_profit {
-            Some("take_profit")
-        } else if move_pct <= -stop_loss && (mid - avg_entry).abs() >= min_abs_move {
-            Some("stop_loss")
-        } else if held_days >= max_hold_days {
-            Some("time_stop")
-        } else if signal_flipped(pool, &market_id, &outcome, min_net_edge).await {
-            Some("signal_flip")
-        } else {
-            None
+        // Price/time reasons are pure (unit-tested); signal_flip needs a DB read so it stays here
+        // and is only consulted when no price/time reason already fired.
+        let reason = match price_or_time_exit_reason(
+            move_pct,
+            mid - avg_entry,
+            held_days,
+            take_profit,
+            stop_loss,
+            min_abs_move,
+            max_hold_days,
+        ) {
+            Some(r) => Some(r),
+            None if signal_flipped(pool, &market_id, &outcome, min_net_edge).await => {
+                Some("signal_flip")
+            }
+            None => None,
         };
         let Some(reason) = reason else { continue };
 
@@ -266,6 +282,34 @@ async fn signal_flipped(
     })
 }
 
+/// Pure: the price/time exit reason for one position, or None. Extracted for unit testing (same
+/// pattern as `flip_row_confirms`); `signal_flip` is excluded because it requires a DB read.
+///
+/// Precedence is take-profit → stop-loss → time-stop, matching the original inline chain.
+/// `abs_move` is `mid − avg_entry` (signed); the stop needs BOTH a relative drop past `stop_loss`
+/// and an absolute move of at least `min_abs_move`, so cheap shares don't stop on pennies of noise.
+/// `max_hold_days <= 0` disables the time-stop entirely (the 2026-07-25 default — see the constant's
+/// comment for why selling at the mark before resolution is a pure cost for this book).
+fn price_or_time_exit_reason(
+    move_pct: Decimal,
+    abs_move: Decimal,
+    held_days: Decimal,
+    take_profit: Decimal,
+    stop_loss: Decimal,
+    min_abs_move: Decimal,
+    max_hold_days: Decimal,
+) -> Option<&'static str> {
+    if move_pct >= take_profit {
+        Some("take_profit")
+    } else if move_pct <= -stop_loss && abs_move.abs() >= min_abs_move {
+        Some("stop_loss")
+    } else if max_hold_days > dec!(0) && held_days >= max_hold_days {
+        Some("time_stop")
+    } else {
+        None
+    }
+}
+
 /// One decision report confirms a flip iff it targets the OPPOSITE outcome and its net edge clears
 /// both `min_net_edge` and the one-way friction floor at the report's target price. A report with
 /// no parsable price never confirms (conservative: holding a bounded position beats paying friction
@@ -300,8 +344,82 @@ fn flip_row_confirms(
 
 #[cfg(test)]
 mod tests {
-    use super::flip_row_confirms;
+    use super::{flip_row_confirms, price_or_time_exit_reason};
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn time_stop_disabled_at_zero_max_hold_days() {
+        // The 2026-07-25 default: 0 ⇒ never time-stop, however long the position is held.
+        assert_eq!(
+            price_or_time_exit_reason(
+                dec!(0.0),
+                dec!(0.0),
+                dec!(999), // held ~3 years
+                dec!(0.25),
+                dec!(0.50),
+                dec!(0.04),
+                dec!(0), // disabled
+            ),
+            None
+        );
+        // A positive value re-arms it (reversible via env, nothing is deleted).
+        assert_eq!(
+            price_or_time_exit_reason(
+                dec!(0.0),
+                dec!(0.0),
+                dec!(20),
+                dec!(0.25),
+                dec!(0.50),
+                dec!(0.04),
+                dec!(14),
+            ),
+            Some("time_stop")
+        );
+    }
+
+    #[test]
+    fn disabling_time_stop_leaves_take_profit_and_stop_loss_armed() {
+        // Both remaining reasons must still fire with the time-stop off — take_profit was the only
+        // NET-POSITIVE exit reason post-cap (+$8.42), and the stop is the thesis-collapse breaker.
+        assert_eq!(
+            price_or_time_exit_reason(
+                dec!(0.30),
+                dec!(0.15),
+                dec!(1),
+                dec!(0.25),
+                dec!(0.50),
+                dec!(0.04),
+                dec!(0),
+            ),
+            Some("take_profit")
+        );
+        assert_eq!(
+            price_or_time_exit_reason(
+                dec!(-0.60),
+                dec!(-0.30),
+                dec!(1),
+                dec!(0.25),
+                dec!(0.50),
+                dec!(0.04),
+                dec!(0),
+            ),
+            Some("stop_loss")
+        );
+        // Stop still respects the absolute-move floor: a 60% drop on a cheap share worth 2¢ of
+        // actual movement is noise, not a thesis collapse.
+        assert_eq!(
+            price_or_time_exit_reason(
+                dec!(-0.60),
+                dec!(-0.02),
+                dec!(1),
+                dec!(0.25),
+                dec!(0.50),
+                dec!(0.04),
+                dec!(0),
+            ),
+            None
+        );
+    }
 
     #[test]
     fn flip_needs_opposite_target_and_min_edge() {
