@@ -1259,6 +1259,14 @@ async fn maybe_execute_opportunity(
                 shares,
                 limit_price,
                 &order_id.to_string(),
+                &ShadowOrderContext {
+                    // net_edge is a fraction (the live gate is 0.02 = 2%); the dry-run wants bps.
+                    // Note the real bar is DELIBERATELY stricter than the paper gate: 400bps (4%)
+                    // vs the 2% we fill on in paper, so a paper fill clearing the live gate can
+                    // still — correctly — fail the real edge check.
+                    expected_edge_bps: Some(net_edge * dec!(10000)),
+                    basket: None,
+                },
             )
             .await;
         }
@@ -1572,6 +1580,23 @@ async fn real_trading_precondition(pool: &sqlx::PgPool) -> serde_json::Value {
     })
 }
 
+/// Strategy context for a shadow order — everything the real dry-run needs beyond the raw order
+/// fields, kept in one struct so `shadow_real_order` doesn't grow a tenth positional argument.
+#[derive(Debug, Clone, Default)]
+struct ShadowOrderContext {
+    /// Expected edge in basis points. Feeds the dry-run's `expected_edge_present_and_sufficient`
+    /// blocker (default floor 400bps = 4%). Added 2026-07-28: this was hardcoded `None` since the
+    /// shadow pipeline was built, so that blocker failed on EVERY shadow order (28/28 over the
+    /// preceding week) and told us nothing — a permanently-red check is not a signal. `None` still
+    /// means "no edge estimate available", which correctly keeps the check failing.
+    expected_edge_bps: Option<rust_decimal::Decimal>,
+    /// Set when this order is one leg of a multi-leg NegRisk basket: event id, leg count, this
+    /// leg's index, and whether the paper leg filled. A per-leg shadow can only answer "is this
+    /// order constructible"; assessing whether the BASKET was executable for real needs to know the
+    /// legs belong together, since the arb only holds if all of them fill.
+    basket: Option<serde_json::Value>,
+}
+
 /// Construct + validate the REAL Polymarket CLOB order that a paper fill WOULD send, run it through
 /// the fail-closed live sender (which refuses before any network call), and journal a
 /// `clob_shadow_order` event. SENDS NOTHING — no network order, no real money. This advances the
@@ -1588,6 +1613,7 @@ async fn shadow_real_order(
     size: rust_decimal::Decimal,
     price: rust_decimal::Decimal,
     paper_order_id: &str,
+    ctx: &ShadowOrderContext,
 ) {
     let token_id = resolve_token_id(pool, gamma_id, outcome).await;
 
@@ -1597,7 +1623,7 @@ async fn shadow_real_order(
         order_type: order_type.to_string(),
         size,
         price: Some(price),
-        expected_edge_bps: None,
+        expected_edge_bps: ctx.expected_edge_bps,
         market_id: Some(gamma_id.to_string()),
         outcome: Some(outcome.to_string()),
     };
@@ -1665,13 +1691,16 @@ async fn shadow_real_order(
                     "rejection_reason": result.rejection_reason,
                 },
                 "go_live_gate": gate,
+                "expected_edge_bps": ctx.expected_edge_bps.map(|e| e.to_string()),
+                "basket": ctx.basket,
                 "paper_only": true,
                 "real_orders_enabled": false,
-                "note": "SHADOW ONLY — built + validated the real order that would be sent, then the fail-closed sender refused dispatch. No network call, no real money. Real dispatch needs the go_live_gate satisfied AND a real sender wired (absent in this build).",
+                "note": "SHADOW ONLY — built + validated the real order that would be sent, then the fail-closed sender refused dispatch. No network call, no real money. Real dispatch needs the go_live_gate satisfied AND a real sender wired (absent in this build). When 'basket' is present this is ONE LEG of a NegRisk arb: the leg validating in isolation does NOT mean the basket was executable, which additionally needs every sibling leg to clear and to fill simultaneously (P5).",
             }),
         )
         .await;
-    tracing::info!(market = %gamma_id, outcome = %outcome, "shadow real order recorded (fail-closed; nothing sent)");
+    tracing::info!(market = %gamma_id, outcome = %outcome, basket = ctx.basket.is_some(),
+        "shadow real order recorded (fail-closed; nothing sent)");
 }
 
 /// Periodic arbitrage scan, journaled as an 'arb_scan' event for Hermes closed-loop learning.
@@ -1793,6 +1822,20 @@ fn negrisk_basket_units(
     max_units.min(collateral_cap / total_cost).round_dp(2)
 }
 
+/// A NegRisk basket's expected edge in basis points = return on the collateral needed to assemble
+/// it (net guaranteed profit per unit ÷ cost per unit). Fed to the real-order dry-run's edge gate.
+/// Pure so the bps scaling is pinned by test — an off-by-100 here would silently pass or fail the
+/// 400bps real-order blocker. Non-positive cost → 0 (callers guard, but never divide by zero).
+fn negrisk_basket_edge_bps(
+    net_profit_per_unit: rust_decimal::Decimal,
+    total_cost: rust_decimal::Decimal,
+) -> rust_decimal::Decimal {
+    if total_cost <= dec!(0) {
+        return dec!(0);
+    }
+    (net_profit_per_unit / total_cost * dec!(10000)).round_dp(1)
+}
+
 async fn execute_negrisk_opportunity(
     pool: &sqlx::PgPool,
     journal: &Arc<JournalWriter>,
@@ -1842,11 +1885,17 @@ async fn execute_negrisk_opportunity(
         return Ok(());
     }
 
+    // The arb's edge belongs to the BASKET, not to any single leg — no individual leg is
+    // "mispriced"; the guaranteed spread only exists once all legs are held. So every leg carries
+    // the basket's return on collateral as its expected edge.
+    let basket_edge_bps = negrisk_basket_edge_bps(opp.net_profit_per_unit, opp.total_cost);
+
     let mut filled_legs = 0usize;
     let mut total_filled_cost = dec!(0);
-    for leg in &opp.legs {
+    for (leg_index, leg) in opp.legs.iter().enumerate() {
+        let order_id = uuid::Uuid::new_v4();
         let order = crate::paper::PaperOrder {
-            id: uuid::Uuid::new_v4(),
+            id: order_id,
             market_id: leg.market_id.clone(),
             outcome: "No".to_string(),
             side: crate::paper::OrderSide::Buy,
@@ -1866,21 +1915,57 @@ async fn execute_negrisk_opportunity(
                 "real_orders_enabled": false,
             })),
         };
-        match engine.submit_order(order).await {
+        let leg_filled = match engine.submit_order(order).await {
             Ok(fills) if !fills.is_empty() => {
                 filled_legs += 1;
                 total_filled_cost += fills
                     .iter()
                     .map(|f| f.price * f.size)
                     .sum::<rust_decimal::Decimal>();
+                true
             }
             Ok(_) => {
                 warn!(event = %opp.event_id, market = %leg.market_id, "negrisk leg unfilled (stale/thin book)");
+                false
             }
             Err(e) => {
                 warn!(event = %opp.event_id, market = %leg.market_id, error = %e, "negrisk leg submit failed");
+                false
             }
-        }
+        };
+
+        // Shadow the REAL order this leg would send (2026-07-28). Until now the shadow pipeline ran
+        // ONLY off the directional executor, so the one strategy with positive expectancy — and the
+        // only one a real-money switch would be for — had never had a single order validated against
+        // the live exchange. Every leg is shadowed, filled or not: an unfilled leg is itself the
+        // finding, since a basket missing a leg is not an arb. $0 risk (fail-closed sender).
+        shadow_real_order(
+            pool,
+            journal,
+            &leg.market_id,
+            "No",
+            "buy",
+            "limit",
+            units,
+            leg.ask_no,
+            &order_id.to_string(),
+            &ShadowOrderContext {
+                expected_edge_bps: Some(basket_edge_bps),
+                basket: Some(serde_json::json!({
+                    "strategy": "negrisk_event_arbitrage",
+                    "event_id": opp.event_id,
+                    "legs": opp.legs.len(),
+                    "leg_index": leg_index,
+                    "leg_filled_in_paper": leg_filled,
+                    "units": units.to_string(),
+                    "basket_total_cost": opp.total_cost.to_string(),
+                    "basket_collateral": (units * opp.total_cost).round_dp(2).to_string(),
+                    "net_profit_per_unit": opp.net_profit_per_unit.to_string(),
+                    "min_payout_per_unit": opp.min_payout.to_string(),
+                })),
+            },
+        )
+        .await;
     }
     let complete = filled_legs == opp.legs.len();
     info!(event = %opp.event_id, legs = opp.legs.len(), filled_legs, %units, complete,
@@ -2510,6 +2595,22 @@ mod tests {
         );
         // Degenerate cost → 0 (no divide-by-zero).
         assert_eq!(negrisk_basket_units(dec!(50), dec!(750), dec!(0)), dec!(0));
+    }
+
+    #[test]
+    fn negrisk_basket_edge_bps_scales_return_on_collateral() {
+        use super::negrisk_basket_edge_bps;
+        // The real Jul-26 Brazilian-football basket: $0.6718 guaranteed net on a $1.315 basket is a
+        // 51% return on collateral — comfortably past the 400bps (4%) real-order edge floor.
+        assert_eq!(
+            negrisk_basket_edge_bps(dec!(0.67180125), dec!(1.315)),
+            dec!(5108.8)
+        );
+        // A 1% return is 100bps — i.e. it would FAIL the 400bps gate, which is the point of
+        // reporting the real number rather than leaving the check permanently red.
+        assert_eq!(negrisk_basket_edge_bps(dec!(0.01), dec!(1)), dec!(100));
+        // Degenerate cost → 0 (no divide-by-zero), mirroring negrisk_basket_units.
+        assert_eq!(negrisk_basket_edge_bps(dec!(0.5), dec!(0)), dec!(0));
     }
 
     #[test]

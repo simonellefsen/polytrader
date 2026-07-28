@@ -150,6 +150,47 @@ quality. The criterion counted exits by design — a round-trip is a real outcom
 and it is honored as written. But the control arm exists precisely so this is falsifiable later: if
 directional expectancy turns positive under the repaired exit regime, that will show up.
 
+## 💵 Real-money readiness assessment — 2026-07-28
+
+Triggered by an operator question: *"thinking of switching to real money Aug 1 — how far are we?"*
+Assessed against live code, the go-live gate, and the shadow-order journal. **Verdict: Aug 1 is not
+reachable.** Not because of missing plumbing — that part is closer than expected — but because the
+one strategy worth taking live cannot be executed by the current order machinery.
+
+**Green already:**
+
+| Gate | State |
+|---|---|
+| `proven` | ✅ realized **+$272.05** over **148** settled (min 10) |
+| `funded` | ✅ **$149.86** real PUSD on the proxy |
+| `approved` | ❌ `POLYTRADER_REAL_ORDERS_OPERATOR_APPROVAL` unset |
+
+`GatedRealClobLiveOrderSender` is real and wired — it signs and POSTs to CLOB `/order` behind four
+independent gates (env unlock, kill switch, human-approval event id, final-review event id). L2
+derivation works. This is genuine infrastructure, not a stub.
+
+**Blockers, in severity order:**
+
+1. **No atomic multi-leg execution — the disqualifier.** The proven edge is NegRisk basket arb;
+   it only pays if *every* leg fills. `place_limit_order` places **one** order and there is no batch
+   path. Filling 2 of 3 legs sequentially while prices move leaves a directional position in the
+   strategy that just scored **NO-GO**. Fixing this *is* the P5 WebSocket item above.
+2. **Capital scale breaks the strategy.** $149.86 at the dry-run's 1% per-trade risk = **$1.50 max
+   notional**. The Jul-26 Brazilian basket cost **$272 across 3 legs**. Not one basket from the
+   track record is executable at current funding, and +$1.005/trade expectancy scaled to $1.50
+   notional is under real fees and slippage.
+3. **Human-in-the-loop by design.** The autonomous executor is hardwired to
+   `FailClosedLiveOrderSender` with zero UUIDs — there is no autonomous real path, deliberately.
+   Live means approving each order by hand; a 9-leg basket is 9 approvals, which makes (1) worse.
+
+**On the track record itself:** paper fills match against snapshot books with a synthetic fallback
+when no book liquidity matched. Real fills face queue position, partial fills, and competition from
+colocated bots. Treat +$1.005/trade as an **upper bound**, not a forecast.
+
+*The two gaps this assessment found in the shadow pipeline (arb never shadowed; edge never reported)
+were fixed the same day — see the top DONE entry. That does not shorten the distance; it makes the
+distance measurable, which it previously was not.*
+
 ## 📋 Open items / TODO (live backlog, most recent first)
 
 Deferred follow-ups surfaced during diagnostic checks but not yet built. Each has a full writeup in
@@ -176,6 +217,25 @@ the dated Decision-log entry below; this is the at-a-glance index.
   held to resolution (which arb legs always are), but not a price anything could be sold into. The
   dashboard's unrealized therefore implies exitable profit that isn't. Split the display into
   resolution-value vs. liquidatable-value. *Display-only; the underlying accounting is right.*
+- [x] **Arb legs now shadow real orders + real edge is reported** (2026-07-28) → *DONE same day.
+  Found while answering "how far are we from real money on Aug 1?". Two independent gaps, both of
+  which made the shadow pipeline unable to answer that question:*
+  1. *`shadow_real_order` was called from **one** place — the directional executor
+     (`src/main.rs:1252`). Every one of the 28 shadow orders in the preceding week was directional.
+     **The arb path — the only strategy with positive expectancy, and the only one a real-money
+     switch would be for — had never had a single order validated against the live exchange.**
+     `execute_negrisk_opportunity` now shadows every basket leg, filled or not (an unfilled leg is
+     itself the finding: a basket missing a leg is not an arb), carrying a `basket` context block
+     (event id, leg index/count, units, collateral, per-unit economics) so the audit trail shows the
+     legs belong together. A leg validating in isolation does NOT mean the basket was executable.*
+  2. *`expected_edge_bps` was hardcoded `None`, so the dry-run's `expected_edge_present_and_sufficient`
+     blocker failed on **28/28** shadow orders. A permanently-red check is not a signal. Directional
+     now passes `net_edge × 10000`; arb passes the basket's return on collateral via a new pure fn
+     `negrisk_basket_edge_bps` (+3 tests). Note the real bar (400bps) is deliberately stricter than
+     the paper live gate (200bps), so a paper fill can still correctly fail the real edge check.*
+
+  *This does not move the real-money date — see the 2026-07-28 readiness assessment below — it makes
+  the remaining distance measurable. 149/149 passing.*
 - [x] **Time-stop exit disabled — the largest remaining P&L leak** (2026-07-25) → *DONE same day.
   13 exits / **−$17.88** since the domination cap, against take_profit's +$8.42 and a lone −$11.45
   stop_loss (signal_flip is fully quiet post-debounce — 0 exits). Beyond the number, the mechanism
