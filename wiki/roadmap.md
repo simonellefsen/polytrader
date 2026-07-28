@@ -191,6 +191,39 @@ colocated bots. Treat +$1.005/trade as an **upper bound**, not a forecast.
 were fixed the same day — see the top DONE entry. That does not shorten the distance; it makes the
 distance measurable, which it previously was not.*
 
+### First real arb-shadow data — 2026-07-28, same day
+
+The very first shadowed basket (event `716159`, 4 legs, all filled) came in at **29.1 bps**, and
+**falsified two claims made in the assessment above.** Recorded because the correction matters more
+than the original guess:
+
+1. *"Arb legs should clear the 400bps edge floor (the Jul-26 basket was ~5100bps)."* **Wrong** — that
+   basket is the 2nd-fattest of 24 ever executed. The **median is ~230bps**; two-thirds of baskets
+   traded would fail the real-money edge gate.
+2. *"The 400bps floor is a blocker."* **Wrong, and backwards** — it is a near-perfect profit filter:
+
+| Gate | Baskets | Total realized | Avg |
+|---|---|---|---|
+| **≥400bps** | 8 | **+$333.59** | **+$41.70** |
+| **<400bps** | 16 | +$22.03 | +$1.38 |
+
+**33% of baskets produced 94% of the profit.** Caveat stated honestly: this correlation is *partly
+mechanical* — realized P&L ≈ units × net-profit-per-unit, so higher edge yields higher P&L by
+construction. It is **not** evidence that fat baskets are better *predicted*. It is evidence for why
+the gate belongs in real money: a 57% guaranteed spread absorbs a mis-filled leg; a 0.29% spread is
+destroyed by one tick of slippage.
+
+**This reframes the real-money path.** The blocker is not "solve atomic multi-leg execution for all
+baskets" — it is **"only trade fat baskets, where partial-fill risk is affordable."** At ≥400bps the
+system would trade ~1 basket per 3 days rather than daily, needing far less execution machinery than
+full P5. Funding stays the binding constraint ($1.50 max notional vs $4.84–$12.12 legs), but a $30
+basket at 5744bps returns ~$17 — meaningful against $150.
+
+- [ ] **Gate arb execution on a minimum basket edge.** The scanner's own net-profit threshold admits
+  29bps baskets that earn ~$1 and add settlement/partial-fill surface for nothing. Consider a
+  `POLYTRADER_ARB_MIN_BASKET_EDGE_BPS` floor well above the current threshold. *Do this before any
+  real-money step, not after — it shrinks the execution problem rather than solving it.*
+
 ## 📋 Open items / TODO (live backlog, most recent first)
 
 Deferred follow-ups surfaced during diagnostic checks but not yet built. Each has a full writeup in
