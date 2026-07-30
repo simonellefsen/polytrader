@@ -1263,8 +1263,9 @@ async fn maybe_execute_opportunity(
                     // net_edge is a fraction (the live gate is 0.02 = 2%); the dry-run wants bps.
                     // Note the real bar is DELIBERATELY stricter than the paper gate: 400bps (4%)
                     // vs the 2% we fill on in paper, so a paper fill clearing the live gate can
-                    // still — correctly — fail the real edge check.
-                    expected_edge_bps: Some(net_edge * dec!(10000)),
+                    // still — correctly — fail the real edge check. round_dp(1) to match the arb
+                    // path (negrisk_basket_edge_bps) — unrounded, this logged 26 decimal places.
+                    expected_edge_bps: Some((net_edge * dec!(10000)).round_dp(1)),
                     basket: None,
                 },
             )
@@ -1666,38 +1667,41 @@ async fn shadow_real_order(
 
     let gate = real_trading_precondition(pool).await;
 
+    let mut payload = serde_json::json!({
+        "paper_order_id": paper_order_id,
+        "would_send": {
+            "market_id": gamma_id,
+            "token_id": token_id,
+            "outcome": outcome,
+            "side": side,
+            "order_type": order_type,
+            "size": size.to_string(),
+            "price": price.to_string(),
+        },
+        "dry_run_validation": dry_run,
+        "fail_closed_result": {
+            "sender": result.sender_name,
+            "accepted_for_network_dispatch": result.accepted_for_network_dispatch,
+            "request_sent": result.request_sent,
+            "post_order_called": result.post_order_called,
+            "rejection_reason": result.rejection_reason,
+        },
+        "go_live_gate": gate,
+        "expected_edge_bps": ctx.expected_edge_bps.map(|e| e.to_string()),
+        "paper_only": true,
+        "real_orders_enabled": false,
+        "note": "SHADOW ONLY — built + validated the real order that would be sent, then the fail-closed sender refused dispatch. No network call, no real money. Real dispatch needs the go_live_gate satisfied AND a real sender wired (absent in this build). When 'basket' is present this is ONE LEG of a NegRisk arb: the leg validating in isolation does NOT mean the basket was executable, which additionally needs every sibling leg to clear and to fill simultaneously (P5).",
+    });
+    // Insert `basket` only for real baskets — do NOT emit it as JSON null for directional orders.
+    // Postgres treats JSONB null as a VALUE, so `payload->'basket' IS NOT NULL` is TRUE for a null
+    // literal: the obvious "find the arb legs" query would silently scoop up every directional row
+    // too (observed 2026-07-30, one directional order polluting an arb-leg query). Omitting the key
+    // makes `payload ? 'basket'` and `IS NOT NULL` agree.
+    if let Some(basket) = &ctx.basket {
+        payload["basket"] = basket.clone();
+    }
     let _ = journal
-        .record_journal_event(
-            "clob_shadow_order",
-            "polytrader_shadow",
-            "info",
-            serde_json::json!({
-                "paper_order_id": paper_order_id,
-                "would_send": {
-                    "market_id": gamma_id,
-                    "token_id": token_id,
-                    "outcome": outcome,
-                    "side": side,
-                    "order_type": order_type,
-                    "size": size.to_string(),
-                    "price": price.to_string(),
-                },
-                "dry_run_validation": dry_run,
-                "fail_closed_result": {
-                    "sender": result.sender_name,
-                    "accepted_for_network_dispatch": result.accepted_for_network_dispatch,
-                    "request_sent": result.request_sent,
-                    "post_order_called": result.post_order_called,
-                    "rejection_reason": result.rejection_reason,
-                },
-                "go_live_gate": gate,
-                "expected_edge_bps": ctx.expected_edge_bps.map(|e| e.to_string()),
-                "basket": ctx.basket,
-                "paper_only": true,
-                "real_orders_enabled": false,
-                "note": "SHADOW ONLY — built + validated the real order that would be sent, then the fail-closed sender refused dispatch. No network call, no real money. Real dispatch needs the go_live_gate satisfied AND a real sender wired (absent in this build). When 'basket' is present this is ONE LEG of a NegRisk arb: the leg validating in isolation does NOT mean the basket was executable, which additionally needs every sibling leg to clear and to fill simultaneously (P5).",
-            }),
-        )
+        .record_journal_event("clob_shadow_order", "polytrader_shadow", "info", payload)
         .await;
     tracing::info!(market = %gamma_id, outcome = %outcome, basket = ctx.basket.is_some(),
         "shadow real order recorded (fail-closed; nothing sent)");
