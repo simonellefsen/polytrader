@@ -53,18 +53,22 @@ thiserror = "1"
 dotenvy = "0.15"
 clap = { version = "4", features = ["derive", "env"] }
 
-# Optional resilient WS client for CLOB feeds (orderbook/trades streaming for future reactive tier).
-# STRICTLY gated: feature "clob-ws" (default off) + runtime env POLYTRADER_ENABLE_CLOB_WS=highconviction.
-# Skeleton only (connection mgmt, reconnect, basic msg handling); no activation in poll paths.
-# Follows patterns from transferred repos (see wiki decisions/2026-05-25-data-ingester... + integrations).
-# Paper-only, $150 context: do not enable lightly (complexity/risk vs deliberate 5-min tier).
+# Live CLOB orderbook feed over WebSocket (P5; src/ingester/clob_ws.rs).
+# Two gates, both retained from the original skeleton:
+#   - compile: feature "clob-ws" (off for a plain `cargo build`; the release image enables it so the
+#     feed is present and can be exercised live).
+#   - runtime: POLYTRADER_ENABLE_CLOB_WS, unset by default. Only "shadow" (read-only book
+#     maintenance + REST audit) is implemented; "highconviction" (reactive execution) is refused.
 # rustls to match existing reqwest tls choice.
 tokio-tungstenite = { version = "0.21", optional = true, features = ["rustls-tls-webpki-roots"] }
+# Stream/Sink combinators for the WS read loop. Already present transitively (sqlx, reqwest);
+# declared here so the WS module's use of it is explicit rather than an accident of the lockfile.
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["std", "sink"] }
 
 [features]
 default = []
 native-l2 = ["dep:polymarket_client_sdk_v2"]
-clob-ws = ["dep:tokio-tungstenite"]
+clob-ws = ["dep:tokio-tungstenite", "dep:futures-util"]
 
 [dev-dependencies]
 tokio-test = "0.4"

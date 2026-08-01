@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY Cargo.toml Cargo.lock* ./
 # Dummy main to cache deps
 RUN mkdir -p src && echo 'fn main(){}' > src/main.rs
-RUN cargo build --release --locked --features native-l2 --bin polytrader || true
+RUN cargo build --release --locked --features native-l2,clob-ws --bin polytrader || true
 
 # Real source
 COPY . .
@@ -22,7 +22,7 @@ COPY . .
 # can preserve source mtimes older than that artifact, so Cargo may otherwise ship the
 # no-op binary and Kubernetes sees an immediate clean exit. Keep deps cached, but force
 # this binary source newer than the cached artifact before building the real app.
-RUN touch src/main.rs && cargo build --release --locked --features native-l2 --bin polytrader
+RUN touch src/main.rs && cargo build --release --locked --features native-l2,clob-ws --bin polytrader
 
 # Runtime image for polytrader (main app + dashboard)
 # Keep a slim glibc runtime with OpenSSL available for sqlx/reqwest and the native

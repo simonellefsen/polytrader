@@ -4528,6 +4528,7 @@ dependencies = [
  "dioxus",
  "dioxus-ssr",
  "dotenvy",
+ "futures-util",
  "hmac",
  "polymarket_client_sdk_v2",
  "reqwest 0.12.28",

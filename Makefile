@@ -90,6 +90,9 @@ check:
 	cargo check --features native-l2
 	cargo test --features native-l2 -- clob::authenticated::tests::place_limit -- --test-threads=1
 	cargo test --features native-l2 -- clob::live_sender::tests::gated_real -- --test-threads=1
+	# The release image builds with clob-ws (P5 live orderbook feed), so its tests must run
+	# under that feature or they are never compiled — the default `cargo test` filters them out.
+	cargo test --features clob-ws --bin polytrader -- ingester::clob_ws --test-threads=1
 
 # Strict guardrails that MUST pass before any deployment.
 # This prevents wasting time on CrashLoopBackOff deploys due to
@@ -108,6 +111,9 @@ pre-deploy-check:
 	cargo check --features native-l2
 	cargo test --features native-l2 -- clob::authenticated::tests::place_limit -- --test-threads=1
 	cargo test --features native-l2 -- clob::live_sender::tests::gated_real -- --test-threads=1
+	# The release image builds with clob-ws (P5 live orderbook feed), so its tests must run
+	# under that feature or they are never compiled — the default `cargo test` filters them out.
+	cargo test --features clob-ws --bin polytrader -- ingester::clob_ws --test-threads=1
 	@echo ""
 	@echo "==> Running clippy for visibility (does not block deploy yet)..."
 	cargo clippy --all-targets -- -D warnings || echo "    (Clippy warnings exist — consider cleaning, but not blocking deploy for now)"
@@ -116,6 +122,9 @@ pre-deploy-check:
 	cargo check --features native-l2
 	cargo test --features native-l2 -- clob::authenticated::tests::place_limit -- --test-threads=1
 	cargo test --features native-l2 -- clob::live_sender::tests::gated_real -- --test-threads=1
+	# The release image builds with clob-ws (P5 live orderbook feed), so its tests must run
+	# under that feature or they are never compiled — the default `cargo test` filters them out.
+	cargo test --features clob-ws --bin polytrader -- ingester::clob_ws --test-threads=1
 	@echo ""
 	@echo "==> ✅ Guardrails passed. fmt + check + tests + native-l2 real gated coverage are clean. Safe to build/deploy."
 	@echo "    (Clippy is advisory for now due to pre-existing L2/paper engine noise.)"

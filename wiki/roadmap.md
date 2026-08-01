@@ -289,6 +289,72 @@ as far from tradeable as the 1.031 event the old metric was pointing at.
   the events where an arb could actually clear, rather than at the ones with the biggest raw
   overround and an unpayable bar.
 
+## 📡 P5 increment 1 — the live book exists, and it is provably right — 2026-08-01
+
+The pre-registered criterion unblocked P5 on 2026-07-25 (Path B GO). This is the first real
+increment. `ClobWsClient` had been a documented no-op since May; it is now
+`src/ingester/clob_ws.rs`, a real client behind the same two gates — Cargo feature `clob-ws` (now
+on in the release image) plus `POLYTRADER_ENABLE_CLOB_WS=shadow`.
+
+**The protocol was established by connecting to it, not by reading docs** (probe against
+`wss://ws-subscriptions-clob.polymarket.com/ws/market`, 500 live tokens). Three findings that a
+docs-first implementation would have got wrong:
+- The opening frame is a JSON **array** of `book` snapshots; everything after is single
+  `price_change` objects whose `price_changes` array batches several assets per frame.
+- `size:"0"` is a **deletion**, not a zero-size level. Treated as a level it leaves a phantom at the
+  top of the book and quotes a price nobody is offering.
+- **Bids arrive ascending, asks descending** — best-last on both sides. So the code sorts nothing
+  and trusts nothing: levels live in a `BTreeMap` keyed by price and best-of-book is a min/max. This
+  is the same trap that made an `asks->0` SQL read report an implied sum of 0.066 against the
+  scanner's 1.021 on 2026-08-01; the fix is to remove the assumption, not to document it.
+
+**Gap detection without sequence numbers.** The feed has no sequence field, so a dropped frame would
+corrupt a book silently and permanently — the one failure mode a live feed must not have. But every
+`price_change` carries the exchange's own `best_bid`/`best_ask`, which is a free continuous
+consistency check against the top we derive ourselves. Two refinements, both from reasoning about
+what the field actually means rather than from a failure:
+- The stated best describes the book **after the whole frame**, so the check runs once per token per
+  frame, not per change. Checked per change, a frame that adds depth before moving the top flags
+  itself.
+- One mismatch is a **race**, not a gap: a frame can arrive behind the state it describes. A real
+  gap never heals, so `DESYNC_STRIKES = 3` consecutive disagreements condemn the book; agreement
+  resets. Condemned books are withheld from readers until a reconnect re-snapshots them.
+
+**Measured live** (2 shards × 250 tokens, ~1,400 frames/sec sustained, 44m CPU / 58Mi):
+
+| | tracked | fresh | desynced | stale | reconnects | REST audit |
+|---|---|---|---|---|---|---|
+| first build, 7 samples | 488→501 | 462–492 | 2–9 | **17–18** | 0 | 52/52 agreed |
+| after the freshness fix, 5 samples | 496 | 481–486 | 10–15 | **0** | 0 | 40/40 agreed |
+
+**92/92 agreement against fresh REST `/book` fetches, zero disagreements, zero reconnects.** The
+audit is deliberately *not* a comparison against `orderbook_snapshots` — that table is up to five
+minutes old, so it differs always and proves nothing either way. Ground truth has to be fetched at
+the moment of comparison or the check cannot fail for the right reason.
+
+Two defects the live run exposed, both fixed and redeployed the same hour:
+1. **Per-book age is the wrong staleness signal.** A calm market emits no deltas, so 17–18 perfectly
+   accurate books were being condemned for being quiet. Silence from a *market* is not silence from
+   the *feed*. Freshness now tracks the shard: a book is readable iff its connection is alive.
+   This mattered more than the count suggests — wide, quiet books are disproportionately the negRisk
+   ladder legs the arb scanner exists to read.
+2. **Exact-set resubscribe churned every 5 minutes.** The discovery pool rotates a few tokens per
+   tick, and any difference tore down and rebuilt every socket, losing all delta continuity. Now
+   only material drift (≥10% of the set, floor 20) triggers a resubscribe.
+
+**The desyncs are concentrated and interesting.** ~2–3% of books at any moment, and across the whole
+run only 36 distinct tokens — all **live in-play**: MLB games in progress, WNBA, Valorant, tennis.
+Those are precisely the markets the 2026-07-16 entry identified as holding the only RICH overrounds
+(27% on Canada–Morocco) and as uncapturable without WebSocket. So the hardest books to track are the
+ones with the alpha, and the detector is what makes that visible instead of silently wrong.
+
+**Nothing downstream reads these books.** That is the point of the increment: every claim P5 makes
+rests on the book being correct, and a book that is quietly wrong turns a "risk-free" basket into a
+directional position. `highconviction` — the reactive-execution mode the old skeleton named — is
+**refused** at startup rather than silently downgraded to shadow, so an operator can't believe
+execution is live when it isn't. Increment 2 (let the arb scanner read the live book instead of
+5-minute-old snapshots) is gated on this audit staying clean.
+
 ## 🔭 The arb scanner was reading 14% of every event it scanned — 2026-08-01
 
 Operator question: *"Why are we not opening new positions, are we being too cautious?"* Two answers,
@@ -345,12 +411,20 @@ Deferred follow-ups surfaced during diagnostic checks but not yet built. Each ha
 the dated Decision-log entry below; this is the at-a-glance index.
 
 - [ ] **P5 — WebSocket CLOB feed. UNBLOCKED 2026-07-25** by the Path B GO above; it is now the
-  headline piece of work, no longer gated on the directional question. A gated skeleton already
-  exists — `ClobWsClient` (`src/ingester/clob_public.rs:159`) behind Cargo feature `clob-ws` +
-  `POLYTRADER_ENABLE_CLOB_WS`; build it out **in that gate**, don't add a parallel path. Unlocks:
-  (a) simultaneous multi-leg fills — the hard prerequisite for arb with real money, since
-  snapshot-based legs can mis-fill and turn a risk-free basket into a directional position;
-  (b) maker rebates (zero taker fee + 20–25% rebate); (c) honest fill simulation. Large.
+  headline piece of work, no longer gated on the directional question. Unlocks: (a) simultaneous
+  multi-leg fills — the hard prerequisite for arb with real money, since snapshot-based legs can
+  mis-fill and turn a risk-free basket into a directional position; (b) maker rebates (zero taker
+  fee + 20–25% rebate); (c) honest fill simulation. Large — being built in increments:
+  - [x] **Increment 1 — the live book, and proof it is correct** → *DONE 2026-08-01, see the dated
+    entry below.* Real client at `src/ingester/clob_ws.rs` (the old no-op skeleton is gone), behind
+    the same two gates: Cargo feature `clob-ws` (now on in the release image) + runtime
+    `POLYTRADER_ENABLE_CLOB_WS=shadow`. Maintains books from snapshot+delta with missed-message
+    detection; **nothing downstream reads them.** Live: 488 books, 8/8 REST audit agreement.
+  - [ ] **Increment 2 — let the arb scanner read the live book.** The negRisk scanner currently
+    reads `orderbook_snapshots`, i.e. prices up to 5 minutes old, which is the single biggest
+    reason a 20bps-short basket may in fact have been tradeable at some instant in that window.
+    Gate on the audit having stayed clean; keep the poller as the fallback for stale/desynced books.
+  - [ ] **Increment 3 — simultaneous multi-leg fill simulation**, then maker quoting. Only after 2.
 - [x] **Widen the negrisk funnel** (2026-07-25, from the Path B GO) → *DONE 2026-08-01. Triggered by
   the operator question "why are we not opening new positions, are we being too cautious?" — the
   directional throttle was deliberate (the P5 NO-GO), but arb, the GO path, had gone quiet and that

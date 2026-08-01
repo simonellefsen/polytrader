@@ -201,6 +201,35 @@ spec:
             # those numbers, not against a guess. 0 disables the gate entirely.
             - name: POLYTRADER_ARB_MIN_BASKET_EDGE_BPS
               value: "50"
+            # === P5 — live CLOB orderbook feed over WebSocket (2026-08-01, first increment) ===
+            # "shadow" = maintain live books from the WS feed and audit them against REST /book.
+            # NOTHING downstream reads these books: no strategy, no executor, no snapshot write.
+            # It is running here for one reason — to establish, on live data over days rather than
+            # in a unit test, that a delta-maintained book is actually correct. Every claim P5 makes
+            # (simultaneous multi-leg fills, maker rebates, honest fill simulation) rests on that,
+            # and a book that is silently wrong would turn a "risk-free" basket into a directional
+            # position. So the accuracy proof comes first and is publicly checkable in the logs:
+            # `P5 CLOB WS shadow diagnostics` reports audit_agreed/audit_disagreed against fresh
+            # REST fetches, plus desync_events (missed-message detection) and reconnects.
+            #
+            # Cost is bounded and small: ~2 sockets to a public endpoint, no DB writes, no extra
+            # REST load beyond POLYTRADER_CLOB_WS_AUDIT_SAMPLE fetches/minute.
+            #
+            # Unset (or any unrecognized value) turns the feed off entirely. "highconviction" —
+            # the reactive-execution mode the original skeleton named — is REFUSED rather than
+            # silently downgraded, because it is not implemented.
+            - name: POLYTRADER_ENABLE_CLOB_WS
+              value: "shadow"
+            # Cap on subscribed tokens, sharded 250/connection. 500 covers the current universe
+            # (~430 books after the negRisk completion pass) with headroom; the cap exists so a
+            # runaway universe cannot open unlimited sockets against a public endpoint.
+            - name: POLYTRADER_CLOB_WS_MAX_ASSETS
+              value: "500"
+            # Tokens re-checked against REST per minute. 8/min ≈ every tracked book audited about
+            # once an hour — enough to catch a systematic error quickly without adding meaningful
+            # load to an endpoint the poller is already using.
+            - name: POLYTRADER_CLOB_WS_AUDIT_SAMPLE
+              value: "8"
             # P6 turnover budget (2026-07-12): max autonomous directional ENTRIES per UTC day.
             # Friction is paid per trade while the directional book runs ~flat gross, so the
             # marginal entry is usually P&L-negative. Exits + risk-free arb are NOT capped. 0 = off.

@@ -171,6 +171,123 @@ async fn main() -> Result<()> {
         // for clean shutdown of the ingestion task (current fire-and-forget is acceptable for bootstrap).
     }
 
+    // === P5: LIVE CLOB ORDERBOOK FEED (WebSocket) — SHADOW ONLY ===
+    //
+    // Doubly gated: compiled only with `--features clob-ws`, and started only when
+    // POLYTRADER_ENABLE_CLOB_WS names an implemented mode. Nothing downstream reads these books
+    // yet — this tier exists to establish that a delta-maintained book is *correct* before any
+    // execution path depends on one. See src/ingester/clob_ws.rs for why the proof is a REST audit
+    // rather than a comparison against the 5-minute snapshot table.
+    #[cfg(feature = "clob-ws")]
+    {
+        use crate::ingester::clob_ws;
+        let mode = std::env::var("POLYTRADER_ENABLE_CLOB_WS")
+            .ok()
+            .as_deref()
+            .and_then(clob_ws::WsMode::from_env_value);
+
+        match mode {
+            None => info!("P5 CLOB WS feed compiled in but disabled (set POLYTRADER_ENABLE_CLOB_WS=shadow to run it read-only)"),
+            Some(clob_ws::WsMode::Shadow) => {
+                let pool = pool.clone();
+                let clob = clob.clone();
+                let store = clob_ws::LiveBookStore::new();
+                // Bounded so a runaway universe cannot open unlimited sockets against a public
+                // endpoint; the cap is on tokens, and shards derive from it.
+                let max_assets = std::env::var("POLYTRADER_CLOB_WS_MAX_ASSETS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(500);
+                let audit_sample = std::env::var("POLYTRADER_CLOB_WS_AUDIT_SAMPLE")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(8);
+
+                info!(
+                    max_assets,
+                    audit_sample,
+                    "P5 CLOB WS feed enabled in SHADOW mode — maintains live books and audits them \
+                     against REST; no strategy or executor reads them (first subscribe in ~90s, \
+                     once the opening ingest tick has defined a universe)"
+                );
+
+                tokio::spawn(async move {
+                    // Wait for the first ingest tick to define a universe; subscribing to nothing
+                    // and retrying is cheaper than guessing at a token list.
+                    tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+
+                    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+                    let mut subscribed: Vec<String> = Vec::new();
+
+                    loop {
+                        // The universe is whatever the poller is currently keeping fresh, which is
+                        // the same set any future execution path would need books for.
+                        let universe: Vec<String> = sqlx::query_scalar(
+                            "SELECT DISTINCT token_id FROM market_data.orderbook_snapshots
+                              WHERE fetched_at > now() - interval '20 minutes'
+                              ORDER BY token_id LIMIT $1",
+                        )
+                        .bind(max_assets as i64)
+                        .fetch_all(&pool)
+                        .await
+                        .unwrap_or_default();
+
+                        // Resubscribe only on MATERIAL drift, never on any difference. The
+                        // discovery pool rotates a handful of tokens every tick, so an
+                        // exact-set comparison would tear down and rebuild every socket every
+                        // five minutes — losing all delta continuity and hammering a public
+                        // endpoint, to chase a few percent of coverage. The cost of drifting is
+                        // small and bounded (a few dead subscriptions, a few unwatched new
+                        // tokens); the cost of churning is the feed never settling at all.
+                        let cur: std::collections::HashSet<&String> = subscribed.iter().collect();
+                        let next: std::collections::HashSet<&String> = universe.iter().collect();
+                        let added = next.difference(&cur).count();
+                        let dropped = cur.difference(&next).count();
+                        let drift_floor = (subscribed.len() / 10).max(20);
+
+                        if !universe.is_empty()
+                            && (subscribed.is_empty() || added.max(dropped) >= drift_floor)
+                        {
+                            // Resubscribing means new sockets, so tear the old ones down first —
+                            // an aborted shard is the only way to stop its reconnect loop.
+                            for h in handles.drain(..) {
+                                h.abort();
+                            }
+                            let shards = clob_ws::spawn_feed(store.clone(), universe.clone());
+                            info!(
+                                tokens = universe.len(),
+                                shards = shards.len(),
+                                added,
+                                dropped,
+                                "P5 CLOB WS feed (shadow) subscribed"
+                            );
+                            handles = shards;
+                            subscribed = universe;
+                        }
+
+                        // Audit + health on a 5-minute beat, matching the poll cadence so the two
+                        // tiers' numbers are directly comparable in the log.
+                        for _ in 0..5 {
+                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                            let h = store.health();
+                            let a = clob_ws::audit_against_rest(&store, &clob, audit_sample).await;
+                            info!(
+                                tracked = h.tracked, fresh = h.fresh, desynced = h.desynced, stale = h.stale,
+                                frames = h.frames, books = h.book_events, changes = h.change_events,
+                                desync_events = h.desync_events, reconnects = h.reconnects,
+                                orphan_changes = h.orphan_changes,
+                                audit_sampled = a.sampled, audit_agreed = a.agreed,
+                                audit_disagreed = a.disagreed, audit_no_rest_book = a.no_rest_book,
+                                worst_ask_delta_bps = ?a.worst_ask_delta_bps,
+                                "P5 CLOB WS shadow diagnostics"
+                            );
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // Daily DB garbage collection: roll fat raw data (orderbook books, decision_report payloads) into
     // compact summaries + prune beyond the retention windows so the DB stays bounded (~60MB/day growth).
     // Runs ~2 min after boot (drains the initial backlog) then every 24h. Journals a `gc_run` event.

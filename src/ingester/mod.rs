@@ -4,6 +4,8 @@
 //! Periodic task keeps markets + orderbook_snapshots fresh for paper engine.
 
 mod clob_public;
+#[cfg(feature = "clob-ws")]
+pub mod clob_ws;
 mod gamma;
 
 use anyhow::Result;
@@ -11,10 +13,6 @@ use sqlx::PgPool;
 
 pub use clob_public::{ClobPublicClient, OrderbookSnapshot, PriceSize};
 pub use gamma::GammaClient;
-
-#[cfg(feature = "clob-ws")]
-#[allow(unused_imports)]
-pub use clob_public::ClobWsClient;
 
 /// One ingestion tick: fetch configured bootstrap markets, upsert to DB + snapshots + mids.
 /// Conservative sleeps between calls to be polite to public endpoints.
