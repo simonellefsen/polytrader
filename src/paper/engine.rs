@@ -24,11 +24,32 @@ use std::sync::Arc;
 pub struct PaperTradingEngine {
     pool: PgPool,
     journal: Arc<JournalWriter>,
+    /// P5 live orderbook feed, when one is running. Empty (or absent) means every fill matches
+    /// against the polled snapshot, exactly as before.
+    live_books: Option<crate::ingester::clob_ws::LiveBookStore>,
 }
 
 impl PaperTradingEngine {
     pub fn new(pool: PgPool, journal: Arc<JournalWriter>) -> Self {
-        Self { pool, journal }
+        Self {
+            pool,
+            journal,
+            live_books: None,
+        }
+    }
+
+    /// Match fills against the live WebSocket book where one is fresh and in sync.
+    ///
+    /// This has to move in lockstep with the arb scanner's price source, and the reason is
+    /// specific: negRisk legs are placed as **limit** orders at the price the scanner saw. If the
+    /// scanner reads a live ask of 0.66 while the matcher walks a snapshot whose best ask is still
+    /// 0.67, the limit is simply never marketable and the basket records a partial-or-unfilled
+    /// every cycle. The failure is safe — a stale book can never make us *overpay* through a limit
+    /// — but a scanner that finds baskets the engine structurally cannot fill is worse than no
+    /// scanner change at all. One book, read by both.
+    pub fn with_live_books(mut self, books: crate::ingester::clob_ws::LiveBookStore) -> Self {
+        self.live_books = Some(books);
+        self
     }
 
     /// Submit paper order. Loads latest book snapshot from DB for the (market, outcome).
@@ -284,6 +305,31 @@ impl PaperTradingEngine {
             Some(t) if !t.is_empty() => t.clone(),
             _ => return Ok(None),
         };
+
+        // Prefer the live book. `get_fresh` withholds anything desynced or on a dead connection,
+        // so falling through to the snapshot covers both "no feed" and "a feed we do not trust".
+        if let Some(live) = self
+            .live_books
+            .as_ref()
+            .and_then(|b| b.get_fresh(&token_id))
+        {
+            let to_levels = |v: Vec<(Decimal, Decimal)>| {
+                v.into_iter()
+                    .map(|(p, s)| PriceSize {
+                        price: p.to_string(),
+                        size: s.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mid = live.mid();
+            return Ok(Some(OrderbookSnapshot {
+                token_id,
+                bids: to_levels(live.bid_levels()),
+                asks: to_levels(live.ask_levels()),
+                mid,
+                fetched_at: chrono::Utc::now(),
+            }));
+        }
 
         // Latest snapshot for that token
         let snap_row = sqlx::query(

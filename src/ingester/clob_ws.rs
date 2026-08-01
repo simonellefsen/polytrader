@@ -9,15 +9,21 @@
 //! - **Runtime gate**: `POLYTRADER_ENABLE_CLOB_WS`, unset by default. Nothing here runs, connects,
 //!   or allocates unless that variable is set to a recognized mode.
 //!
-//! ## What this increment does, and deliberately does not do
+//! ## What this does, and deliberately does not do
 //!
-//! It maintains live orderbooks in memory and audits them against REST ground truth. It does
-//! **not** feed execution. The three things P5 ultimately unlocks — simultaneous multi-leg fills,
-//! maker rebates, honest fill simulation — all sit on top of "we have a correct live book", and
-//! that foundation has to be *proven* correct before anything trades on it. So the only mode
-//! implemented here is [`WsMode::Shadow`]: keep books, compare them to `/book`, report the error
-//! rate. `POLYTRADER_ENABLE_CLOB_WS=highconviction` (the reactive-execution mode the skeleton
-//! named) is explicitly still unimplemented and refuses to start.
+//! It maintains live orderbooks in memory, audits them against REST ground truth, and — since
+//! increment 2 — **prices the negRisk arb scanner's legs**. It still does not *execute*: orders
+//! are placed by the existing paper engine on the 5-minute cycle, not reactively off a frame.
+//!
+//! That ordering was the point. Increment 1 shipped shadow-only precisely so the books could be
+//! proven correct on live data before anything read them (92/92 REST agreement over the first
+//! deploy), because a book that is silently wrong turns a "risk-free" basket into a directional
+//! position. Increment 2 then let the scanner read them, with the fallback to polled snapshots
+//! kept for any book the feed cannot vouch for.
+//!
+//! [`WsMode::Shadow`] remains the only implemented mode; the name now means "no reactive
+//! execution" rather than "no readers". `POLYTRADER_ENABLE_CLOB_WS=highconviction` (the
+//! reactive-execution mode the skeleton named) is still unimplemented and refuses to start.
 //!
 //! ## Protocol (verified live 2026-08-01, not from docs)
 //!
@@ -51,9 +57,17 @@
 //! resolves on the next frame. Condemned books are excluded from reads until a reconnect
 //! re-snapshots them. Silent wrongness is the one failure mode a live feed must not have.
 
+//! ## Why only half of this file is feature-gated
+//!
+//! The book model, the store and the frame parser compile unconditionally; only the socket itself
+//! (`connect_and_pump`, `run_shard`, `spawn_feed`) sits behind `clob-ws`. That split exists so
+//! readers like the arb scanner can take an `Option<&LiveBookStore>` without a `cfg` in the
+//! strategy layer: with the feature off the store simply stays empty and every read falls back to
+//! the polled snapshot, which is the same code path a read takes when a book is desynced. One
+//! behaviour, type-checked in both builds, instead of two shapes of the scanner.
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use futures_util::{SinkExt, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -61,15 +75,22 @@ use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+
+#[cfg(feature = "clob-ws")]
+use futures_util::{SinkExt, StreamExt};
+#[cfg(feature = "clob-ws")]
 use tokio_tungstenite::tungstenite::Message;
 
+#[cfg(feature = "clob-ws")]
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
+#[cfg(feature = "clob-ws")]
 /// Assets per connection. The server does not document a subscription cap, so rather than probe
 /// for it we shard: several modest connections are also more robust than one fat one, since a
 /// disconnect then costs a fraction of the universe instead of all of it.
 const CHUNK_ASSETS: usize = 250;
 
+#[cfg(feature = "clob-ws")]
 /// Keepalive cadence. The server tolerated 75s of near-idle in testing, but Polymarket's own
 /// clients ping, and an unanswered connection that looks alive to the OS is worse than a reconnect.
 const PING_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -305,6 +326,15 @@ impl LiveBook {
         self.asks.keys().next().copied()
     }
 
+    /// Best ask together with the size resting at it, which is what bounds basket units.
+    ///
+    /// Depth has to come from the same read as the price. Taking the price live and the size from
+    /// a polled snapshot would size a basket against liquidity that no longer exists — the exact
+    /// mis-fill that turns a "risk-free" basket into a directional position.
+    pub fn best_ask_with_size(&self) -> Option<(Decimal, Decimal)> {
+        self.asks.iter().next().map(|(p, s)| (*p, *s))
+    }
+
     pub fn mid(&self) -> Option<Decimal> {
         match (self.best_bid(), self.best_ask()) {
             (Some(b), Some(a)) if a > b => Some((b + a) / Decimal::from(2)),
@@ -316,6 +346,18 @@ impl LiveBook {
 
     pub fn depth(&self) -> (usize, usize) {
         (self.bids.len(), self.asks.len())
+    }
+
+    /// Every resting bid level, `(price, size)`.
+    pub fn bid_levels(&self) -> Vec<(Decimal, Decimal)> {
+        self.bids.iter().map(|(p, s)| (*p, *s)).collect()
+    }
+
+    /// Every resting ask level, `(price, size)`. The paper matcher sorts what it is handed, so the
+    /// order here is not load-bearing — but it comes out ascending, i.e. genuinely best-first,
+    /// unlike the REST payload.
+    pub fn ask_levels(&self) -> Vec<(Decimal, Decimal)> {
+        self.asks.iter().map(|(p, s)| (*p, *s)).collect()
     }
 
     pub fn age_secs(&self) -> i64 {
@@ -591,6 +633,7 @@ pub(crate) fn feed_best_disagrees(
 // Connection
 // ===========================================================================================
 
+#[cfg(feature = "clob-ws")]
 /// Backoff for a failed or dropped connection: exponential, capped, with jitter so that N sharded
 /// connections dropped by one server-side event do not all come back in the same instant.
 fn backoff_delay(attempt: u32) -> std::time::Duration {
@@ -606,6 +649,7 @@ fn backoff_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(capped.saturating_sub(spread).saturating_add(jitter))
 }
 
+#[cfg(feature = "clob-ws")]
 /// One long-lived sharded connection: connect, subscribe, pump messages into the store, ping,
 /// and reconnect forever. Returns only if the task is dropped.
 async fn run_shard(store: LiveBookStore, assets: Vec<String>, shard: usize) {
@@ -630,6 +674,7 @@ async fn run_shard(store: LiveBookStore, assets: Vec<String>, shard: usize) {
     }
 }
 
+#[cfg(feature = "clob-ws")]
 async fn connect_and_pump(store: &LiveBookStore, assets: &[String], shard: usize) -> Result<()> {
     let (ws, _resp) = tokio_tungstenite::connect_async(WS_URL)
         .await
@@ -682,6 +727,7 @@ async fn connect_and_pump(store: &LiveBookStore, assets: &[String], shard: usize
     }
 }
 
+#[cfg(feature = "clob-ws")]
 /// Split a universe into shards and spawn one resilient connection per shard.
 ///
 /// The returned handles are the only way to stop a shard: each runs an unbounded reconnect loop by
@@ -1123,6 +1169,7 @@ mod tests {
         assert_eq!(WsMode::from_env_value("true"), None);
     }
 
+    #[cfg(feature = "clob-ws")]
     #[test]
     fn backoff_grows_then_caps_and_always_carries_jitter() {
         let d0 = backoff_delay(0).as_millis();

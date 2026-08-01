@@ -21,8 +21,21 @@
 //! by market makers. Keeping N books of one event mutually consistent is much harder, which is why
 //! real Polymarket dislocations concentrate at the event level.
 //!
-//! Same execution-risk caveats as the single-market scanner (snapshot staleness, per-level depth);
-//! paper-only, journaled for Hermes.
+//! ## Where the prices come from (P5 increment 2, 2026-08-01)
+//! Each leg is priced from the **live WebSocket book** when one is available, fresh and in sync,
+//! and falls back to the polled `orderbook_snapshots` row otherwise. That fallback is not a
+//! degraded mode to be avoided — it is the correct answer whenever the feed cannot vouch for a
+//! book, and `LiveBookStore::get_fresh` already refuses to hand back anything desynced or on a
+//! dead connection, so this scanner never reasons about feed health itself.
+//!
+//! The staleness this removes was substantial: the snapshot query accepts books up to **30 minutes**
+//! old, against an arb line that events cross for seconds. Every leg carries both readings so the
+//! two can be scored side by side in the same pass (`best_line_shortfall` vs
+//! `best_line_shortfall_snapshot`) — if they never diverge, the live feed bought nothing here, and
+//! that is a result worth being able to see rather than assume away.
+//!
+//! Remaining execution-risk caveats as the single-market scanner (per-level depth, no simultaneous
+//! multi-leg fill); paper-only, journaled for Hermes.
 
 use anyhow::Result;
 use rust_decimal::Decimal;
@@ -31,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use super::arbitrage::best_ask;
+use crate::ingester::clob_ws::LiveBookStore;
 
 /// Minimum net profit per basket-unit (one No share in every chosen member) to report.
 /// Matches the single-market scanner's MIN_NET_PROFIT.
@@ -54,11 +68,53 @@ pub struct NegRiskLeg {
     pub market_id: String,
     pub question: String,
     /// Best (lowest) ask on the No token — the taker buy price for this leg.
+    /// Live (WebSocket) when a fresh in-sync book exists, otherwise the polled snapshot.
     pub ask_no: Decimal,
-    /// Depth at that best ask (shares).
+    /// Depth at that best ask (shares). Always read from the SAME source as `ask_no`: a live price
+    /// against snapshot depth would size the basket on liquidity that may no longer exist.
     pub depth: Decimal,
     /// Estimated taker fee per share for this leg.
     pub fee_per_share: Decimal,
+    /// What the polled snapshot said, kept even when `ask_no` came from the live feed. This is what
+    /// makes the live-vs-stale comparison measurable in-process rather than only across deploys —
+    /// see `NegRiskDiagnostics::best_line_shortfall_snapshot`.
+    #[serde(default)]
+    pub ask_no_snapshot: Decimal,
+    #[serde(default)]
+    pub fee_per_share_snapshot: Decimal,
+    /// True when `ask_no`/`depth` came from the live WebSocket book.
+    #[serde(default)]
+    pub from_live: bool,
+}
+
+/// Which of a leg's two price readings to score a basket with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriceSource {
+    /// Live book where available, polled snapshot elsewhere — what the executor actually trades on.
+    Best,
+    /// Polled snapshot only, ignoring the live feed — the counterfactual, for diagnostics.
+    Snapshot,
+}
+
+impl NegRiskLeg {
+    fn ask(&self, src: PriceSource) -> Decimal {
+        match src {
+            PriceSource::Best => self.ask_no,
+            PriceSource::Snapshot => self.ask_no_snapshot,
+        }
+    }
+
+    fn fee(&self, src: PriceSource) -> Decimal {
+        match src {
+            PriceSource::Best => self.fee_per_share,
+            PriceSource::Snapshot => self.fee_per_share_snapshot,
+        }
+    }
+
+    /// A leg contributes this much to the guaranteed margin. Non-positive legs only dilute.
+    fn contribution(&self, src: PriceSource) -> Decimal {
+        Decimal::ONE - self.ask(src) - self.fee(src)
+    }
 }
 
 /// A buy-all-No event arbitrage: buy 1 No share in each leg; at most one member resolves Yes, so
@@ -114,26 +170,54 @@ pub struct NegRiskDiagnostics {
     pub best_line_shortfall: Option<String>,
     /// Opportunities clearing the net-profit threshold.
     pub net_arb_events: usize,
+
+    // === P5 increment 2: live-book sourcing (2026-08-01) ===
+    /// Legs priced from the live WebSocket book.
+    #[serde(default)]
+    pub legs_from_live_book: usize,
+    /// Legs that fell back to the polled snapshot — no live book, or one flagged desynced/offline.
+    #[serde(default)]
+    pub legs_from_snapshot: usize,
+    /// The same best-shortfall metric computed on snapshot prices ALONE.
+    ///
+    /// This is the counterfactual, and it is the whole point of keeping both readings: comparing
+    /// `best_line_shortfall` against a number from a previous deploy confounds the price source
+    /// with whatever the market did in between. Computed in the same pass over the same events,
+    /// the pair isolates what the live feed is actually worth. If they stay equal, the 5-minute
+    /// snapshot was never the binding constraint and increment 2 bought nothing — a result worth
+    /// being able to see.
+    #[serde(default)]
+    pub best_line_shortfall_snapshot: Option<String>,
 }
+
+/// One member row as the scan query returns it:
+/// `(event_id, gamma_id, slug, question, taker_fee_rate, snapshot asks, No token_id)`.
+type MemberRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<Decimal>,
+    serde_json::Value,
+    String,
+);
 
 /// Scan all active negRisk events over the books already ingested. Returns opportunities sorted
 /// best-first plus diagnostics.
-pub async fn scan_negrisk(pool: &PgPool) -> Result<(Vec<NegRiskOpportunity>, NegRiskDiagnostics)> {
+pub async fn scan_negrisk(
+    pool: &PgPool,
+    books: Option<&LiveBookStore>,
+) -> Result<(Vec<NegRiskOpportunity>, NegRiskDiagnostics)> {
     // Latest fresh No-book per active member of every negRisk event with enough visible members.
-    let rows: Vec<(
-        String,
-        String,
-        String,
-        String,
-        Option<Decimal>,
-        serde_json::Value,
-    )> = sqlx::query_as(
+    // `token_id` comes along because it is the live feed's key — the snapshot row already knows
+    // which token it described, so no second lookup is needed to join the two sources.
+    let rows: Vec<MemberRow> = sqlx::query_as(
         r#"
         SELECT m.event_id, m.gamma_id, COALESCE(m.slug, ''), m.question, m.taker_fee_rate,
-               no_snap.asks
+               no_snap.asks, no_snap.token_id
         FROM market_data.markets m
         JOIN LATERAL (
-            SELECT asks FROM market_data.orderbook_snapshots
+            SELECT asks, token_id FROM market_data.orderbook_snapshots
             WHERE market_id = m.gamma_id AND outcome = 'No'
               AND fetched_at > now() - interval '30 minutes'
             ORDER BY fetched_at DESC LIMIT 1
@@ -149,24 +233,48 @@ pub async fn scan_negrisk(pool: &PgPool) -> Result<(Vec<NegRiskOpportunity>, Neg
     let mut opportunities = Vec::new();
     // (implied_yes_sum, event_id, fee-adjusted arb line, signed shortfall vs that line)
     let mut best_sum: Option<(Decimal, String, Decimal, Decimal)> = None;
+    // Same, scored on snapshot prices only — the counterfactual.
+    let mut best_snapshot_shortfall: Option<Decimal> = None;
 
     // Group rows by event_id (rows arrive sorted).
     let mut by_event: std::collections::BTreeMap<String, Vec<NegRiskLeg>> =
         std::collections::BTreeMap::new();
-    for (event_id, market_id, slug, question, fee_rate, no_asks) in rows {
-        let (ask_no, depth) = best_ask(&no_asks);
-        if ask_no <= Decimal::ZERO || ask_no >= Decimal::ONE || depth <= Decimal::ZERO {
+    for (event_id, market_id, slug, question, fee_rate, no_asks, token_id) in rows {
+        let (snap_ask, snap_depth) = best_ask(&no_asks);
+        if snap_ask <= Decimal::ZERO || snap_ask >= Decimal::ONE || snap_depth <= Decimal::ZERO {
             continue;
         }
         diag.member_books += 1;
         let rate = fee_rate.unwrap_or_else(|| crate::polymarket_taker_fee_rate(&slug));
-        let fee_per_share = crate::polymarket_fee(rate, ask_no, Decimal::ONE);
+
+        // Prefer the live book. `get_fresh` already withholds anything desynced or on a dead
+        // connection, so "no live book" and "a live book we do not trust" collapse into the same
+        // fallback — the scanner never has to reason about feed health.
+        let live = books
+            .and_then(|b| b.get_fresh(&token_id))
+            .and_then(|b| b.best_ask_with_size())
+            .filter(|(p, d)| *p > Decimal::ZERO && *p < Decimal::ONE && *d > Decimal::ZERO);
+
+        let (ask_no, depth) = match live {
+            Some(pair) => {
+                diag.legs_from_live_book += 1;
+                pair
+            }
+            None => {
+                diag.legs_from_snapshot += 1;
+                (snap_ask, snap_depth)
+            }
+        };
+
         by_event.entry(event_id).or_default().push(NegRiskLeg {
             market_id,
             question,
             ask_no,
             depth,
-            fee_per_share,
+            fee_per_share: crate::polymarket_fee(rate, ask_no, Decimal::ONE),
+            ask_no_snapshot: snap_ask,
+            fee_per_share_snapshot: crate::polymarket_fee(rate, snap_ask, Decimal::ONE),
+            from_live: live.is_some(),
         });
     }
 
@@ -175,10 +283,20 @@ pub async fn scan_negrisk(pool: &PgPool) -> Result<(Vec<NegRiskOpportunity>, Neg
             continue;
         }
         diag.events_scanned += 1;
+
+        // Score the same event on snapshot prices alone before any live-priced filtering narrows
+        // the leg set, so the counterfactual answers "what would the old scanner have seen here",
+        // not "what would it have seen among the legs the new one kept".
+        if let Some((_, _, snap_short)) = score_basket(&legs, PriceSource::Snapshot) {
+            if best_snapshot_shortfall.is_none_or(|b| snap_short > b) {
+                best_snapshot_shortfall = Some(snap_short);
+            }
+        }
+
         // Basket selection: a leg contributes (1 − ask_no − fee) to the guaranteed margin; keep
         // only positive contributors (others dilute — leaving a member out never hurts, at most
         // one Yes can occur regardless). Sort best-contributor-first for reporting clarity.
-        legs.retain(|l| Decimal::ONE - l.ask_no - l.fee_per_share > Decimal::ZERO);
+        legs.retain(|l| l.contribution(PriceSource::Best) > Decimal::ZERO);
         if legs.len() < MIN_MEMBERS {
             continue;
         }
@@ -227,7 +345,27 @@ pub async fn scan_negrisk(pool: &PgPool) -> Result<(Vec<NegRiskOpportunity>, Neg
         diag.best_arb_line = Some(line.round_dp(4).to_string());
         diag.best_line_shortfall = Some(shortfall.round_dp(4).to_string());
     }
+    diag.best_line_shortfall_snapshot = best_snapshot_shortfall.map(|s| s.round_dp(4).to_string());
     Ok((opportunities, diag))
+}
+
+/// Score an event under one price source: `(implied_yes_sum, arb line, signed shortfall)`.
+///
+/// Applies the same positive-contributor selection and `MIN_MEMBERS` floor the real basket does,
+/// so the snapshot counterfactual is scored by the identical rules and the two numbers are
+/// comparable. `None` when too few legs survive to form a basket.
+fn score_basket(legs: &[NegRiskLeg], src: PriceSource) -> Option<(Decimal, Decimal, Decimal)> {
+    let kept: Vec<&NegRiskLeg> = legs
+        .iter()
+        .filter(|l| l.contribution(src) > Decimal::ZERO)
+        .collect();
+    if kept.len() < MIN_MEMBERS {
+        return None;
+    }
+    let sum: Decimal = kept.iter().map(|l| Decimal::ONE - l.ask(src)).sum();
+    let fees: Decimal = kept.iter().map(|l| l.fee(src)).sum();
+    let (line, shortfall) = arb_line_and_shortfall(sum, fees);
+    Some((sum, line, shortfall))
 }
 
 /// Σ implied-Yes across the basket's legs (`Σ (1 − ask_no)`).
@@ -249,19 +387,29 @@ fn arb_line_and_shortfall(implied_yes_sum: Decimal, total_fees: Decimal) -> (Dec
 mod tests {
     use super::*;
 
-    /// k evenly-priced legs summing to `s` implied-Yes, at taker rate `rate`.
+    /// k evenly-priced legs summing to `s` implied-Yes, at taker rate `rate`. Both price readings
+    /// are identical, i.e. the live book agreed with the snapshot — vary them explicitly when the
+    /// test is about the difference.
     fn even_legs(k: usize, s: Decimal, rate: Decimal) -> Vec<NegRiskLeg> {
         let q = s / Decimal::from(k as u64);
         let ask_no = Decimal::ONE - q;
         (0..k)
-            .map(|i| NegRiskLeg {
-                market_id: format!("m{i}"),
-                question: format!("leg {i}"),
-                ask_no,
-                depth: dec!(1000),
-                fee_per_share: crate::polymarket_fee(rate, ask_no, Decimal::ONE),
-            })
+            .map(|i| leg(&format!("m{i}"), ask_no, ask_no, rate))
             .collect()
+    }
+
+    /// One leg with independently chosen live and snapshot asks.
+    fn leg(id: &str, live_ask: Decimal, snap_ask: Decimal, rate: Decimal) -> NegRiskLeg {
+        NegRiskLeg {
+            market_id: id.to_string(),
+            question: format!("leg {id}"),
+            ask_no: live_ask,
+            depth: dec!(1000),
+            fee_per_share: crate::polymarket_fee(rate, live_ask, Decimal::ONE),
+            ask_no_snapshot: snap_ask,
+            fee_per_share_snapshot: crate::polymarket_fee(rate, snap_ask, Decimal::ONE),
+            from_live: live_ask != snap_ask,
+        }
     }
 
     #[test]
@@ -322,5 +470,60 @@ mod tests {
         let (line, shortfall) = arb_line_and_shortfall(dec!(1.05), dec!(0.05));
         assert_eq!(line, dec!(1.05));
         assert_eq!(shortfall, dec!(0));
+    }
+
+    // === P5 increment 2: live-book sourcing ===
+
+    #[test]
+    fn a_book_that_moved_since_the_snapshot_turns_a_miss_into_an_arb() {
+        // The case increment 2 exists for. The polled snapshot is accepted up to 30 minutes old;
+        // an event can cross the arb line and come back well inside that. Fee-free event, so the
+        // line is exactly 1.00 and the arithmetic is readable: snapshot 0.67 x 3 sums to 0.99
+        // (a miss), live 0.66 x 3 sums to 1.02 (a 2% arb).
+        let legs: Vec<NegRiskLeg> = (0..3)
+            .map(|i| leg(&format!("m{i}"), dec!(0.66), dec!(0.67), dec!(0)))
+            .collect();
+
+        let (_, _, live_short) = score_basket(&legs, PriceSource::Best).expect("live basket");
+        let (_, _, snap_short) =
+            score_basket(&legs, PriceSource::Snapshot).expect("snapshot basket");
+
+        assert_eq!(snap_short, dec!(-0.01), "stale prices miss it");
+        assert_eq!(live_short, dec!(0.02), "live prices find it");
+        assert!(snap_short < Decimal::ZERO && live_short > Decimal::ZERO);
+    }
+
+    #[test]
+    fn agreeing_readings_score_identically() {
+        // The null result, and worth pinning: if the live book agrees with the snapshot, the two
+        // metrics must coincide exactly. Otherwise the A/B would show a phantom improvement and
+        // credit the feed for arithmetic rather than for freshness.
+        let legs = even_legs(5, dec!(1.01), dec!(0.05));
+        assert_eq!(
+            score_basket(&legs, PriceSource::Best),
+            score_basket(&legs, PriceSource::Snapshot)
+        );
+    }
+
+    #[test]
+    fn the_live_reading_can_also_be_worse_than_the_snapshot() {
+        // Freshness is not a synonym for opportunity. A book that moved AGAINST us since the
+        // snapshot must score worse, not better — the counterfactual has to be able to say the
+        // stale price was flattering, which is exactly the case where trading on it would have
+        // mis-filled.
+        let legs: Vec<NegRiskLeg> = (0..3)
+            .map(|i| leg(&format!("m{i}"), dec!(0.68), dec!(0.66), dec!(0)))
+            .collect();
+        let (_, _, live_short) = score_basket(&legs, PriceSource::Best).unwrap();
+        let (_, _, snap_short) = score_basket(&legs, PriceSource::Snapshot).unwrap();
+        assert_eq!(snap_short, dec!(0.02), "the stale price looked tradeable");
+        assert_eq!(live_short, dec!(-0.04), "live says it is not");
+    }
+
+    #[test]
+    fn a_basket_below_the_member_floor_scores_nothing() {
+        let legs = vec![leg("solo", dec!(0.4), dec!(0.4), dec!(0))];
+        assert!(score_basket(&legs, PriceSource::Best).is_none());
+        assert!(score_basket(&legs, PriceSource::Snapshot).is_none());
     }
 }

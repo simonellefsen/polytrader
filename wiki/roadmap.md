@@ -289,6 +289,54 @@ as far from tradeable as the 1.031 event the old metric was pointing at.
   the events where an arb could actually clear, rather than at the ones with the biggest raw
   overround and an unpayable bar.
 
+## 📡 P5 increment 2 — the arb scanner reads the live book — 2026-08-01
+
+Increment 1 proved the book correct (92/92 REST agreement) without letting anything read it.
+This connects it. The negRisk scanner prices each leg from the live WebSocket book when one is
+fresh and in sync, falling back to the polled snapshot otherwise.
+
+**The staleness removed was larger than advertised.** The snapshot query accepts books up to
+**30 minutes** old — not the 5 minutes the ingest cadence suggests — against an arb line that
+events cross for seconds.
+
+**The A/B is in-process, not across deploys.** Every leg carries both readings, and the same pass
+scores the same events twice: `best_line_shortfall` (live where available) against
+`best_line_shortfall_snapshot` (snapshot only). Comparing to a number from a previous deploy would
+confound the price source with whatever the market did in between. The counterfactual is also
+computed *before* live-priced leg selection narrows the set, so it answers "what would the old
+scanner have seen here", not "what would it have seen among the legs the new one kept".
+
+First measurements, 5-minute cycles:
+
+| scan | legs live / total | live shortfall | snapshot shortfall |
+|---|---|---|---|
+| 21:08 | 0 / 307 (feed not yet subscribed) | −0.0041 | −0.0041 |
+| 21:13 | 218 / 301 | −0.0041 | −0.0041 |
+| 21:18 | 215 / 301 | **−0.0031** | −0.0041 |
+
+The third pass is the first real divergence: **10bps closer to tradeable on live prices**. Still
+`net_arbs 0` — 31bps short — but the mechanism works and the null case (rows 1–2, where the two
+agree exactly) is equally important: it shows the metric is not manufacturing an improvement.
+
+**Two things had to move together, and one was nearly missed.** NegRisk legs are placed as LIMIT
+orders at the price the scanner saw, while `PaperTradingEngine` matched against
+`orderbook_snapshots`. A scanner reading a live ask of 0.66 against a matcher walking a snapshot
+best of 0.67 would never be marketable: the basket records `basket_partial_or_unfilled` every
+cycle and never fills. The failure is *safe* — a stale book cannot make a limit order overpay —
+but a scanner that finds baskets the engine structurally cannot fill is worse than not changing
+the scanner at all. The engine now shares the same store.
+
+**A cap-ordering flaw the live data exposed.** The subscription set was `ORDER BY token_id LIMIT
+500` — a lexicographic slice of a 694-token universe, arbitrary with respect to what anything
+reads. That is why 86 of 301 negRisk member books were still snapshot-priced above. NegRisk No
+books now take the budget first (354 of 694 qualify, so all of them fit under the same cap);
+token_id survives only as a deterministic tiebreak for the drift check.
+
+**Structurally**, the book model, store and parser now compile unconditionally and only the socket
+sits behind `clob-ws`. Readers take an `Option<&LiveBookStore>` with no `cfg` in the strategy or
+paper layers: with the feature off the store is simply empty and every read falls back — the same
+path a read takes when a book is desynced. One behaviour, type-checked in both builds.
+
 ## 📡 P5 increment 1 — the live book exists, and it is provably right — 2026-08-01
 
 The pre-registered criterion unblocked P5 on 2026-07-25 (Path B GO). This is the first real
@@ -420,10 +468,10 @@ the dated Decision-log entry below; this is the at-a-glance index.
     the same two gates: Cargo feature `clob-ws` (now on in the release image) + runtime
     `POLYTRADER_ENABLE_CLOB_WS=shadow`. Maintains books from snapshot+delta with missed-message
     detection; **nothing downstream reads them.** Live: 488 books, 8/8 REST audit agreement.
-  - [ ] **Increment 2 — let the arb scanner read the live book.** The negRisk scanner currently
-    reads `orderbook_snapshots`, i.e. prices up to 5 minutes old, which is the single biggest
-    reason a 20bps-short basket may in fact have been tradeable at some instant in that window.
-    Gate on the audit having stayed clean; keep the poller as the fallback for stale/desynced books.
+  - [x] **Increment 2 — let the arb scanner read the live book** → *DONE 2026-08-01, see the dated
+    entry below.* NegRisk legs now price from the live book where one is fresh and in sync, with
+    the poller as fallback. The paper engine reads the same store, because legs are LIMIT orders.
+    First measured divergence: live shortfall **−0.0031** vs snapshot **−0.0041** on the same pass.
   - [ ] **Increment 3 — simultaneous multi-leg fill simulation**, then maker quoting. Only after 2.
 - [x] **Widen the negrisk funnel** (2026-07-25, from the Path B GO) → *DONE 2026-08-01. Triggered by
   the operator question "why are we not opening new positions, are we being too cautious?" — the

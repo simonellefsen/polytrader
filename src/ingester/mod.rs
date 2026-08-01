@@ -4,7 +4,10 @@
 //! Periodic task keeps markets + orderbook_snapshots fresh for paper engine.
 
 mod clob_public;
-#[cfg(feature = "clob-ws")]
+// Without `clob-ws` there is no socket to fill the store, so the wire types and mode parsing are
+// genuinely unreachable — expected, not rot. Scoped to that build so real dead code still surfaces
+// in the one the release image actually ships.
+#[cfg_attr(not(feature = "clob-ws"), allow(dead_code))]
 pub mod clob_ws;
 mod gamma;
 

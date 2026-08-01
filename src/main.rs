@@ -136,9 +136,21 @@ async fn main() -> Result<()> {
 
     // === JOURNAL + ENGINE (shared) ===
     let journal = Arc::new(JournalWriter::new(pool.clone()));
+
+    // P5 live orderbook store. Created unconditionally so its readers have one type to talk to:
+    // without the `clob-ws` feature, or with POLYTRADER_ENABLE_CLOB_WS unset, nothing ever fills
+    // it and every read falls back to the polled snapshot — the same path a read takes when a
+    // live book is desynced. No cfg reaches the strategy or paper layers.
+    let live_books = crate::ingester::clob_ws::LiveBookStore::new();
+
     // Fees are per-market (Polymarket's real taker model, resolved per fill from the stored
     // Gamma rate) — the engine takes no flat rate.
-    let engine = Arc::new(PaperTradingEngine::new(pool.clone(), journal.clone()));
+    // The engine shares the scanner's book so both read the same prices: negRisk legs are LIMIT
+    // orders at the price the scanner saw, so a scanner on live prices and a matcher on snapshots
+    // would simply never fill (see PaperTradingEngine::with_live_books).
+    let engine = Arc::new(
+        PaperTradingEngine::new(pool.clone(), journal.clone()).with_live_books(live_books.clone()),
+    );
     info!("PaperTradingEngine + JournalWriter initialized (Decimal-only math, full journaling)");
 
     // === INGESTER CLIENTS (public only) ===
@@ -191,7 +203,7 @@ async fn main() -> Result<()> {
             Some(clob_ws::WsMode::Shadow) => {
                 let pool = pool.clone();
                 let clob = clob.clone();
-                let store = clob_ws::LiveBookStore::new();
+                let store = live_books.clone();
                 // Bounded so a runaway universe cannot open unlimited sockets against a public
                 // endpoint; the cap is on tokens, and shards derive from it.
                 let max_assets = std::env::var("POLYTRADER_CLOB_WS_MAX_ASSETS")
@@ -223,9 +235,28 @@ async fn main() -> Result<()> {
                         // The universe is whatever the poller is currently keeping fresh, which is
                         // the same set any future execution path would need books for.
                         let universe: Vec<String> = sqlx::query_scalar(
-                            "SELECT DISTINCT token_id FROM market_data.orderbook_snapshots
-                              WHERE fetched_at > now() - interval '20 minutes'
-                              ORDER BY token_id LIMIT $1",
+                            // Priority order matters more than it looks. The cap is a hard limit,
+                            // so whatever sorts last is simply not subscribed — and ordering by
+                            // token_id alone made that an arbitrary lexicographic slice of a
+                            // 600-token universe. Measured 2026-08-01: 86 of 301 negRisk member
+                            // books were snapshot-priced for no reason other than where their
+                            // token id happened to fall. NegRisk No books are what the arb
+                            // scanner reads, so they take the budget first; token_id remains the
+                            // tiebreak purely to keep the set deterministic for the drift check.
+                            "SELECT s.token_id
+                               FROM (
+                                    SELECT DISTINCT ON (token_id) token_id, market_id, outcome
+                                      FROM market_data.orderbook_snapshots
+                                     WHERE fetched_at > now() - interval '20 minutes'
+                                     ORDER BY token_id, fetched_at DESC
+                               ) s
+                               LEFT JOIN market_data.markets m ON m.gamma_id = s.market_id
+                              ORDER BY (COALESCE(m.neg_risk, false)
+                                        AND s.outcome = 'No'
+                                        AND COALESCE(m.active, false)
+                                        AND NOT COALESCE(m.closed, true)) DESC,
+                                       s.token_id
+                              LIMIT $1",
                         )
                         .bind(max_assets as i64)
                         .fetch_all(&pool)
@@ -411,6 +442,7 @@ async fn main() -> Result<()> {
         let pool = pool.clone();
         let journal = journal.clone();
         let engine = engine.clone();
+        let live_books = live_books.clone();
         let interval = std::time::Duration::from_secs(300); // 5min per goals cadence
         tokio::spawn(async move {
             // initial immediately (so first reflection sees data)
@@ -418,7 +450,7 @@ async fn main() -> Result<()> {
                 warn!(error = %e, "initial 5min DR generation failed (will retry)");
             }
             // Initial arb scan immediately so Hermes has data on first reflection.
-            if let Err(e) = produce_arb_scan_journal(&pool, &journal, &engine).await {
+            if let Err(e) = produce_arb_scan_journal(&pool, &journal, &engine, &live_books).await {
                 warn!(error = %e, "initial arb scan failed (will retry)");
             }
             // Real PUSD balance of the proxy (read-only; for the /trades UI + funded gate).
@@ -436,7 +468,9 @@ async fn main() -> Result<()> {
                 if let Err(e) = produce_5min_decision_report(&pool, &journal, &engine).await {
                     warn!(error = %e, "periodic 5min DR generation failed (will retry)");
                 }
-                if let Err(e) = produce_arb_scan_journal(&pool, &journal, &engine).await {
+                if let Err(e) =
+                    produce_arb_scan_journal(&pool, &journal, &engine, &live_books).await
+                {
                     warn!(error = %e, "periodic arb scan failed (will retry)");
                 }
                 fetch_and_journal_real_balance(&journal).await;
@@ -1850,6 +1884,7 @@ async fn produce_arb_scan_journal(
     pool: &sqlx::PgPool,
     journal: &Arc<JournalWriter>,
     paper_engine: &Arc<PaperTradingEngine>,
+    live_books: &crate::ingester::clob_ws::LiveBookStore,
 ) -> anyhow::Result<()> {
     let scanner = ArbitrageScanner::with_default_fees();
     let (opps, diag) = scanner.scan_with_diagnostics(pool).await?;
@@ -1898,13 +1933,20 @@ async fn produce_arb_scan_journal(
     // NegRisk EVENT-level scan: buy-all-No baskets across a mutually-exclusive event (at most one
     // member resolves Yes ⇒ k No-shares pay ≥ k−1). This is where real dislocations live — the
     // single-market Yes+No scan above was measured structurally dead (best cost pinned at $1.001).
-    match crate::strategy::negrisk::scan_negrisk(pool).await {
+    match crate::strategy::negrisk::scan_negrisk(pool, Some(live_books)).await {
         Ok((nopps, ndiag)) => {
             tracing::info!(
                 events_scanned = ndiag.events_scanned,
                 member_books = ndiag.member_books,
                 net_arbs = ndiag.net_arb_events,
                 best_implied_yes_sum = ?ndiag.best_implied_yes_sum,
+                best_line_shortfall = ?ndiag.best_line_shortfall,
+                // The A/B: same events, same pass, snapshot prices only. If these two never
+                // diverge, the 30-minute snapshot window was not the binding constraint and the
+                // live feed bought this scanner nothing.
+                best_line_shortfall_snapshot = ?ndiag.best_line_shortfall_snapshot,
+                legs_live = ndiag.legs_from_live_book,
+                legs_snapshot = ndiag.legs_from_snapshot,
                 "negrisk arb scan diagnostics"
             );
             // MINIMUM BASKET EDGE. The scanner's own bar is MIN_NET_PROFIT — an ABSOLUTE $0.002 per
@@ -1944,7 +1986,7 @@ async fn produce_arb_scan_journal(
                     .map(|o| negrisk_basket_edge_bps(o.net_profit_per_unit, o.total_cost).to_string()),
                 "paper_only": true,
                 "real_orders_enabled": false,
-                "note": "Event-level negRisk scan (buy No across k mutually-exclusive members pays >= k-1; arb when implied Yes probs sum over 100%). Works on partial event coverage, so it scans the books the universe already ingests. best_implied_yes_sum is the closest approach to the 1.00 arb line."
+                "note": "Event-level negRisk scan (buy No across k mutually-exclusive members pays >= k-1; arb when implied Yes probs sum over 100%). Works on partial event coverage, so it scans the books the universe already ingests. Legs are priced from the LIVE WebSocket book where one is fresh and in sync (diagnostics.legs_from_live_book), falling back to the polled snapshot otherwise. Read best_implied_yes_sum against best_arb_line, never against 1.00 — fees move the line. best_line_shortfall_snapshot is the same metric on snapshot prices alone, so the value of the live feed is visible in-process."
             });
             let _ = journal
                 .record_journal_event(
