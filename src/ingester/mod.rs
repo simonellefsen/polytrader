@@ -131,24 +131,55 @@ pub async fn ingest_tick(
         if !event_ids.is_empty() {
             match gamma.fetch_event_members(&event_ids).await {
                 Ok(members) => {
+                    // Per event: the FULL live member count and the worst per-leg taker rate. Both
+                    // set the event's fee hurdle (see `completion_hurdle`), so they must be taken
+                    // over every member, not just the ones we happen to be missing.
+                    let mut size_by_event: std::collections::BTreeMap<String, usize> =
+                        std::collections::BTreeMap::new();
+                    let mut rate_by_event: std::collections::BTreeMap<
+                        String,
+                        rust_decimal::Decimal,
+                    > = std::collections::BTreeMap::new();
                     // Group the members we do NOT already have by event.
                     let mut missing_by_event: std::collections::BTreeMap<
                         String,
                         Vec<gamma::Market>,
                     > = std::collections::BTreeMap::new();
                     for m in members {
+                        let Some(ev) = m.event_id.clone() else {
+                            continue;
+                        };
+                        *size_by_event.entry(ev.clone()).or_default() += 1;
+                        let rate = m
+                            .taker_fee_rate
+                            .unwrap_or_else(|| crate::polymarket_taker_fee_rate(&m.slug));
+                        let e = rate_by_event.entry(ev.clone()).or_default();
+                        if rate > *e {
+                            *e = rate;
+                        }
                         if seen.contains(&m.id) {
                             continue;
                         }
-                        if let Some(ev) = m.event_id.clone() {
-                            missing_by_event.entry(ev).or_default().push(m);
-                        }
+                        missing_by_event.entry(ev).or_default().push(m);
                     }
-                    let sizes: Vec<(String, usize)> = missing_by_event
+                    let sizes: Vec<CompletionCandidate> = missing_by_event
                         .iter()
-                        .map(|(ev, ms)| (ev.clone(), ms.len()))
+                        .map(|(ev, ms)| CompletionCandidate {
+                            event_id: ev.clone(),
+                            missing: ms.len(),
+                            members: size_by_event.get(ev).copied().unwrap_or(ms.len()),
+                            fee_rate: rate_by_event.get(ev).copied().unwrap_or_default(),
+                        })
                         .collect();
+                    // How the budget actually got spent, by fee class — the check on whether the
+                    // hurdle ordering is doing its job. Cheapest-first sent 250 of ~300 books to
+                    // 5%-fee events (bar ~1.05) and 50 to the fee-free ones (bar 1.00).
+                    let fee_free_available = sizes.iter().filter(|c| c.fee_rate.is_zero()).count();
                     let chosen = select_completion_events(sizes, completion_limit);
+                    let fee_free_chosen = rate_by_event
+                        .iter()
+                        .filter(|(ev, r)| r.is_zero() && chosen.contains(*ev))
+                        .count();
                     let mut added = 0usize;
                     for (ev, ms) in missing_by_event {
                         if !chosen.contains(&ev) {
@@ -166,6 +197,8 @@ pub async fn ingest_tick(
                         events_considered = event_ids.len(),
                         events_completed = chosen.len(),
                         members_added = added,
+                        fee_free_available,
+                        fee_free_chosen,
                         completion_limit,
                         "negRisk event completion"
                     );
@@ -352,52 +385,145 @@ pub async fn ingest_tick(
     Ok(())
 }
 
-/// Choose which negRisk events to top up this tick, given each event's count of members we are
-/// missing and a budget in member-markets. Returns the event ids to complete.
+/// One negRisk event competing for the completion budget.
+#[derive(Debug, Clone)]
+struct CompletionCandidate {
+    event_id: String,
+    /// Member books we do not yet hold — what completing this event costs.
+    missing: usize,
+    /// FULL live member count (k), which sets the basket's fee hurdle.
+    members: usize,
+    /// Worst per-leg taker rate across the event's members.
+    fee_rate: rust_decimal::Decimal,
+}
+
+/// Estimated fee hurdle: how far above 1.00 this event's implied-Yes sum must reach before the
+/// basket is an arb at all.
 ///
-/// **Cheapest-first, whole events only.** Both halves matter:
+/// Buying No across k legs pays `rate × (S − Σq²)` in taker fees (`q_i = 1 − ask_no_i`, `S = Σq_i`).
+/// With `S ≈ 1` and the legs evenly spread, `Σq² ≈ 1/k`, so the hurdle is **`rate × (1 − 1/k)`**.
+/// Two properties fall straight out, and both are load-bearing:
+/// - **Fee-free events have hurdle 0 at any k.** Their real arb line is 1.00, so any overround at
+///   all is capturable.
+/// - **The hurdle RISES with k.** Σq² shrinks as a basket spreads, so total fees climb toward the
+///   full rate: 5% × (1 − 1/3) = 3.3% at 3 legs vs 5% × (1 − 1/30) = 4.8% at 30. This is the
+///   missing explanation for a pattern already in our record — every profitable basket we have
+///   executed ran **3–11 legs**.
+fn completion_hurdle(fee_rate: rust_decimal::Decimal, members: usize) -> rust_decimal::Decimal {
+    if members == 0 {
+        return fee_rate;
+    }
+    fee_rate
+        * (rust_decimal::Decimal::ONE
+            - rust_decimal::Decimal::ONE / rust_decimal::Decimal::from(members as u64))
+}
+
+/// Choose which negRisk events to top up this tick, under a budget in member-markets.
+///
+/// **Lowest fee-hurdle first, whole events only.**
 /// - *Whole events*, because the arb line is `Σ(1 − ask_no) > 1` over the legs we can see. Spending
-///   the budget half-covering one big ladder buys a basket that still cannot clear the line, so a
+///   the budget half-covering one ladder buys a basket that still cannot clear the line, so a
 ///   partially funded event is wasted budget rather than partial progress.
-/// - *Cheapest-first*, because it maximises how many events become judgeable per book fetched. The
-///   2026-08-01 distribution was long-tailed (missing counts 1,1,2,2,2,2,4,6,6,7,7,8,8,12,…,50), so
-///   ascending order converts ~20 events for what the two largest alone would have cost.
+/// - *Lowest hurdle first* (2026-08-01, replacing cheapest-first). Cheapest-first is fee- and
+///   shape-blind, and it showed: it spent 250 of ~300 books on 5%-fee events where the bar is ~1.05
+///   and only 50 on the fee-free events where it is 1.00 — funding precisely the baskets least able
+///   to pay. Ordering by `completion_hurdle` puts fee-free events first at any size, then
+///   concentrated events over spread ones, which is the order of "could this basket ever clear?".
 ///
-/// Once the smallest remaining event does not fit, nothing later can either, so the scan stops.
+/// Ties break on cheapest-to-complete then event id, so the choice is deterministic tick-to-tick
+/// rather than thrashing a different half of a tie group each pass.
+///
+/// An event that does not fit is SKIPPED, not a stopping point — unlike the old cost-ordered scan,
+/// this order is not monotonic in cost, so a later event may still fit the remaining budget.
 fn select_completion_events(
-    mut sizes: Vec<(String, usize)>,
+    mut candidates: Vec<CompletionCandidate>,
     budget: usize,
 ) -> std::collections::HashSet<String> {
-    // Ascending by missing-count; event id breaks ties so the choice is deterministic tick-to-tick.
-    sizes.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    candidates.sort_by(|a, b| {
+        completion_hurdle(a.fee_rate, a.members)
+            .cmp(&completion_hurdle(b.fee_rate, b.members))
+            .then_with(|| a.missing.cmp(&b.missing))
+            .then_with(|| a.event_id.cmp(&b.event_id))
+    });
     let mut chosen = std::collections::HashSet::new();
     let mut spent = 0usize;
-    for (event_id, missing) in sizes {
-        if missing == 0 {
+    for c in candidates {
+        if c.missing == 0 {
             continue; // already fully covered — costs nothing, gains nothing
         }
-        if spent + missing > budget {
-            break;
+        if spent + c.missing > budget {
+            continue; // does not fit; a cheaper later event still might
         }
-        spent += missing;
-        chosen.insert(event_id);
+        spent += c.missing;
+        chosen.insert(c.event_id);
     }
     chosen
 }
 
 #[cfg(test)]
 mod tests {
-    use super::select_completion_events;
+    use super::{completion_hurdle, select_completion_events, CompletionCandidate};
+    use rust_decimal_macros::dec;
 
-    fn sizes(v: &[(&str, usize)]) -> Vec<(String, usize)> {
-        v.iter().map(|(a, b)| (a.to_string(), *b)).collect()
+    /// (event_id, missing, total members, fee rate)
+    fn cands(v: &[(&str, usize, usize, f64)]) -> Vec<CompletionCandidate> {
+        v.iter()
+            .map(|(id, missing, members, rate)| CompletionCandidate {
+                event_id: id.to_string(),
+                missing: *missing,
+                members: *members,
+                fee_rate: rust_decimal::Decimal::try_from(*rate).unwrap(),
+            })
+            .collect()
+    }
+
+    /// Same-shape events at one fee rate — isolates the cost tiebreak from the hurdle ordering.
+    fn even(v: &[(&str, usize)]) -> Vec<CompletionCandidate> {
+        cands(
+            &v.iter()
+                .map(|(id, missing)| (*id, *missing, 10usize, 0.05))
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[test]
-    fn completes_cheapest_events_first() {
+    fn fee_free_events_win_the_budget_at_any_size() {
+        // THE point of the 2026-08-01 reordering. Cheapest-first funded the 5%-fee events (bar
+        // ~1.05) and starved the fee-free ones (bar exactly 1.00) purely because they were smaller
+        // to complete. A fee-free 40-leg event is a better bet than a 5%-fee 3-leg one.
+        let chosen = select_completion_events(
+            cands(&[("feefree_big", 20, 40, 0.0), ("fee5_small", 3, 3, 0.05)]),
+            20,
+        );
+        assert!(chosen.contains("feefree_big"));
+        assert!(
+            !chosen.contains("fee5_small"),
+            "budget went to the wrong one"
+        );
+    }
+
+    #[test]
+    fn among_equal_fee_rates_concentrated_events_come_first() {
+        // The hurdle rises with leg count (fees climb toward the full rate as sum q^2 shrinks), so
+        // a 3-leg 5% basket clears on an overround a 30-leg 5% basket cannot.
+        assert!(completion_hurdle(dec!(0.05), 3) < completion_hurdle(dec!(0.05), 30));
+        let chosen =
+            select_completion_events(cands(&[("spread", 5, 30, 0.05), ("tight", 5, 3, 0.05)]), 5);
+        assert!(chosen.contains("tight") && !chosen.contains("spread"));
+    }
+
+    #[test]
+    fn fee_free_hurdle_is_zero_regardless_of_leg_count() {
+        for k in [2usize, 3, 30, 50] {
+            assert_eq!(completion_hurdle(dec!(0), k), dec!(0), "k={k}");
+        }
+    }
+
+    #[test]
+    fn completes_cheapest_events_first_within_a_hurdle_tier() {
         // Budget 10 buys the three small events (2+3+4=9); the 20-member one never fits.
         let chosen =
-            select_completion_events(sizes(&[("big", 20), ("c", 4), ("a", 2), ("b", 3)]), 10);
+            select_completion_events(even(&[("big", 20), ("c", 4), ("a", 2), ("b", 3)]), 10);
         assert_eq!(chosen.len(), 3);
         assert!(chosen.contains("a") && chosen.contains("b") && chosen.contains("c"));
         assert!(!chosen.contains("big"));
@@ -407,38 +533,39 @@ mod tests {
     fn never_part_funds_an_event() {
         // 6 of the 8 missing legs would fit, but a half-covered ladder cannot clear
         // `sum(1 - ask_no) > 1`, so the budget goes unspent rather than buying an unusable basket.
-        let chosen = select_completion_events(sizes(&[("solo", 8)]), 6);
+        let chosen = select_completion_events(even(&[("solo", 8)]), 6);
         assert!(chosen.is_empty());
     }
 
     #[test]
-    fn stops_at_the_first_event_that_does_not_fit() {
-        // Ascending order means a bigger event later can never fit either — and taking a LATER
-        // small event after skipping one would make the choice depend on scan order.
-        let chosen = select_completion_events(sizes(&[("a", 2), ("b", 5), ("c", 9)]), 6);
-        assert_eq!(chosen.len(), 1);
-        assert!(chosen.contains("a"));
+    fn an_event_that_does_not_fit_is_skipped_not_a_stopping_point() {
+        // Changed 2026-08-01 with the hurdle ordering: the scan is no longer monotonic in cost, so
+        // stopping at the first misfit would strand budget a later, cheaper event can use. Here
+        // "b" (5) does not fit alongside "a" (2) under a budget of 6, but "c" (3) does.
+        let chosen = select_completion_events(even(&[("a", 2), ("b", 5), ("c", 3)]), 6);
+        assert!(chosen.contains("a") && chosen.contains("c"));
+        assert!(!chosen.contains("b"));
     }
 
     #[test]
     fn fully_covered_events_cost_nothing() {
         // A 0-missing event must not consume budget that a real event could use.
-        let chosen = select_completion_events(sizes(&[("done", 0), ("a", 3), ("b", 3)]), 6);
+        let chosen = select_completion_events(even(&[("done", 0), ("a", 3), ("b", 3)]), 6);
         assert_eq!(chosen.len(), 2);
         assert!(!chosen.contains("done"));
     }
 
     #[test]
     fn zero_budget_disables_the_pass() {
-        assert!(select_completion_events(sizes(&[("a", 1)]), 0).is_empty());
+        assert!(select_completion_events(even(&[("a", 1)]), 0).is_empty());
     }
 
     #[test]
     fn selection_is_deterministic_across_ties() {
-        // Equal missing-counts: id order decides, so consecutive ticks complete the same events
-        // instead of thrashing a different half of the tie group each pass.
-        let a = select_completion_events(sizes(&[("y", 3), ("x", 3), ("z", 3)]), 6);
-        let b = select_completion_events(sizes(&[("z", 3), ("y", 3), ("x", 3)]), 6);
+        // Identical hurdle AND cost: id order decides, so consecutive ticks complete the same
+        // events instead of thrashing a different half of the tie group each pass.
+        let a = select_completion_events(even(&[("y", 3), ("x", 3), ("z", 3)]), 6);
+        let b = select_completion_events(even(&[("z", 3), ("y", 3), ("x", 3)]), 6);
         assert_eq!(a, b);
         assert!(a.contains("x") && a.contains("y"));
     }

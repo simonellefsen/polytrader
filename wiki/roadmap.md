@@ -267,10 +267,27 @@ new best is event `677008` at gross **0.994** — *below* 1.00, and therefore in
 metric — but nearly fee-free, so its line is 1.0016 and its shortfall is **−0.0076**, less than half
 as far from tradeable as the 1.031 event the old metric was pointing at.
 
-- [ ] **Bias the completion budget toward attainable events.** `select_completion_events` orders by
-  cheapest-to-complete, which is fee- and shape-blind: it spent 250 of 300 books on 5%-fee events
-  where the bar is ~1.05, and 50 on the fee-free ones where it is 1.00. Weight fee-free and
-  small/concentrated events first. *This is the change most likely to actually produce a fill.*
+- [x] **Bias the completion budget toward attainable events** → *DONE 2026-08-01, same day.*
+  `select_completion_events` ordered by cheapest-to-complete, which is fee- and shape-blind: it sent
+  250 of ~300 books to 5%-fee events (bar ~1.05) and 50 to the fee-free ones (bar 1.00) — funding
+  precisely the baskets least able to pay. It now orders by an estimated **fee hurdle**,
+  `rate × (1 − 1/k)`, which falls straight out of the fee algebra above and encodes both properties
+  at once: fee-free events sort first at any size, and among equal rates concentrated events beat
+  spread ones. One behavioural change came with it — an event that does not fit is now *skipped*
+  rather than ending the scan, because hurdle order is not monotonic in cost, so stopping early
+  would strand budget a later cheaper event can use.
+
+  **Measured live across the deploy** (5-minute scans, same 250-book budget):
+
+  | | Best event | Gross sum | Real line | Shortfall |
+  |---|---|---|---|---|
+  | 19:25 before | `677008` | 0.994 | 1.0016 | **−0.0076** |
+  | 19:30 after | `90434` | 1.000 | 1.0020 | **−0.0020** |
+
+  ~4× closer to tradeable, with `fee_free_chosen 4 / fee_free_available 4` and member books
+  286 → 414. Still **zero opportunities** — 20bps short is short. But the system is now looking at
+  the events where an arb could actually clear, rather than at the ones with the biggest raw
+  overround and an unpayable bar.
 
 ## 🔭 The arb scanner was reading 14% of every event it scanned — 2026-08-01
 
