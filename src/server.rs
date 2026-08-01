@@ -2694,7 +2694,20 @@ setInterval(load, 15000);
 fn classify_category(slug: &str, question: &str) -> &'static str {
     let s = format!("{} {}", slug, question).to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| s.contains(w));
+    // Politics first: an election market is never Sports, and several sports keywords ("champion",
+    // "win the") otherwise claim them.
     if has(&[
+        "president",
+        "presidential",
+        "election",
+        "nomination",
+        "prime minister",
+        "senate",
+        "congress",
+        "parliament",
+    ]) {
+        "Politics"
+    } else if has(&[
         "world-cup",
         "world cup",
         "fifa",
@@ -2702,7 +2715,11 @@ fn classify_category(slug: &str, question: &str) -> &'static str {
         "nfl",
         "nhl",
         "fifwc",
-        "win the",
+        // "win the" was here until 2026-08-01 and tagged EVERY "Will X win the Y election" market
+        // as Sports — all four 2028 US-presidential markets, the 2027 French presidential, the
+        // Democratic nomination. Display-only (trading routing uses `arb_category` in main.rs, which
+        // is unaffected), but it made the board unreadable at a glance. Politics is checked first
+        // below so the sports keywords can't claim it.
         "-vs-",
         "champion",
         "super bowl",
@@ -2835,10 +2852,16 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
     .fetch_all(pool)
     .await
     .unwrap_or_default();
-    let pos_map: HashMap<String, (String, Decimal, Decimal)> = pos_rows
-        .into_iter()
-        .map(|(m, o, s, a)| (m, (o, s, a)))
-        .collect();
+    // Keyed market_id -> ALL legs. This was a plain HashMap<market_id, one_leg> until 2026-08-01,
+    // which SILENTLY DROPPED a leg whenever we held both sides: `.collect()` keeps the last row for
+    // a duplicate key. Both-sides holdings are exactly the two-leg YES+NO arbs, so the board showed
+    // one hedged leg in isolation — the Israel/Iran ceasefire arb (Yes 200 @ 0.89 + No 200 @ 0.06,
+    // $190 cost against a guaranteed $200 payout = **+$10 locked in**) rendered as "HOLDING No ·
+    // −$11.70". A guaranteed profit displayed as a loss is worse than no display at all.
+    let mut pos_map: HashMap<String, Vec<(String, Decimal, Decimal)>> = HashMap::new();
+    for (m, o, s, a) in pos_rows {
+        pos_map.entry(m).or_default().push((o, s, a));
+    }
 
     // overreaction_fade retired 2026-06-29 (unwired from the fusion engine) — excluded from the
     // scorecard so the UI doesn't show a permanently-dead row.
@@ -2878,30 +2901,70 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
                     "fired": fired,
                 })
             });
-            let position = pos_map.get(&gid).map(|(o, s, a)| {
-                // Live unrealized P&L for the held outcome: (current_mid - avg_entry) * shares.
-                let held_mid = if o.eq_ignore_ascii_case("yes") { my } else { mn };
-                let cost_basis = (*a * *s).round_dp(2);
-                let (mid_json, unrealized_json, market_value_json) = match held_mid {
-                    Some(mid) => {
-                        let mv = (mid * *s).round_dp(2);
-                        let upnl = (mv - cost_basis).round_dp(2);
-                        (
-                            Some(mid.round_dp(4).to_string()),
-                            Some(upnl.to_string()),
-                            Some(mv.to_string()),
-                        )
-                    }
-                    None => (None, None, None),
-                };
+            let position = pos_map.get(&gid).filter(|legs| !legs.is_empty()).map(|legs| {
+                // Per-leg valuation: (current_mid − avg_entry) × shares for the side actually held.
+                let leg_json: Vec<serde_json::Value> = legs
+                    .iter()
+                    .map(|(o, s, a)| {
+                        let held_mid = if o.eq_ignore_ascii_case("yes") { my } else { mn };
+                        let cost_basis = (*a * *s).round_dp(2);
+                        let (mid_json, unrealized_json, market_value_json) = match held_mid {
+                            Some(mid) => {
+                                let mv = (mid * *s).round_dp(2);
+                                (
+                                    Some(mid.round_dp(4).to_string()),
+                                    Some((mv - cost_basis).round_dp(2).to_string()),
+                                    Some(mv.to_string()),
+                                )
+                            }
+                            None => (None, None, None),
+                        };
+                        serde_json::json!({
+                            "outcome": o,
+                            "shares": s.round_dp(1).to_string(),
+                            "avg_entry": a.round_dp(4).to_string(),
+                            "cost_basis": cost_basis.to_string(),
+                            "mid": mid_json,
+                            "market_value": market_value_json,
+                            "unrealized": unrealized_json,
+                        })
+                    })
+                    .collect();
+                // Totals across every leg — for a both-sides arb this is the only honest number,
+                // since the legs are a hedged unit and either one alone misrepresents the trade.
+                let total_cost: Decimal = legs.iter().map(|(_, s, a)| *a * *s).sum();
+                let total_value: Decimal = legs
+                    .iter()
+                    .filter_map(|(o, s, _)| {
+                        let mid = if o.eq_ignore_ascii_case("yes") { my } else { mn };
+                        mid.map(|m| m * *s)
+                    })
+                    .sum();
+                // Primary leg (largest cost basis) keeps the flat shape the card already renders.
+                let primary = legs
+                    .iter()
+                    .max_by_key(|(_, s, a)| (*a * *s).round_dp(4))
+                    .expect("non-empty");
+                let (po, ps, pa) = primary;
+                let primary_mid = if po.eq_ignore_ascii_case("yes") { my } else { mn };
+                let primary_cost = (*pa * *ps).round_dp(2);
                 serde_json::json!({
-                    "outcome": o,
-                    "shares": s.round_dp(1).to_string(),
-                    "avg_entry": a.round_dp(4).to_string(),
-                    "cost_basis": cost_basis.to_string(),
-                    "mid": mid_json,
-                    "market_value": market_value_json,
-                    "unrealized": unrealized_json,
+                    "outcome": po,
+                    "shares": ps.round_dp(1).to_string(),
+                    "avg_entry": pa.round_dp(4).to_string(),
+                    "cost_basis": primary_cost.to_string(),
+                    "mid": primary_mid.map(|m| m.round_dp(4).to_string()),
+                    "market_value": primary_mid.map(|m| (m * *ps).round_dp(2).to_string()),
+                    // Both-sides: report the HEDGED total, not the primary leg alone.
+                    "unrealized": if legs.len() > 1 {
+                        (total_value - total_cost).round_dp(2).to_string()
+                    } else {
+                        primary_mid.map(|m| ((m * *ps).round_dp(2) - primary_cost).round_dp(2).to_string()).unwrap_or_default()
+                    },
+                    "both_sides": legs.len() > 1,
+                    "legs": leg_json,
+                    "total_cost_basis": total_cost.round_dp(2).to_string(),
+                    "total_market_value": total_value.round_dp(2).to_string(),
                 })
             });
             serde_json::json!({
@@ -3021,14 +3084,23 @@ async function load(){
     const statusTag = m.resolved_outcome ? `<span class="tag ${ (pos&&pos.outcome===m.resolved_outcome)?'won': (pos?'lost':'') }">RESOLVED · ${fmt(m.resolved_outcome)}</span>`
                      : (m.active ? `<span class="tag" style="color:#3fb950;border-color:#23863655">LIVE</span>` : `<span class="tag">closed</span>`);
     const upnl = pos&&pos.unrealized!=null ? parseFloat(pos.unrealized) : null;
-    const holdTag = pos ? `<span class="tag hold">HOLDING ${fmt(pos.outcome)} · ${pos.shares} sh${upnl!=null?` · <span class="pnl ${pnlCls(upnl)}">${upnl>=0?'+':''}$${upnl.toFixed(2)}</span>`:''}</span>` : '';
-    const posLine = pos ? `<div class="pos">
+    // Both-sides (two-leg arb) shows the HEDGED pair, never one leg on its own — a leg in isolation
+    // reads as a loss even when the pair has locked in a guaranteed profit.
+    const holdLabel = pos ? (pos.both_sides ? `HEDGED Yes+No · ${pos.legs.map(l=>l.shares).join('/')} sh` : `HOLDING ${fmt(pos.outcome)} · ${pos.shares} sh`) : '';
+    const holdTag = pos ? `<span class="tag hold">${holdLabel}${upnl!=null?` · <span class="pnl ${pnlCls(upnl)}">${upnl>=0?'+':''}$${upnl.toFixed(2)}</span>`:''}</span>` : '';
+    const legLine = (l)=>`<span>${fmt(l.shares)} ${fmt(l.outcome)} @ ${fmt(l.avg_entry)}</span>${l.mid!=null?`<span class="muted">now ${l.mid}</span>`:''}${l.market_value!=null?`<span class="muted">· value $${l.market_value}</span>`:''}`;
+    const posLine = !pos ? '' : (pos.both_sides ? `<div class="pos">
+        <span class="lbl">Hedged pair</span>
+        ${pos.legs.map(l=>`<div>${legLine(l)}</div>`).join("")}
+        <div><span class="muted">cost $${pos.total_cost_basis} · value $${pos.total_market_value}</span>
+        ${upnl!=null?`<span class="spacer"></span><span class="pnl ${pnlCls(upnl)}">${upnl>=0?'+':''}$${upnl.toFixed(2)} unrealized (pair)</span>`:''}</div>
+      </div>` : `<div class="pos">
         <span class="lbl">Position</span>
         <span>${fmt(pos.shares)} ${fmt(pos.outcome)} @ ${fmt(pos.avg_entry)}</span>
         ${pos.mid!=null?`<span class="muted">now ${pos.mid}</span>`:''}
         ${pos.market_value!=null?`<span class="muted">· value $${pos.market_value}</span>`:''}
         ${upnl!=null?`<span class="spacer"></span><span class="pnl ${pnlCls(upnl)}">${upnl>=0?'+':''}$${upnl.toFixed(2)} unrealized</span>`:''}
-      </div>` : '';
+      </div>`);
     return `<div class="card ${m.resolved_outcome?'resolved':''} ${pos&&!m.resolved_outcome?'held':''}">
       <div class="q">${fmt(m.question||m.slug)}</div>
       <div class="row">
@@ -3041,7 +3113,7 @@ async function load(){
         <span>net edge <b class="edge ${edgeCls(sig.net_edge)}">${parseFloat(sig.net_edge||0).toFixed(3)}</b></span>
         ${sig.kelly_usdc&&parseFloat(sig.kelly_usdc)>0?`<span class="muted">· Kelly $${parseFloat(sig.kelly_usdc).toFixed(0)} (${fmt(sig.target_outcome)})</span>`:''}
         <span class="spacer"></span>${firedChips||'<span class="muted">no signal fired</span>'}
-      </div>`:'<div class="sig muted">no decision report yet</div>'}
+      </div>`:'<div class="sig muted" title="Decision reports are capped at 40 markets per 5-min cycle (DR_MARKET_LIMIT), prioritising the directional universe + bootstrap list. ~5.5k markets are DR-eligible, so most never get one — this is our own throughput cap, not a Polymarket delay. Arb-only markets never need a DR.">not in the decision-report pool</div>'}
       ${posLine}
       ${news?`<div class="news"><span class="dot" style="background:${polDot(news.polarity)}"></span>news ${fmt(news.headline_count)} headlines · polarity ${fmt(news.polarity)}${(news.top_titles&&news.top_titles[0])?` — <span class="muted">${news.top_titles[0]}</span>`:''}</div>`:''}
     </div>`;
