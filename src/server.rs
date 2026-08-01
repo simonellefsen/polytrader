@@ -2806,9 +2806,15 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
         bool,
         bool,
         Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
     );
     let markets: Vec<MktRow> = sqlx::query_as(
-        "SELECT gamma_id, slug, question, category, last_mid_yes, last_mid_no, active, closed, resolved_outcome
+        // end_date drives the AWAITING RESOLUTION badge: a held market past its end date is not
+        // "live", it is parked waiting on Polymarket/UMA, and the card said nothing to distinguish
+        // the two. Cast is best-effort — Gamma's end_date is free-form text in raw_json.
+        "SELECT gamma_id, slug, question, category, last_mid_yes, last_mid_no, active, closed, resolved_outcome,
+                CASE WHEN raw_json->>'end_date' ~ '^\\d{4}-\\d{2}-\\d{2}T'
+                     THEN (raw_json->>'end_date')::timestamptz END
          FROM market_data.markets ORDER BY closed ASC, updated_at DESC",
     )
     .fetch_all(pool)
@@ -2874,7 +2880,7 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
     ];
     let out: Vec<serde_json::Value> = markets
         .into_iter()
-        .map(|(gid, slug, question, db_category, my, mn, active, closed, resolved)| {
+        .map(|(gid, slug, question, db_category, my, mn, active, closed, resolved, end_date)| {
             let category = db_category.unwrap_or_else(|| classify_category(&slug, &question).to_string());
             let signal = dr_map.get(&gid).map(|dr| {
                 let attr = dr.pointer("/report/attribution");
@@ -2967,6 +2973,15 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
                     "total_market_value": total_value.round_dp(2).to_string(),
                 })
             });
+            // AWAITING RESOLUTION: held, past its own end date, and Polymarket still has it open.
+            // Without this the board renders a parked position identically to a live one, which
+            // reads as "stuck" when it is usually on schedule — the comparable PortWatch market
+            // ("Strait of Hormuz traffic returns to normal by July 15") settled 160h past its end
+            // date. Only shown for HELD markets: for everything else the state is not actionable.
+            let awaiting_hours = end_date.filter(|_| position.is_some() && !closed).and_then(|ed| {
+                let hrs = (chrono::Utc::now() - ed).num_minutes() as f64 / 60.0;
+                (hrs > 0.0).then_some(hrs)
+            });
             serde_json::json!({
                 "slug": slug,
                 "question": question,
@@ -2980,6 +2995,8 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
                 "signal": signal,
                 "news": news_map.get(&gid),
                 "position": position,
+                "awaiting_hours": awaiting_hours.map(|h| format!("{h:.0}")),
+                "end_date": end_date.map(|d| d.format("%Y-%m-%d %H:%MZ").to_string()),
             })
         })
         .collect();
@@ -3028,6 +3045,9 @@ fn render_board_page(prefix: &str) -> String {
   .tag { font-size:11px; padding:1px 7px; border-radius:10px; border:1px solid #30363d; color:#8b949e; }
   .tag.cat { color:#d2a8ff; border-color:#8957e555; text-transform:capitalize; }
   .tag.hold { color:#e3b341; border-color:#bb800955; }
+  /* Parked, not live: past end date, waiting on Polymarket/UMA. Deliberately not red — this is a
+     normal state that routinely runs days, not a fault. */
+  .tag.await { color:#a371f7; border-color:#8957e555; }
   .tag.won { color:#3fb950; border-color:#23863655; }
   .tag.lost { color:#f85149; border-color:#da363355; }
   .bar { height:22px; border-radius:6px; overflow:hidden; display:flex; font-size:11px; font-weight:600; }
@@ -3081,8 +3101,15 @@ async function load(){
     const haveBar = yes!=null && no!=null;
     const sig = m.signal, pos = m.position, news = m.news;
     const firedChips = (sig&&sig.fired||[]).map(f=>`<span class="chip ${chipCls(f.name)}">${f.name.replace(/_/g,' ')} ${f.score}</span>`).join(" ");
+    // A held market past its own end date is NOT live — it is parked waiting on Polymarket to close
+    // it and on a UMA proposer to post an outcome. Rendering it as LIVE (which the board did until
+    // 2026-08-01) makes an on-schedule wait look like a stuck position. Nothing on our side gates
+    // this; settlement fires as soon as Gamma reports closed + a resolved outcome.
+    const awaitingH = m.awaiting_hours!=null ? parseInt(m.awaiting_hours,10) : null;
+    const awaitingLbl = awaitingH==null ? '' : (awaitingH < 48 ? `${awaitingH}h` : `${Math.floor(awaitingH/24)}d`);
     const statusTag = m.resolved_outcome ? `<span class="tag ${ (pos&&pos.outcome===m.resolved_outcome)?'won': (pos?'lost':'') }">RESOLVED · ${fmt(m.resolved_outcome)}</span>`
-                     : (m.active ? `<span class="tag" style="color:#3fb950;border-color:#23863655">LIVE</span>` : `<span class="tag">closed</span>`);
+                     : (awaitingH!=null ? `<span class="tag await" title="Past its end date (${fmt(m.end_date)}). Polymarket has not closed this market yet and no UMA resolution has been proposed — nothing is blocked on our side; settlement fires automatically once it resolves. For reference a comparable IMF-PortWatch market settled 160h (6.7 days) after its end date.">AWAITING RESOLUTION · ${awaitingLbl}</span>`
+                     : (m.active ? `<span class="tag" style="color:#3fb950;border-color:#23863655">LIVE</span>` : `<span class="tag">closed</span>`));
     const upnl = pos&&pos.unrealized!=null ? parseFloat(pos.unrealized) : null;
     // Both-sides (two-leg arb) shows the HEDGED pair, never one leg on its own — a leg in isolation
     // reads as a loss even when the pair has locked in a guaranteed profit.

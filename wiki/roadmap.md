@@ -233,6 +233,45 @@ basket at 5744bps returns ~$17 — meaningful against $150.
   call on a risk parameter, set loose on purpose so it can be tightened from `below_min_edge_count`
   rather than from a guess.
 
+## 💸 The "1.00 arb line" was the wrong bar — 2026-08-01 (same day, follow-on)
+
+Widening the funnel worked (14% → full event coverage, 26–29 events scanned) and **still produced
+zero opportunities**, with `best_implied_yes_sum` sitting at 1.031 — apparently 3.1% *past* the arb
+line, with the executor declining it. The executor was right; the diagnostic was lying.
+
+With per-leg taker fees `rate × p × (1−p)`, a buy-all-No basket pays `rate × (S − Σq²)` in fees
+(`q_i = 1 − ask_no_i`, `S = Σq_i`). So the real line is **`S > 1 + rate × (S − Σq²)`**, not `S > 1`.
+For the live 20-leg 5%-fee event at S = 1.031 the line is **1.049** — it was 1.8 points underwater,
+never close.
+
+Two consequences the raw sum hid:
+
+| Shape (S = 1.031, rate 5%) | Real arb line | Net/unit |
+|---|---|---|
+| 3 legs | 1.0338 | −0.0028 |
+| 11 legs | 1.0467 | −0.0157 |
+| 30 legs | 1.0493 | −0.0283 |
+| **any k, fee-free** | **1.0000** | **+0.0310** |
+
+1. **More legs is a worse deal.** `Σq²` shrinks as the basket spreads, so total fees rise toward
+   `rate`. This is the missing explanation for a pattern already in the record: **every profitable
+   basket we have ever executed ran 3–11 legs** (3, 3, 9, 6, 6, 11, 3, 4, 3, 5). It was never a
+   coincidence — big ladders carry a structurally higher bar.
+2. **Fee-free events (geopolitics, rate 0) really do have a 1.00 line.** The same 1.031 that loses
+   money on a 5%-fee event is a live +3.1% arb there. Of the events currently scanned, only **4 of
+   38 (50 of 378 books)** are fee-free.
+
+`NegRiskDiagnostics` now reports `best_arb_line` and `best_line_shortfall`, and ranks the "closest"
+event by shortfall rather than by raw sum. The reordering was immediate and confirms the point: the
+new best is event `677008` at gross **0.994** — *below* 1.00, and therefore invisible to the old
+metric — but nearly fee-free, so its line is 1.0016 and its shortfall is **−0.0076**, less than half
+as far from tradeable as the 1.031 event the old metric was pointing at.
+
+- [ ] **Bias the completion budget toward attainable events.** `select_completion_events` orders by
+  cheapest-to-complete, which is fee- and shape-blind: it spent 250 of 300 books on 5%-fee events
+  where the bar is ~1.05, and 50 on the fee-free ones where it is 1.00. Weight fee-free and
+  small/concentrated events first. *This is the change most likely to actually produce a fill.*
+
 ## 🔭 The arb scanner was reading 14% of every event it scanned — 2026-08-01
 
 Operator question: *"Why are we not opening new positions, are we being too cautious?"* Two answers,
