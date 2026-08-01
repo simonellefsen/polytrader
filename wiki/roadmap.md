@@ -219,10 +219,69 @@ system would trade ~1 basket per 3 days rather than daily, needing far less exec
 full P5. Funding stays the binding constraint ($1.50 max notional vs $4.84–$12.12 legs), but a $30
 basket at 5744bps returns ~$17 — meaningful against $150.
 
-- [ ] **Gate arb execution on a minimum basket edge.** The scanner's own net-profit threshold admits
-  29bps baskets that earn ~$1 and add settlement/partial-fill surface for nothing. Consider a
-  `POLYTRADER_ARB_MIN_BASKET_EDGE_BPS` floor well above the current threshold. *Do this before any
-  real-money step, not after — it shrinks the execution problem rather than solving it.*
+- [x] **Gate arb execution on a minimum basket edge** → *DONE 2026-08-01, shipped with the funnel
+  widening below (which is what made it urgent: a wider funnel surfaces more thin baskets competing
+  for the same collateral).* `POLYTRADER_ARB_MIN_BASKET_EDGE_BPS`, enforced at the routing layer in
+  the scan handler rather than inside the executor, so one scan record reports both what cleared and
+  what did not (`below_min_edge_count`, `best_below_min_edge_bps`) — a per-basket rejection event
+  would re-fire every 5-minute cycle for as long as a dislocation persists.
+  **Deployed at 50, not the 400 the profit table implies, and the gap is deliberate.** 400 is the
+  REAL-MONEY bar; its entire justification is partial-fill risk, which paper fills do not carry.
+  Importing it here would forgo real (if small) paper profit — the <400bps bucket was still net
+  **positive** (+$22.03) — and stop generating data about the middle of the distribution, where
+  event 748763 (147.6bps) actually sits. 50 declines only the sub-dollar tail. This is a judgment
+  call on a risk parameter, set loose on purpose so it can be tightened from `below_min_edge_count`
+  rather than from a guess.
+
+## 🔭 The arb scanner was reading 14% of every event it scanned — 2026-08-01
+
+Operator question: *"Why are we not opening new positions, are we being too cautious?"* Two answers,
+and only one of them was intended.
+
+**Directional: deliberate.** `ROTATION_LIMIT=5` + `MAX_DAILY_ENTRIES=1` is the P5 Path A NO-GO
+control arm. Over 5 days: 57 `halted_by_daily_turnover_budget`, 101 `rejected_by_risk_gate`, **3
+filled** — while settlements ran 15/day on Jul 27/29/31. Positions drained ~10x faster than a 1/day
+cap refills them (40 → 7). Arithmetic, not timidity.
+
+**Arb: not intended, and the cause was structural.** The scan looked healthy — 575 scans/48h, 102
+usable books, `best_implied_yes_sum` 1.012 — and reported 0 opportunities. But discovery ranks
+individual MARKETS, so a multi-leg event enters the universe as its few most-traded legs. The arb
+line is `Σ(1 − ask_no) > 1` **over the legs we can see**, so a 3-of-50 fragment sums nowhere near 1
+no matter how dislocated the event truly is. Measured across the 31 negRisk events already touched:
+
+| | Gamma live member books | Held fresh | Coverage |
+|---|---|---|---|
+| before | 530 | 76 | **14%** |
+
+So "no arb" was never a finding about the market. The scanner could not have found event arb.
+
+Three defects, fixed together:
+
+1. **Event-completeness pass** (`ingest_tick` step 4 + `GammaClient::fetch_event_members`). Tops up
+   the events already in the universe, **cheapest event first, whole events only** — a part-funded
+   ladder still cannot clear the line, so partial funding is wasted budget, not partial progress.
+   Completion members fetch the **No book only** (all the buy-all-No basket reads), halving cost.
+2. **`ARB_DISCOVERY_LIMIT=150` had been silently delivering 100.** Gamma caps a `/markets` page at
+   100 regardless of `limit` — a cap already documented on `discover_directional_markets`, but
+   `discover_arb_markets` was a single un-paginated call. Visible in hindsight in the `universe=158`
+   ingest log (100 + 23 bootstrap + rotation/held).
+3. **`MIN_MEMBERS = 3` rested on a false premise.** Its comment claimed 2-member events were
+   "covered by the single-market scanner". They are not — the two members are separate gamma_ids
+   with separate CLOB books, while `arbitrage::scan` only ever compares the Yes and No books *of one
+   market*. Covered by nothing, and precisely the cross-book case the module doc names as the
+   profitable one. Now 2; the payout algebra was already correct at k=2.
+
+**Live after deploy:** discovery 100 → **150** returned; 35 negRisk events considered, 547 members
+fetched, **27 events completed, 228 members added**; universe **158 → 434**. Tick cost **231s** of
+the 300s interval (426 markets), against a 235s prediction — snapshots now refresh every ~8.9 min,
+still well inside the negRisk scan's 30-minute freshness join. `elapsed_secs` on the "ingestion tick
+complete" log is the budget signal for raising `NEGRISK_COMPLETION_LIMIT` past 250.
+
+*Checked and deliberately NOT changed:* DR eligibility. Completion members set `last_mid_no` only,
+which qualifies them for the DR pool — but 3,744 active markets already sit in that no-Yes-mid state,
+so the ~250 added are a ~7% increase to a case the generator already handles. Tightening DR
+eligibility to require both mids would have excluded those 3,744 as a side effect of an unrelated
+change.
 
 ## 📋 Open items / TODO (live backlog, most recent first)
 
@@ -236,12 +295,31 @@ the dated Decision-log entry below; this is the at-a-glance index.
   (a) simultaneous multi-leg fills — the hard prerequisite for arb with real money, since
   snapshot-based legs can mis-fill and turn a risk-free basket into a directional position;
   (b) maker rebates (zero taker fee + 20–25% rebate); (c) honest fill simulation. Large.
-- [ ] **Widen the negrisk funnel** (2026-07-25, from the Path B GO). Arb is the only proven earner,
-  so its coverage is now the main throughput lever. Two knobs: `MIN_MEMBERS = 3`
-  (`src/strategy/negrisk.rs:40`) excludes 2-member events, and the scan only sees books the ingester
-  already holds (volume-ranked top-N), so event coverage is incidental rather than deliberate. Move
-  toward scanning *whole events* — the invariant holds for any subset, so partial coverage only
-  shrinks the captured spread.
+- [x] **Widen the negrisk funnel** (2026-07-25, from the Path B GO) → *DONE 2026-08-01. Triggered by
+  the operator question "why are we not opening new positions, are we being too cautious?" — the
+  directional throttle was deliberate (the P5 NO-GO), but arb, the GO path, had gone quiet and that
+  was **not** intended. Three defects, one of them the reason event arb was structurally unfindable:*
+  1. ***The scanner was reading 14% of every event it scanned.*** Discovery ranks individual
+     MARKETS, so a 50-leg ladder enters the universe as its 3 most-traded legs. But the arb line is
+     `Σ(1 − ask_no) > 1` over *visible* legs — a 3-of-50 fragment sums nowhere near 1 no matter how
+     dislocated the event actually is. So "0 opportunities, best_implied_yes_sum 1.012" was not a
+     verdict about the market; the scanner could not have found event arb regardless of what was
+     there. Measured across the 31 negRisk events we already touched: **530 live member books on
+     Gamma, 76 held fresh.** Fixed with a completion pass (`ingest_tick` step 4 +
+     `GammaClient::fetch_event_members`) that tops up the events already in the universe,
+     **cheapest event first, whole events only** — a part-funded ladder still cannot clear the line,
+     so partial funding is wasted budget rather than partial progress. Completion members fetch the
+     **No book only** (all the buy-all-No basket reads), halving their cost.
+  2. ***`POLYTRADER_ARB_DISCOVERY_LIMIT=150` had been silently delivering 100.*** Gamma caps a
+     `/markets` page at 100 regardless of `limit` — a cap already documented on
+     `discover_directional_markets`, but `discover_arb_markets` was a single un-paginated call.
+     Visible in hindsight in the `universe=158` ingest log (100 + 23 bootstrap + rotation/held).
+  3. ***`MIN_MEMBERS = 3` rested on a false premise.*** Its comment said 2-member events are "covered
+     by the single-market scanner". They are not: the two members are separate gamma_ids with
+     separate CLOB books, while `arbitrage::scan` only ever compares the Yes and No books *of one
+     market*. Those baskets were covered by nothing — and they are precisely the cross-book case the
+     module doc names as the profitable one. Now 2. The payout algebra was already correct at k=2.
+  *Verification and the live before/after are in the dated Decision-log entry.*
 - [ ] **Variable-cadence ladder detection** (deferred from 2026-07-21 #4). `src/rotation/ladder.rs`
   predicts fixed-cadence date-range families only (the weekly Musk ladder). Fed/FOMC ladders recur
   per *meeting*, not on a fixed interval — needs a schedule-driven variant of `next_ladder_window`.

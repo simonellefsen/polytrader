@@ -25,8 +25,13 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 
-/// Same invariant as the negRisk arb scanner (`strategy::negrisk::MIN_MEMBERS`): a 2-member event
-/// is just a binary market, not a ladder — not worth the prediction machinery.
+/// A 2-member family is a single either/or question, not a ladder of brackets — there is no next
+/// rung to predict, so it is not worth the prediction machinery.
+///
+/// This deliberately no longer tracks `strategy::negrisk::MIN_MEMBERS`, which dropped to 2 on
+/// 2026-08-01. The two constants were never the same question: the arb scanner asks "can this
+/// basket be priced?" (yes at k=2 — two separate books that must stay consistent), while this asks
+/// "does this family have a recurring bracket structure worth forecasting?" (no at k=2).
 const LADDER_MIN_MEMBERS: usize = 3;
 
 const MONTHS: [&str; 12] = [

@@ -1790,12 +1790,41 @@ async fn produce_arb_scan_journal(
                 best_implied_yes_sum = ?ndiag.best_implied_yes_sum,
                 "negrisk arb scan diagnostics"
             );
+            // MINIMUM BASKET EDGE. The scanner's own bar is MIN_NET_PROFIT — an ABSOLUTE $0.002 per
+            // unit — which admits baskets whose return on locked collateral is negligible: the first
+            // shadowed basket (2026-07-28, event 716159, 4 legs) came in at **29.1 bps** and earned
+            // about a dollar. Of the 24 baskets executed to that date, the 8 at >=400bps produced
+            // +$333.59 (+$41.70 avg) against +$22.03 (+$1.38 avg) for the 16 below — 33% of baskets,
+            // 94% of the profit. That correlation is *partly mechanical* (P&L ~ units x
+            // net-profit-per-unit), so it is NOT evidence that fat baskets are better predicted; it
+            // is evidence about what a spread has to be to survive execution. A 57% guaranteed
+            // spread absorbs a mis-filled leg; a 0.29% spread is destroyed by one tick of slippage,
+            // and a partial fill degrades the payout floor to filled_legs-1 (see
+            // execute_negrisk_opportunity).
+            //
+            // Gating here rather than inside the executor keeps "which baskets do we trade" at the
+            // routing layer, and lets one scan record report both what cleared and what did not —
+            // per-basket rejection events would re-fire every 5-minute cycle for as long as a
+            // dislocation persists. `below_min_edge` is the tuning signal: raise the floor only
+            // against observed edges, not against a guess.
+            let min_basket_edge_bps = std::env::var("POLYTRADER_ARB_MIN_BASKET_EDGE_BPS")
+                .ok()
+                .and_then(|v| v.trim().parse::<rust_decimal::Decimal>().ok())
+                .unwrap_or(dec!(0));
+            let (tradeable, below_floor): (Vec<_>, Vec<_>) = nopps.iter().partition(|o| {
+                negrisk_basket_edge_bps(o.net_profit_per_unit, o.total_cost) >= min_basket_edge_bps
+            });
             let payload = serde_json::json!({
                 "strategy": "negrisk_event_arbitrage",
                 "opportunity_count": nopps.len(),
                 "best_net_profit_per_unit": nopps.first().map(|o| o.net_profit_per_unit.to_string()),
                 "top_opportunities": nopps.iter().take(3).collect::<Vec<_>>(),
                 "diagnostics": ndiag,
+                "min_basket_edge_bps": min_basket_edge_bps.to_string(),
+                "below_min_edge_count": below_floor.len(),
+                "best_below_min_edge_bps": below_floor
+                    .first()
+                    .map(|o| negrisk_basket_edge_bps(o.net_profit_per_unit, o.total_cost).to_string()),
                 "paper_only": true,
                 "real_orders_enabled": false,
                 "note": "Event-level negRisk scan (buy No across k mutually-exclusive members pays >= k-1; arb when implied Yes probs sum over 100%). Works on partial event coverage, so it scans the books the universe already ingests. best_implied_yes_sum is the closest approach to the 1.00 arb line."
@@ -1809,7 +1838,7 @@ async fn produce_arb_scan_journal(
                 )
                 .await;
             if autonomous {
-                for opp in nopps.iter().take(2) {
+                for opp in tradeable.iter().take(2) {
                     if let Err(e) =
                         execute_negrisk_opportunity(pool, journal, paper_engine, opp).await
                     {
@@ -2644,6 +2673,38 @@ mod tests {
         assert_eq!(negrisk_basket_edge_bps(dec!(0.01), dec!(1)), dec!(100));
         // Degenerate cost → 0 (no divide-by-zero), mirroring negrisk_basket_units.
         assert_eq!(negrisk_basket_edge_bps(dec!(0.5), dec!(0)), dec!(0));
+    }
+
+    #[test]
+    fn min_basket_edge_floor_separates_the_two_real_baskets() {
+        use super::negrisk_basket_edge_bps;
+        // The routing gate (POLYTRADER_ARB_MIN_BASKET_EDGE_BPS) partitions on this value, so pin it
+        // against the two baskets we actually executed rather than invented numbers.
+        //
+        // The FIRST shadowed basket (2026-07-28, event 716159, 4 legs, all filled), inputs taken
+        // verbatim from its clob_shadow_order journal rows. It cleared the scanner's ABSOLUTE
+        // MIN_NET_PROFIT bar ($0.002/unit) on a $2.966 basket and earned about a dollar — exactly
+        // the trade the floor exists to decline.
+        let thin = negrisk_basket_edge_bps(dec!(0.00863570), dec!(2.966));
+        assert_eq!(thin, dec!(29.1));
+        // The Jul-26 Brazilian basket, 2nd-fattest of the 24 executed.
+        let fat = negrisk_basket_edge_bps(dec!(0.67180125), dec!(1.315));
+
+        // The deployed paper floor declines the thin one and keeps the fat one.
+        assert!(thin < dec!(50) && fat >= dec!(50));
+        // The 400bps real-money bar (8 of 24 baskets, 94% of realized profit) agrees on both.
+        assert!(thin < dec!(400) && fat >= dec!(400));
+
+        // The two bars are NOT interchangeable, and a real basket sits between them: event 748763
+        // (2026-07-29) at 147.6bps would trade under the deployed paper floor and be declined under
+        // the real-money bar. Paper keeps it deliberately — it is a live data point about the
+        // middle of the distribution, and paper carries no partial-fill risk to price.
+        let middling = negrisk_basket_edge_bps(dec!(0.04328385), dec!(2.933));
+        assert_eq!(middling, dec!(147.6));
+        assert!(middling >= dec!(50) && middling < dec!(400));
+
+        // A floor of 0 disables the gate — every scanner-admitted basket still trades.
+        assert!(thin >= dec!(0));
     }
 
     #[test]

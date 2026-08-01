@@ -158,31 +158,120 @@ impl GammaClient {
     }
 
     /// Discover the top active binary markets by 24h volume that have a live order book — the
-    /// volume-ranked arb-scan universe. ONE batched Gamma call (unlike the per-slug bootstrap path),
-    /// filtered client-side to 2-outcome (Yes/No) order-book markets since the YES+NO<$1 arb needs
-    /// exactly two complementary books. Breadth is the point: real arbs are rare per-market but
-    /// scale with the number of books watched. Failure is caller-non-fatal.
+    /// volume-ranked arb-scan universe. Filtered client-side to 2-outcome (Yes/No) order-book
+    /// markets since the YES+NO<$1 arb needs exactly two complementary books. Breadth is the point:
+    /// real arbs are rare per-market but scale with the number of books watched. Failure is
+    /// caller-non-fatal.
+    ///
+    /// PAGINATED (2026-08-01). This was a single call passing `limit` straight through, but Gamma
+    /// caps a /markets page at 100 **regardless of the limit parameter** — the same cap already
+    /// documented on `discover_directional_markets`. So `POLYTRADER_ARB_DISCOVERY_LIMIT=150` had
+    /// been silently delivering 100 markets (confirmed against the live API and against the
+    /// `universe=158` ingest log against a 150 limit + 23 bootstrap + rotation/held slugs). The knob
+    /// now means what it says.
     pub async fn discover_arb_markets(&self, limit: usize) -> Result<Vec<Market>> {
-        let url = format!(
-            "{}/markets?active=true&closed=false&order=volume24hr&ascending=false&limit={}",
-            self.base, limit
-        );
-        let resp: Vec<Value> = self.http.get(&url).send().await?.json().await?;
-        let out: Vec<Market> = resp
-            .iter()
-            .map(Self::parse_market)
-            .filter(|m| {
+        const PAGE: usize = 100; // Gamma caps a /markets page at 100 regardless of limit
+        let mut out: Vec<Market> = Vec::new();
+        let mut returned_total = 0usize;
+        let mut offset = 0usize;
+        while offset < limit {
+            let want = PAGE.min(limit - offset);
+            let url = format!(
+                "{}/markets?active=true&closed=false&order=volume24hr&ascending=false&limit={}&offset={}",
+                self.base, want, offset
+            );
+            let resp: Vec<Value> = self.http.get(&url).send().await?.json().await?;
+            let n = resp.len();
+            returned_total += n;
+            out.extend(resp.iter().map(Self::parse_market).filter(|m| {
                 !m.closed
                     && m.enable_order_book
                     && m.outcomes.len() == 2
                     && m.clob_token_ids.len() == 2
-            })
-            .collect();
+            }));
+            if n < want {
+                break; // ranking exhausted
+            }
+            offset += n;
+        }
         tracing::info!(
-            returned = resp.len(),
+            returned = returned_total,
             usable = out.len(),
             limit,
             "gamma arb-discovery markets"
+        );
+        Ok(out)
+    }
+
+    /// Fetch every member market of the given negRisk events (`/events?id=…`, whose `markets[]`
+    /// carries the full member list). Returns live, binary, order-book members only.
+    ///
+    /// This is what makes event-level arb reachable. The volume-ranked discovery pool ranks
+    /// INDIVIDUAL markets, so a big ladder enters it as a handful of its most-traded legs and the
+    /// rest are invisible. Measured 2026-08-01: across the 31 negRisk events we already touched,
+    /// Gamma exposed **530** live order-book members while we held fresh books for **76** — the
+    /// scanner was reading 14% of the very events it was scanning. Since the arb line is
+    /// `Σ(1 − ask_no) > 1`, a fragment of a 50-leg ladder sums nowhere near 1 no matter how
+    /// dislocated the event is; coverage has to be near-complete before the event is even
+    /// judgeable.
+    ///
+    /// Event payloads are large (full description text per member), so ids are requested in small
+    /// chunks and a failed chunk is skipped rather than failing the pass.
+    pub async fn fetch_event_members(&self, event_ids: &[String]) -> Result<Vec<Market>> {
+        /// Event JSON carries every member's full description; keep requests small.
+        const CHUNK: usize = 5;
+        let mut out: Vec<Market> = Vec::new();
+        for chunk in event_ids.chunks(CHUNK) {
+            let q = chunk
+                .iter()
+                .map(|id| format!("id={id}"))
+                .collect::<Vec<_>>()
+                .join("&");
+            let url = format!("{}/events?limit=100&{}", self.base, q);
+            let resp: Vec<Value> = match self.http.get(&url).send().await {
+                Ok(r) => match r.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "gamma event-members parse failed; skipping chunk");
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "gamma event-members request failed; skipping chunk");
+                    continue;
+                }
+            };
+            for ev in resp {
+                let Some(event_id) = ev.get("id").and_then(|i| i.as_str()) else {
+                    continue;
+                };
+                // The parent's negRisk is authoritative: member objects nested under an event carry
+                // no `events` array, so `parse_market`'s usual fallback path can't see it.
+                let parent_neg_risk = ev.get("negRisk").and_then(|b| b.as_bool()).unwrap_or(false);
+                let Some(members) = ev.get("markets").and_then(|m| m.as_array()) else {
+                    continue;
+                };
+                for mv in members {
+                    let mut m = Self::parse_market(mv);
+                    if m.closed
+                        || !m.active
+                        || !m.enable_order_book
+                        || m.outcomes.len() != 2
+                        || m.clob_token_ids.len() != 2
+                        || m.id.is_empty()
+                    {
+                        continue;
+                    }
+                    m.event_id = Some(event_id.to_string());
+                    m.neg_risk = m.neg_risk || parent_neg_risk;
+                    out.push(m);
+                }
+            }
+        }
+        tracing::info!(
+            events = event_ids.len(),
+            members = out.len(),
+            "gamma negRisk event members"
         );
         Ok(out)
     }

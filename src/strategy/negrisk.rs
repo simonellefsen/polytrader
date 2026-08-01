@@ -35,9 +35,18 @@ use super::arbitrage::best_ask;
 /// Minimum net profit per basket-unit (one No share in every chosen member) to report.
 /// Matches the single-market scanner's MIN_NET_PROFIT.
 const MIN_NET_PROFIT: Decimal = dec!(0.002);
-/// Ignore events where we can see fewer than this many live member books: 2-member events are
-/// equivalent to one binary market (covered by the single-market scanner).
-const MIN_MEMBERS: usize = 3;
+/// Ignore events where we can see fewer than this many live member books.
+///
+/// Was 3, on the stated grounds that "2-member events are equivalent to one binary market (covered
+/// by the single-market scanner)". That was **wrong**: the two members of a 2-outcome negRisk event
+/// are two SEPARATE markets with their own gamma_ids and their own CLOB books, whereas
+/// `arbitrage::scan` only ever compares the Yes and No books *of one market*. Those baskets were
+/// therefore covered by nothing. They are also the cross-book case the module doc calls out as the
+/// profitable one — one book is trivially kept efficient by its own makers; two books that must
+/// stay mutually consistent are not. The payout algebra is unchanged and already correct at k=2:
+/// at most one member resolves Yes, so buying No in both pays >= k−1 = 1 for Σask_no, an arb
+/// whenever Σask_no + fees < 1.
+const MIN_MEMBERS: usize = 2;
 
 /// One member leg of a NegRisk basket.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -64,10 +64,32 @@ spec:
             # Arb-discovery universe: on each ingest tick, ALSO pull the top-N active binary order-book
             # markets by 24h volume (deduped with the bootstrap slugs + any market we hold). Breadth is
             # the arb frequency lever — dislocations are rare per-market but scale with books watched.
-            # ~1s of book-fetching per market/tick, so keep N well under ingest_interval (300s): 150 ⇒
-            # ~180s tick. 0 disables (bootstrap-only). Directional exec is unaffected (arb-only routing).
+            # ~0.7s of book-fetching per market/tick (2 tokens x 250ms polite sleep + latency), so keep
+            # N well under ingest_interval (300s). 0 disables (bootstrap-only). Directional exec is
+            # unaffected (arb-only routing).
+            # 2026-08-01: HELD at 150, but this is the first tick where 150 means 150 — Gamma caps a
+            # /markets page at 100 regardless of the limit parameter, so the single un-paginated call
+            # had been returning 100 (see discover_arb_markets). The extra 50 costs ~35s/tick. The
+            # remaining budget goes to NEGRISK_COMPLETION_LIMIT below, which buys far more arb
+            # surface per second: ranking deeper adds mostly singleton sports markets, whereas
+            # completing an event turns a basket the scanner cannot price into one it can.
             - name: POLYTRADER_ARB_DISCOVERY_LIMIT
               value: "150"
+            # negRisk event completion (2026-08-01): after the volume ranking, top up the negRisk
+            # EVENTS already in the universe with their missing member markets, cheapest event first,
+            # up to this many member-markets per tick. Completion members fetch the No book only (all
+            # the buy-all-No basket reads), so each costs ~0.35s.
+            # Why this exists: the discovery pool ranks individual MARKETS, so a 50-leg ladder enters
+            # as its 3 most-traded legs. But the arb line is sum(1 - ask_no) > 1 across the legs we can
+            # see, and a 3-of-50 fragment sums nowhere near 1 no matter how dislocated the event is —
+            # so the scanner was structurally unable to find event arb, not merely unlucky. Measured
+            # before the change: 31 negRisk events touched, 530 live member books on Gamma, 76 held
+            # fresh (14%), and 0 opportunities with best_implied_yes_sum stuck at 1.012.
+            # 250 completes ~20 events for ~88s of tick, landing the tick near 235s against the 300s
+            # interval. Raise only against the `elapsed_secs` field on the "ingestion tick complete"
+            # log — snapshots must stay inside the negRisk scan's 30-minute freshness join. 0 disables.
+            - name: POLYTRADER_NEGRISK_COMPLETION_LIMIT
+              value: "250"
             # Directional market rotation (6h cadence): promote up to LIMIT active, order-book,
             # binary, NON-sports markets ending within MAX_DAYS and above the 24h-volume floor into
             # market_data.directional_universe; demote on close/resolution. The directional executor
@@ -161,6 +183,24 @@ spec:
             # bounded by POLYTRADER_MAX_TOTAL_EXPOSURE_PCT and each basket by thinnest-leg depth.
             - name: POLYTRADER_ARB_MAX_BASKET_COLLATERAL
               value: "1500"
+            # Minimum negRisk basket edge, in bps of return on locked collateral (2026-08-01).
+            # The scanner's own bar is MIN_NET_PROFIT, an ABSOLUTE $0.002/unit, which admits baskets
+            # whose return on collateral is negligible: the first shadowed basket (event 716159) was
+            # 29.1bps and earned ~$1. Of 24 baskets executed to 2026-07-28, the 8 at >=400bps made
+            # +$333.59 (+$41.70 avg) vs +$22.03 (+$1.38 avg) for the 16 below.
+            # Set to 50, NOT the 400 that filter implies, and the difference is deliberate:
+            #  - 400 is the REAL-MONEY bar. Its justification is partial-fill risk — a 57% guaranteed
+            #    spread absorbs a mis-filled leg, a 0.29% spread is destroyed by one tick of slippage.
+            #    Paper fills carry none of that risk, so importing 400 here would forgo real (if
+            #    small) paper profit and, worse, stop generating data about the middle of the
+            #    distribution. The <400bps bucket was still net POSITIVE (+$22.03).
+            #  - 50 declines only the sub-dollar tail that adds settlement surface for nothing.
+            # This is a JUDGMENT CALL on a risk parameter, made deliberately loose so it can be
+            # tightened from evidence: `below_min_edge_count` / `best_below_min_edge_bps` on every
+            # negrisk_arb_scan event record exactly what the floor turned away. Raise it against
+            # those numbers, not against a guess. 0 disables the gate entirely.
+            - name: POLYTRADER_ARB_MIN_BASKET_EDGE_BPS
+              value: "50"
             # P6 turnover budget (2026-07-12): max autonomous directional ENTRIES per UTC day.
             # Friction is paid per trade while the directional book runs ~flat gross, so the
             # marginal entry is usually P&L-negative. Exits + risk-free arb are NOT capped. 0 = off.
