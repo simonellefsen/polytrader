@@ -583,7 +583,17 @@ async fn produce_5min_decision_report(
     // "fuller generator active"). Hardcoded LIMIT + FeeContext + stub processors ok for limited wiring (can yield
     // sparse/zero DRs some ticks, as intended for skeleton; see strategy skeleton + non-overclaim in log/wiki).
     // Cover the full directional-eligible set (bootstrap + rotation) with headroom for discovery.
-    const DR_MARKET_LIMIT: i64 = 40;
+    // 40 → 50 (2026-08-01), a deliberately small step. Measured cost profile before changing it:
+    // a full 40-market cycle runs in 0.3–0.9s against a 5-min budget (compute is not the
+    // constraint), and external calls are already capped (Yahoo only fires for ticker-linked slugs;
+    // news is non-arb-only, 2h-cached, 180/day). DISK is the real cost — DRs average 2113 bytes and
+    // GC keeps 14 days raw before rolling up into signal_daily, so steady state ≈ limit × 288 × 14 ×
+    // 2.1KB (40 ⇒ ~340MB, matching the observed 323MB).
+    // NOTE this does NOT increase trading: the ORDER BY already ranks the directional universe and
+    // bootstrap slugs first, so every tradeable market always had a DR — 35 of the 40 slots go to
+    // markets the executor vetoes as arb-only anyway, and zero executor rejections cite a missing
+    // DR (they all cite net_edge/friction). This buys observability only.
+    const DR_MARKET_LIMIT: i64 = 50;
     // Active markets with mids; slug drives arb-only routing + the newsdata query.
     // (gamma_id, slug, last_mid_yes, last_mid_no, end_date_iso, taker_fee_rate)
     type DrMarketRow = (
@@ -2407,7 +2417,22 @@ async fn get_news_context_cached(
     }
 
     // 3. Fetch (1 credit) + cache.
-    let query = crate::strategy::newsdata_query(slug);
+    // Placeholder slugs ("untitled-market-1-<ts>") carry no topic, so the query built from them is
+    // literally "untitled market" — a wasted metered credit that returns publishing-trade headlines
+    // and feeds them to news_sentiment. Pull the real `question` for those (rare: 2 markets live on
+    // 2026-08-01, both held) rather than plumbing it through the whole DR row for every market.
+    let query = if crate::strategy::is_placeholder_slug(slug) {
+        let question: Option<String> =
+            sqlx::query_scalar("SELECT question FROM market_data.markets WHERE gamma_id = $1")
+                .bind(gamma_id)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        crate::strategy::newsdata_query_with_question(slug, question.as_deref().unwrap_or(""))
+    } else {
+        crate::strategy::newsdata_query(slug)
+    };
     let (count, polarity, titles) =
         crate::strategy::fetch_newsdata_news(client, api_key.trim(), &query).await?;
     let news = serde_json::json!({

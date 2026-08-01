@@ -128,6 +128,37 @@ pub fn slug_market_direction(slug: &str) -> &'static str {
 /// topic nouns (e.g. "will-bitcoin-hit-150k-by-june-30-2026" → "bitcoin hit 150k june"). A focused
 /// query returns more on-topic results per credit than the full question sentence.
 pub fn newsdata_query(slug: &str) -> String {
+    newsdata_query_with_question(slug, "")
+}
+
+/// True when a Gamma slug is a placeholder rather than a description of the market.
+///
+/// Polymarket sometimes publishes a market before naming it, leaving the slug as
+/// `untitled-market-1-<timestamp>` while `question` carries the real text — and it does NOT always
+/// backfill the slug later (both live examples on 2026-08-01 were still placeholders weeks after
+/// creation). Built from the slug alone, such a market yields the query "untitled market", which
+/// spends a metered newsdata credit to retrieve publishing-trade headlines about a company called
+/// Agate and feeds them to `news_sentiment` as if they were market-relevant.
+pub fn is_placeholder_slug(slug: &str) -> bool {
+    slug.starts_with("untitled-market")
+}
+
+/// Build the newsdata query, preferring the market QUESTION when the slug is a placeholder.
+/// The question is tokenised the same way (it is prose, so split on whitespace and strip
+/// punctuation first) — "Will Russia and Ukraine hold any diplomatic meeting by July 31, 2026?"
+/// becomes "Russia Ukraine hold any diplomatic meeting" rather than "untitled market".
+pub fn newsdata_query_with_question(slug: &str, question: &str) -> String {
+    if is_placeholder_slug(slug) && !question.trim().is_empty() {
+        let normalized: String = question
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect();
+        return newsdata_query_from_tokens(&normalized);
+    }
+    newsdata_query_from_tokens(slug)
+}
+
+fn newsdata_query_from_tokens(slug: &str) -> String {
     const STOP: [&str; 16] = [
         "will", "the", "by", "be", "there", "a", "an", "of", "to", "is", "on", "in", "for", "and",
         "x", "us",
@@ -515,6 +546,27 @@ mod tests {
         assert!(keyword_polarity(&neg) < Decimal::ZERO);
         let neutral = vec!["A quiet day in the markets".to_string()];
         assert_eq!(keyword_polarity(&neutral), Decimal::ZERO);
+    }
+
+    #[test]
+    fn placeholder_slug_query_uses_the_question_not_the_slug() {
+        // Live 2026-08-01: both markets below still carried placeholder slugs weeks after creation,
+        // so the slug-only query was "untitled market" — a metered credit spent on publishing-trade
+        // headlines ("Agate Teams with Publishing Veteran Kathleen Schmidt") that news_sentiment
+        // then consumed as market context.
+        let slug = "untitled-market-1-20260629155005352";
+        assert_eq!(super::newsdata_query(slug), "untitled market");
+        let q = super::newsdata_query_with_question(
+            slug,
+            "Will Russia and Ukraine hold any diplomatic meeting by July 31, 2026?",
+        );
+        assert!(q.contains("Russia") && q.contains("Ukraine"), "got {q:?}");
+        assert!(!q.contains("untitled"), "got {q:?}");
+        // A real slug is unaffected — the question is only consulted for placeholders.
+        assert_eq!(
+            super::newsdata_query_with_question("will-bitcoin-hit-150k-by-june-30-2026", "ignored"),
+            super::newsdata_query("will-bitcoin-hit-150k-by-june-30-2026")
+        );
     }
 
     #[test]
