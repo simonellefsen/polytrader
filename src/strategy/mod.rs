@@ -374,8 +374,25 @@ impl FusionEngine {
                     let learned = self.weight_for(sig.processor_name);
                     let w = sig.confidence * learned;
                     contributions.push((sig.processor_name, sig.score, sig.confidence, learned));
-                    attribution.insert(
-                        sig.processor_name.to_string(),
+                    // COMPACT ZERO-SCORE ATTRIBUTION (2026-08-01, journal-size work).
+                    // A neutral signal always carries score = confidence = edge = 0, so
+                    // learned_weight/effective_weight/edge/confidence are pure constants on those
+                    // rows — and ~3.5 of the 5 signals are neutral in a typical report. At 288
+                    // cycles/day × 50 markets that was the single largest slice of a 323MB table.
+                    // What MUST survive, and why:
+                    //  - `score`: the scorecard SQL, the settled-market attribution lookup, and the
+                    //    GC rollup into signal_daily all read it (the rollup regex-matches [1-9]).
+                    //  - `metadata.reason`: the only record of WHY a signal stayed silent. Dropping
+                    //    it would have made the 2026-08-01 theta diagnosis (614 reports/day gated by
+                    //    `outside_horizon` with negative days) impossible to run.
+                    // Hermes is unaffected: it reads score/confidence/edge through `dec_from_json`,
+                    // which maps a missing field to ZERO — the same value it read before.
+                    let entry = if sig.score.is_zero() && sig.confidence.is_zero() {
+                        json!({
+                            "score": sig.score,
+                            "reason": sig.metadata.get("reason").cloned(),
+                        })
+                    } else {
                         json!({
                             "score": sig.score,
                             "confidence": sig.confidence,
@@ -383,8 +400,9 @@ impl FusionEngine {
                             "effective_weight": w,
                             "edge": sig.edge,
                             "metadata": sig.metadata
-                        }),
-                    );
+                        })
+                    };
+                    attribution.insert(sig.processor_name.to_string(), entry);
                 }
                 Err(e) => {
                     warn!(processor = %p.name(), error = %e, "processor failed (paper-only; degraded fusion)");
@@ -400,14 +418,13 @@ impl FusionEngine {
             // No score/confidence keys, so replay paths skip this entry as a non-signal.
             attribution.insert(
                 "advisory_only_policy".to_string(),
+                // The two booleans ARE the record; the prose they used to carry was identical on
+                // every row (measured 2026-08-01: 1 distinct value across the whole table, 218
+                // bytes each). `suppressed` and `capped` are self-describing and documented on
+                // `fuse_named` — Hermes and the replay paths only ever read the flags.
                 json!({
                     "suppressed": outcome.advisory_suppressed,
                     "capped": outcome.advisory_capped,
-                    "note": if outcome.advisory_suppressed {
-                        "directional impulse came only from advisory signals (news/yahoo); requires >=1 market-internal signal (momentum/spike/theta) firing to originate an edge"
-                    } else {
-                        "advisory signals outweighed the market-internal signals and were scaled down to their magnitude; the market keeps ownership of direction (advisories tilt, never flip)"
-                    }
                 }),
             );
         }
@@ -467,15 +484,20 @@ impl FusionEngine {
             // harness prefers it); `est_fees_and_gas` stays as the USDC amount for audit and as the
             // historical-report fallback key.
             if let Some(map) = attribution.as_object_mut() {
+                // Edges are rounded to 8dp here (2026-08-01). Decimal arithmetic was emitting the
+                // full 28-significant-digit expansion — "0.0004272533800701051577366049" — of which
+                // everything past ~8dp is an artifact of exact rational division, not information:
+                // the gates that read these compare against thresholds like 0.02, and prices are
+                // quoted in 0.001 ticks. The constant `note` that lived here was identical on every
+                // row (1 distinct value table-wide, ~200 bytes); it now lives on this function.
                 let mut fee_impact = json!({
                     "taker_fee_rate_used": f.taker_fee_rate.to_string(),
                     "price": f.price.to_string(),
-                    "fee_cost_frac": cost_frac.to_string(),
-                    "est_fees_and_gas": (fee_usdc + f.est_gas_usdc).to_string(),
+                    "fee_cost_frac": cost_frac.round_dp(8).to_string(),
+                    "est_fees_and_gas": (fee_usdc + f.est_gas_usdc).round_dp(8).to_string(),
                     "notional_for_cost": notional.to_string(),
-                    "gross_edge": gross_capped.to_string(),
-                    "net_edge_after_fees": n.to_string(),
-                    "note": "PRIMARY signal for deliberate 5-min tier (see fees wiki + 4-6% min net in goals). Real Polymarket taker model: shares × rate × p × (1−p); makers pay nothing (we always cross = taker)."
+                    "gross_edge": gross_capped.round_dp(8).to_string(),
+                    "net_edge_after_fees": n.round_dp(8).to_string(),
                 });
                 if gross_capped != gross {
                     // Signal-calibration record: the fusion wanted more edge than the price can
@@ -504,11 +526,15 @@ impl FusionEngine {
         if let Some(map) = attribution.as_object_mut() {
             map.insert(
                 "decision_report_summary".to_string(),
+                // Both edges are ALSO written at `report.fused_gross_edge` / `report
+                // .net_edge_after_fees` — this block duplicated them at 28-digit precision.
+                // `primary_for_deliberate_tier` was the constant `true` on every row. Kept:
+                // `fee_note`, which is the one field that actually varies (it records whether a
+                // real FeeContext was supplied or the degraded path ran).
                 json!({
-                    "fused_gross_edge": gross_final.to_string(),
-                    "net_edge_after_fees": net.to_string(),
+                    "fused_gross_edge": gross_final.round_dp(8).to_string(),
+                    "net_edge_after_fees": net.round_dp(8).to_string(),
                     "fee_note": fee_note,
-                    "primary_for_deliberate_tier": true
                 }),
             );
         }

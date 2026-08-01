@@ -833,7 +833,11 @@ async fn produce_5min_decision_report(
             "generated_by": "5min_dr_cadence_in_main",
             "paper_only": true,
             "real_orders_enabled": false,
-            "note": "5-min DR per goals-and-operational-cadence.md + strategy/DecisionReport + fuse_net; net_edge_after_fees is PRIMARY signal for deliberate tier (4-6% min net per goals); journaled for Hermes clob_safety + reflections + future attribution (vs approvals/fills); no auto-submit (per goals optional behind flag). See wiki/strategies/goals-and-operational-cadence.md + decisions/real-order-approval-flow.md."
+            // The prose that lived here (412 bytes, byte-identical on all 160k rows = ~66MB, 22% of
+            // the DR payload) moved to the doc comment on this function and to
+            // wiki/strategies/goals-and-operational-cadence.md — a constant string is documentation,
+            // not per-row data, and the journal is not where documentation belongs.
+            "spec": "wiki/strategies/goals-and-operational-cadence.md",
         });
         // Capture id for audit (Issue 10 review); writer logs at debug. Robust: warn on err, do not crash loop (per plan "smallest").
         match journal

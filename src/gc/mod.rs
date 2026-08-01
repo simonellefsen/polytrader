@@ -18,10 +18,15 @@ use sqlx::PgPool;
 /// Keep full orderbook snapshots this recent (covers `recent_move`'s 3h window + buffer + recent
 /// backtests). Older raw snapshots are rolled to hourly `price_history` then deleted.
 const SNAPSHOT_RAW_HOURS: i64 = 48;
-/// Keep raw decision_reports this recent (24h scorecard, 7d health, ~14d of harness backtest attribution).
-/// Older are rolled to daily `signal_daily` then deleted. Was 30d; lowered to 14d on 2026-07-02 to cap the
-/// events table (~5.2k reports/day × ~1.7KB was trending to ~270MB @30d) — see wiki/roadmap retention note.
-const REPORT_RAW_DAYS: i64 = 14;
+/// Keep raw decision_reports this recent. Older are rolled to daily `signal_daily` then deleted.
+/// Was 30d; 14d on 2026-07-02; **7d on 2026-08-01** alongside the payload trim (compact zero-score
+/// attribution + the 412-byte constant `note` removed), which together take the DR slice of
+/// journal.events from ~340MB to roughly 100MB and paid for the DR_MARKET_LIMIT 40→50 raise.
+/// 7d still covers every live consumer: the 24h scorecard, the 3h/24h/7d signal-health comparisons
+/// (the longest baseline is exactly 7d), and Hermes's reflection window. What it gives up is
+/// ad-hoc "what did we see 10 days ago" forensics at raw granularity — `signal_daily` keeps the
+/// per-day aggregate indefinitely, so trend work is unaffected; only per-report detail ages out.
+const REPORT_RAW_DAYS: i64 = 7;
 /// Keep pure per-cycle telemetry (llm_health / real_account_balance) this recent; older is dropped.
 const TELEMETRY_DAYS: i64 = 14;
 /// Keep full-granularity (5-min) portfolio equity snapshots this recent (1D/1W chart); older

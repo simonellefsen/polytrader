@@ -32,6 +32,12 @@ use serde_json::json;
 
 /// Only fire within this many days of resolution — theta is meaningless far out.
 const HORIZON_DAYS: Decimal = dec!(14);
+/// How far PAST the reported `end_date` a market still counts as converging. Covers Gamma's
+/// `00:00Z`-vs-`23:59Z` inconsistency and the ET/local-time deadlines in the rules text (worst
+/// observed skew ~28h); beyond this a market is genuinely overdue or in UMA dispute, where
+/// convergence no longer applies. Urgency is already clamped to 1, so negative days score as
+/// maximally urgent rather than overshooting.
+const GRACE_DAYS: Decimal = dec!(1.5);
 /// Score gain on (lean × urgency). Keeps |score| modest (≤ 0.5 × 0.5 × 1 = 0.25).
 const GAIN: Decimal = dec!(0.5);
 /// Minimum |mid − 0.5| to call a convergence direction (below = a coin-flip, no edge).
@@ -59,9 +65,22 @@ impl SignalProcessor for ThetaConvergenceProcessor {
             Some(d) => d,
             None => return Ok(neutral(json!({"reason": "no_resolution_date"}))),
         };
-        // Window gate: only near resolution. Overdue/disputed (days < 0) markets don't converge
-        // normally, so we stay out of them too.
-        if days < Decimal::ZERO || days > HORIZON_DAYS {
+        // Window gate: only near resolution. Genuinely overdue/disputed markets don't converge
+        // normally, so we stay out of those — but "overdue" starts at −GRACE_DAYS, not at 0.
+        //
+        // Gamma's `end_date` is not the resolution deadline. Polymarket writes it inconsistently:
+        // 571 open markets carry `00:00Z` (midnight at the START of the stated day) while others
+        // carry `23:59Z`, and the market's own rules text is the real authority — e.g. the Andrew
+        // Tate market reads "by the listed date, 11:59 PM ET" against an `end_date` of
+        // 2026-07-31T00:00:00Z, ~28 hours early. (Timezones vary per market too: one live example
+        // resolves at 11:59 PM *IRST*.)
+        //
+        // With a hard `days < 0` gate that mismatch silenced theta for the final ~28 hours before
+        // ACTUAL resolution — precisely the window where urgency → 1 and theta is most informative.
+        // Measured 2026-08-01: 619 of the last 24h's reports were gated `outside_horizon` on
+        // negative days, and **614 of them were within 1.5 days** of `end_date`, i.e. the artifact,
+        // not real overdue markets. Only 5 were genuinely stale.
+        if days < -GRACE_DAYS || days > HORIZON_DAYS {
             return Ok(neutral(json!({
                 "reason": "outside_horizon",
                 "days_to_resolution": days.to_string(),
@@ -198,6 +217,42 @@ mod tests {
             .compute_signal(&snap("0.51", Some("1")), &json!({}))
             .unwrap();
         assert_eq!(score(&s), dec!(0));
+    }
+
+    #[test]
+    fn grace_window_keeps_theta_live_just_past_the_reported_end_date() {
+        // Gamma's end_date runs up to ~28h early on the 00:00Z-convention markets, so a market
+        // genuinely hours from resolving reports NEGATIVE days. Before the grace window that went
+        // neutral — 614 of 619 such reports in a 24h sample — silencing theta at peak urgency.
+        let s = ThetaConvergenceProcessor
+            .compute_signal(&snap("0.85", Some("-0.5")), &json!({}))
+            .unwrap();
+        assert!(
+            score(&s) > dec!(0),
+            "expected a live score, got {}",
+            score(&s)
+        );
+        // Urgency clamps at 1: being past the reported date cannot overshoot maximum urgency.
+        assert_eq!(s.metadata["urgency"].as_str(), Some("1"));
+        // An underdog past the date still leans DOWN (sign convention preserved).
+        let u = ThetaConvergenceProcessor
+            .compute_signal(&snap("0.15", Some("-0.5")), &json!({}))
+            .unwrap();
+        assert!(
+            score(&u) < dec!(0),
+            "underdog should still lean down, got {}",
+            score(&u)
+        );
+    }
+
+    #[test]
+    fn genuinely_overdue_markets_stay_neutral() {
+        // Past the grace window a market is stale or in UMA dispute — convergence no longer applies.
+        let s = ThetaConvergenceProcessor
+            .compute_signal(&snap("0.85", Some("-3")), &json!({}))
+            .unwrap();
+        assert_eq!(score(&s), dec!(0));
+        assert_eq!(s.metadata["reason"].as_str(), Some("outside_horizon"));
     }
 
     #[test]
