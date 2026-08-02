@@ -289,6 +289,99 @@ as far from tradeable as the 1.031 event the old metric was pointing at.
   the events where an arb could actually clear, rather than at the ones with the biggest raw
   overround and an unpayable bar.
 
+## 🧹 Operator UI review: three lying instruments, two deletions, one falsified hypothesis — 2026-08-02
+
+Operator asked for a fresh-eyes UI pass (why do the market cards reshuffle on every refresh? do we
+need the Console tab? why are three signals flagged degraded?), a re-read of the Polymarket API
+docs, query optimization, and new strategy ideas. The UI questions turned out to be bug reports.
+
+### The three defects behind the symptoms (commit `94713af`)
+
+**1. The Signal Scorecard's 7-day baselines were off by one for 3 of 5 rows.** The hand-written
+baseline SQL kept a column for `overreaction_fade` after that signal was retired from `SIGNALS` on
+2026-06-29, while results were still indexed *positionally* by `SIGNALS`. So `theta_convergence`
+read a **dead signal's** baseline (a permanent, meaningless "elevated"), `yahoo_finance` read
+theta's ("degraded"), and `news_sentiment` read yahoo's ("dormant"). **All three badges the
+operator asked about were artifacts** — and the one instrument built to catch a silently-dying
+signal was itself lying. Hermes' copy of the same query was correct; only the dashboard was wrong.
+
+Fixed at the mechanism: the FILTER columns are now **generated from the same array that indexes
+them**, so the drift is unrepresentable. `SIGNALS` was declared twice in `server.rs` with identical
+bodies; both now point at one module-level `SCORECARD_SIGNALS`. The payoff was immediate — retiring
+two signals later the same day (below) was a one-line edit, with the SQL, array width and indexing
+all following automatically, *in the exact place the old version had silently drifted*.
+
+**2. The board reshuffled because `ORDER BY updated_at DESC` had no tiebreak.** The ingest tick
+rewrites `updated_at = now()` market-by-market for ~235s of every 300s interval while the board
+polls every 15s, so most polls landed mid-tick and saw a different permutation. `updated_at` is a
+property of *our ingest schedule*, not of the market — it was never a meaningful sort key. Now
+soonest-resolving first (`end_date`), with `gamma_id` as a total tiebreak: a stable key still needs
+a total order, or rows tied on it are free to swap between queries.
+
+**3. The board shipped every market ever ingested, every 15 seconds.** No `WHERE`, no `LIMIT`, over
+a table that is never pruned. Filtering on `closed` does almost nothing — Gamma leaves
+`closed=false` on markets that resolved long ago (6,519 of 6,806). Recency of ingest is the honest
+proxy for "still tracked". The two LATERAL fan-outs carried the same defect behind a comment
+claiming they were "driven from the ~50-row markets table" — true when written, 6,806 rows now.
+
+| | before | after |
+|---|---|---|
+| board cards | 6,806 rows / 16.7ms | **588 rows / 3.8ms** |
+| DR fan-out | 22.5ms | **5.2ms** |
+
+### Deleted the Console tab — 12,068 lines (commit `58710b0`)
+
+The operator never used it, and it was a leaf: every one of its ~70 CLOB/L2 diagnostic handlers was
+referenced only from the route table, from each other, or from its own tests. `server.rs` went
+**13,733 → ~5,850 lines**; `src/ui/` (2,523 lines, the crate's only Dioxus consumer) and the
+`dioxus`/`dioxus-ssr` dependencies went with it, dropping 1,722 lines of `Cargo.lock`.
+
+`src/clob/` deliberately **stayed** — `main.rs` uses it at startup, so the fail-closed real-order
+gating is untouched; only the HTTP facades over it are gone. An automated prune of that module
+cascaded into a 22-error break (types still named as parameters while never *constructed*), was
+reverted, and the module left structurally intact. What remains there is lint noise, not a
+correctness issue. Also stripped 8 hermes recommendation strings that told an operator to track
+`clob_collateral_readiness` etc. — nothing writes those event types now, so the advice pointed at a
+UI that no longer exists.
+
+### Retired yahoo_finance and news_sentiment (commit `f27348a`)
+
+**Not for misfiring — for being structurally incapable of earning.** The advisory cap means an
+external signal can never *originate* a trade (with no market-internal direction the advisory
+numerator clamps to zero) and can never flip a direction, only cancel or double one a
+market-internal signal already found. Directional is a 1-trade/day control arm, and the arb
+executors that earn all the P&L read no signals at all.
+
+They were also quietly broken. **newsdata.io leaked credits**: the fetch bailed on `?` *before* the
+`news_cache` journal write that `used_today` counted, so every empty or failed fetch spent an
+uncounted credit — and with no negative caching one bad market could burn 288 credits/day against a
+200/day tier. That is the whole explanation for the recurring 429s. And the **Yahoo threshold
+parser returned the year as the price threshold** (`2026 >= 1000`, so the guard meant to skip it
+returned it) on a live bootstrap market.
+
+The `MARKET_INTERNAL_SIGNALS` / advisory-cap machinery **stays** — it is the mechanism, not the
+signal, and any future advisory needs it. This entry exists so the retirement is reversible with
+the reasoning intact.
+
+### The fee hypothesis I had — and why it was wrong
+
+Live Gamma returns `feeSchedule: {"exponent":1, "rate":0.05, "takerOnly":true, "rebateRate":0.15}`
+and we parse only `rate`. The obvious reading is that we over-charge ourselves ~15%, which would
+have meant every basket was judged against a bar 15% too high — a tidy explanation for the
+"20bps short of tradeable" baskets. **It is wrong, and the plan's instruction to verify before
+modelling is what caught it.**
+
+Sampled 400 live markets: `exponent` is **always 1**, `takerOnly` **always true**, and `rebateRate`
+∈ {0.15, 0.20, 0.25} varying *independently* of `rate` ∈ {0.04, 0.05, 0.07}. It is the fraction of
+the taker fee paid to the **maker**, not a discount for the taker. The check that settles it:
+`0.06 × 0.208 = 0.0125`, reproducing the documented maker theta exactly. We always cross the
+spread, so we pay full `rate` — **the arb line was never too high.** Applying the hypothesis would
+have made every basket look better than it is and started executing losers.
+
+Two by-products worth keeping: **92 of 400 top-volume markets (23%) are `feesEnabled: false`
+entirely** — a genuinely fee-free universe where the arb line really is 1.00 — and the maker
+rebate is now quantified per market, which is the input for the strategy candidate below.
+
 ## 📡 P5 increment 2 — the arb scanner reads the live book — 2026-08-01
 
 Increment 1 proved the book correct (92/92 REST agreement) without letting anything read it.
@@ -458,6 +551,47 @@ change.
 Deferred follow-ups surfaced during diagnostic checks but not yet built. Each has a full writeup in
 the dated Decision-log entry below; this is the at-a-glance index.
 
+- [ ] **Mine the Gamma fields we already fetch and throw away** (2026-08-02). `parse_market` reads
+  15 fields; the payload carries far more, and one of them is money:
+  - **`clobRewards[].rewardsDailyRate`** — liquidity rewards paid for *resting* orders whether or
+    not they fill. **One market observed paying $1,000/day.** With `rewardsMinSize` and
+    `rewardsMaxSpread` stating the qualification rules exactly, and `takerOnly: true` meaning makers
+    pay no fee on this venue, this is the concrete, per-market version of the P5 maker thesis.
+  - `orderPriceMinTickSize` — per-market tick. Currently fetched only in a dry-run path
+    (`clob/authenticated.rs`) and *discarded* off the WS feed (`clob_ws.rs`).
+  - `liquidity`/`liquidityNum` — the `markets.liquidity` column exists in the schema and has
+    **never been written**.
+  - `lastTradePrice`, `oneDayPriceChange`, `spread`, `bestBid`/`bestAsk`, `competitive` (Polymarket's
+    own market-quality score) — free inputs we currently derive by hand or not at all.
+- [ ] **Strategy candidates worth a shadow scan before any build** (2026-08-02, harness-first):
+  1. **Maker / liquidity-rewards farming — the strongest.** Money for resting orders, qualification
+     rules published per market, no prediction required. Needs the P5 WS execution tier to quote and
+     re-quote; *shadow-measurable today* by logging which markets we could have qualified in and at
+     what daily rate.
+  2. **Cross-event arb via shared underlying.** We only scan negRisk events. Distinct events
+     resolving off the same fact (the ~15 Iran/Hormuz markets the risk module already treats as one
+     cluster via `MAX_CLUSTER_EXPOSURE`) can be mutually inconsistent without being one negRisk event.
+  3. **Dutch-book across ladder tiers.** Ladder markets ("0–20 transits", "20–40", …) partition a
+     numeric range, so tiers must sum to 1 the way a negRisk event does — but they are separate
+     events, so the scanner never compares them.
+  4. **In-play, now evidenced.** The desync diagnostic showed the only hard-to-track books are live
+     in-play sports — the same class holding the only rich overrounds (27% on Canada–Morocco).
+     Targeted resync on desync is the prerequisite.
+- [ ] **Query optimization** (2026-08-02, measured but not yet done). `market_data.markets` is
+  **never pruned** by GC (6,806 rows, ~650 new/day) and drives the board, both LATERAL fan-outs,
+  both arb scanners and the DR driver — the board's share of that is fixed, the rest is not.
+  `current_portfolio_usdc` runs the identical query **50× per DR cycle**; the daily-turnover
+  `COUNT(*)` and `current_drawdown_pct`'s full scan likewise re-run per market (~500–900
+  round-trips/cycle, mostly repeats). Missing indexes for clauses that have none:
+  `markets(updated_at)`, `paper_fills(created_at)`, an expression index for
+  `journal.events(payload->>'action')` — confirm each with `EXPLAIN ANALYZE` first, don't add on
+  faith. `/trades/pnl?range=all` has no lower bound (full-table `DISTINCT ON`).
+- [ ] **UI: one shared shell.** The nav is written twice in two different syntaxes
+  (`render_board_page` uses CSS classes, `render_trades_page` inlines every style), and of the two
+  pages' CSS rules only 3 are byte-identical — `.pos` even means *green text* on one page and
+  *position row* on the other. Extract one `SHELL_CSS` + nav builder. Also: surface fee rate and
+  rewards per card, and the cumulative fee-drag figure that `write_mark_to_market_snapshot` already
+  computes (`SUM(fee)`) and folds into cash without ever rendering.
 - [ ] **P5 — WebSocket CLOB feed. UNBLOCKED 2026-07-25** by the Path B GO above; it is now the
   headline piece of work, no longer gated on the directional question. Unlocks: (a) simultaneous
   multi-leg fills — the hard prerequisite for arb with real money, since snapshot-based legs can
