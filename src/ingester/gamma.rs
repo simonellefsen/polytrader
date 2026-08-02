@@ -41,6 +41,32 @@ pub struct Market {
     /// Gamma `volume24hr` (USD). Feeds the directional-rotation promotion filter (liquidity floor).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_24hr: Option<Decimal>,
+    /// Gamma `liquidityNum` (USD resting in the book). The `market_data.markets.liquidity` column
+    /// has existed since the init migration and was **never written** — this fills it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liquidity: Option<Decimal>,
+    /// Gamma `orderPriceMinTickSize` — the market's price increment (0.01 or 0.001 observed).
+    ///
+    /// We were fetching this from the CLOB `/tick-size` endpoint in a dry-run-only path and
+    /// *discarding* the `tick_size` the WS feed puts on every book frame, while it was sitting in
+    /// the Gamma payload we already parse. It bounds how finely a maker can undercut, so it is a
+    /// prerequisite for quoting rather than a nicety.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tick_size: Option<Decimal>,
+    /// Liquidity-rewards daily budget for this market, summed over `clobRewards[]` (USD/day).
+    ///
+    /// **This is money paid for resting orders whether or not they fill** — the concrete, per-market
+    /// form of the P5 maker thesis, and the single most valuable field we were throwing away (one
+    /// market observed at $1,000/day). Zero/absent means the market pays no rewards.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewards_daily_rate: Option<Decimal>,
+    /// Gamma `rewardsMinSize` — minimum resting order size (shares) to qualify for rewards.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewards_min_size: Option<Decimal>,
+    /// Gamma `rewardsMaxSpread` — max distance from the midpoint (in cents) a resting order may sit
+    /// and still qualify. With `rewards_min_size` this is the full qualification rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewards_max_spread: Option<Decimal>,
     /// Gamma parent event id (`events[0].id`). Groups the mutually-exclusive member markets of a
     /// negRisk event for the event-level arbitrage scanner.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,6 +97,22 @@ impl GammaClient {
 
     /// Parse a single Gamma market JSON object into our Market struct.
     /// Gamma returns `outcomes` and `clobTokenIds` as JSON-encoded *strings*, hence the inner parse.
+    /// Gamma is inconsistent about number vs string for the same field across endpoints (and even
+    /// between `liquidity` and `liquidityNum` on one market), so every numeric read goes through
+    /// this rather than committing to one JSON type per field.
+    /// Note it goes via `Number::to_string()`, NOT `as_f64()`. `as_f64` + `from_f64_retain` drags
+    /// the value through a binary float and back: Gamma's `1018110.2348` comes out as
+    /// `1018110.2347999999765306711195`. `to_string()` hands back the original JSON literal, which
+    /// parses to the exact decimal — the same "never route money through f64" rule the rest of the
+    /// crate follows.
+    fn num(v: Option<&Value>) -> Option<Decimal> {
+        match v? {
+            Value::Number(x) => x.to_string().parse::<Decimal>().ok(),
+            Value::String(s) => s.trim().parse::<Decimal>().ok(),
+            _ => None,
+        }
+    }
+
     fn parse_market(v: &Value) -> Market {
         let outcomes_str = v.get("outcomes").and_then(|o| o.as_str()).unwrap_or("[]");
         let outcomes: Vec<String> = serde_json::from_str(outcomes_str).unwrap_or_default();
@@ -116,11 +158,9 @@ impl GammaClient {
             taker_fee_rate: {
                 // feesEnabled=false ⇒ fee-free (0). Otherwise take feeSchedule.rate. Absent ⇒ None.
                 let enabled = v.get("feesEnabled").and_then(|b| b.as_bool());
-                let rate = v
-                    .get("feeSchedule")
-                    .and_then(|f| f.get("rate"))
-                    .and_then(|r| r.as_f64())
-                    .and_then(Decimal::from_f64_retain);
+                // Via `num` (literal → Decimal), not as_f64: this rate multiplies into the negRisk
+                // arb line, so float noise here is noise in the tradeable/not-tradeable decision.
+                let rate = Self::num(v.get("feeSchedule").and_then(|f| f.get("rate")));
                 match (enabled, rate) {
                     (Some(false), _) => Some(Decimal::ZERO),
                     (_, Some(r)) => Some(r),
@@ -131,11 +171,26 @@ impl GammaClient {
                 .get("enableOrderBook")
                 .and_then(|b| b.as_bool())
                 .unwrap_or(false),
-            volume_24hr: v.get("volume24hr").and_then(|n| match n {
-                Value::Number(x) => x.as_f64().and_then(Decimal::from_f64_retain),
-                Value::String(s) => s.parse::<Decimal>().ok(),
-                _ => None,
-            }),
+            volume_24hr: Self::num(v.get("volume24hr")),
+            // Gamma sends `liquidity` as a string and `liquidityNum` as a number for the same
+            // value; take either.
+            liquidity: Self::num(v.get("liquidityNum")).or_else(|| Self::num(v.get("liquidity"))),
+            tick_size: Self::num(v.get("orderPriceMinTickSize")),
+            // clobRewards is an ARRAY: a market can carry several concurrent reward programs, and
+            // what a maker earns from resting there is their sum, not the first one. `null` (no
+            // programme) and `[]` both mean zero — mapped to None so "not rewarded" and "we failed
+            // to parse" stay distinguishable in the column.
+            rewards_daily_rate: v
+                .get("clobRewards")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|r| Self::num(r.get("rewardsDailyRate")))
+                        .sum::<Decimal>()
+                })
+                .filter(|total| !total.is_zero()),
+            rewards_min_size: Self::num(v.get("rewardsMinSize")),
+            rewards_max_spread: Self::num(v.get("rewardsMaxSpread")),
             event_id: v
                 .get("events")
                 .and_then(|e| e.as_array())
@@ -422,5 +477,95 @@ impl GammaClient {
         // For bootstrap, reuse list and find; or call /markets/{id} if exists.
         let markets = self.list_active_markets().await?;
         Ok(markets.into_iter().find(|m| m.id == market_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    /// A real Gamma `/markets` row, trimmed to the fields under test. Captured live 2026-08-02 from
+    /// `will-the-us-invade-iran-before-2027` — the market that made the rewards data worth parsing
+    /// at all ($1,000/day paid to resting orders, and we were discarding it).
+    const REAL_ROW: &str = r#"{
+        "id": "512345", "slug": "will-the-us-invade-iran-before-2027",
+        "question": "Will the US invade Iran before 2027?",
+        "outcomes": "[\"Yes\",\"No\"]", "clobTokenIds": "[\"111\",\"222\"]",
+        "outcomePrices": "[\"0.18\",\"0.82\"]",
+        "active": true, "closed": false, "enableOrderBook": true,
+        "feesEnabled": false, "feeSchedule": null,
+        "liquidity": "1018110.2348", "liquidityNum": 1018110.2348,
+        "volume24hr": 2126126.372011996,
+        "orderPriceMinTickSize": 0.01,
+        "rewardsMinSize": 200, "rewardsMaxSpread": 3.5,
+        "clobRewards": [{"id": "288102", "rewardsAmount": 0, "rewardsDailyRate": 1000}]
+    }"#;
+
+    #[test]
+    fn a_real_gamma_row_yields_the_rewards_and_tick_fields_we_used_to_discard() {
+        let m = GammaClient::parse_market(&serde_json::from_str(REAL_ROW).unwrap());
+        assert_eq!(m.rewards_daily_rate, Some(dec!(1000)));
+        assert_eq!(m.rewards_min_size, Some(dec!(200)));
+        assert_eq!(m.rewards_max_spread, Some(dec!(3.5)));
+        assert_eq!(m.tick_size, Some(dec!(0.01)));
+        assert_eq!(m.liquidity, Some(dec!(1018110.2348)));
+        // feesEnabled:false really does mean fee-free — 23% of the top-volume universe is.
+        assert_eq!(m.taker_fee_rate, Some(Decimal::ZERO));
+    }
+
+    #[test]
+    fn rewards_sum_across_concurrent_programmes() {
+        // clobRewards is an ARRAY. A market can run several programmes at once, and what a maker
+        // earns for resting there is their sum — taking the first would under-report the budget.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"clobRewards":[{"rewardsDailyRate":600},{"rewardsDailyRate":150}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            GammaClient::parse_market(&v).rewards_daily_rate,
+            Some(dec!(750))
+        );
+    }
+
+    #[test]
+    fn no_reward_programme_is_none_not_zero() {
+        // "pays nothing" and "we failed to parse" must stay distinguishable in the column, so an
+        // absent or empty programme list yields None rather than 0.
+        for raw in [r#"{}"#, r#"{"clobRewards":null}"#, r#"{"clobRewards":[]}"#] {
+            let m = GammaClient::parse_market(&serde_json::from_str(raw).unwrap());
+            assert_eq!(m.rewards_daily_rate, None, "raw was {raw}");
+        }
+    }
+
+    #[test]
+    fn numeric_fields_parse_from_either_json_type() {
+        // Gamma is inconsistent: `liquidity` is a string and `liquidityNum` a number for the SAME
+        // value on the same market, and other endpoints flip which form a field takes.
+        assert_eq!(
+            GammaClient::num(Some(&serde_json::json!("1018110.2348"))),
+            Some(dec!(1018110.2348))
+        );
+        assert_eq!(
+            GammaClient::num(Some(&serde_json::json!(1018110.2348))),
+            Some(dec!(1018110.2348))
+        );
+        assert_eq!(GammaClient::num(Some(&serde_json::json!(null))), None);
+        assert_eq!(GammaClient::num(None), None);
+    }
+
+    #[test]
+    fn json_numbers_do_not_go_through_a_binary_float() {
+        // Caught by the test above failing on the real payload. `as_f64` + `from_f64_retain` turns
+        // Gamma's 1018110.2348 into 1018110.2347999999765306711195; going via the JSON literal
+        // keeps it exact. The rate below matters most — it multiplies into the negRisk arb line, so
+        // noise here is noise in a tradeable/not-tradeable decision.
+        let exact = GammaClient::num(Some(&serde_json::json!(1018110.2348))).unwrap();
+        assert_eq!(exact.to_string(), "1018110.2348");
+
+        let m = GammaClient::parse_market(
+            &serde_json::from_str(r#"{"feesEnabled":true,"feeSchedule":{"rate":0.07}}"#).unwrap(),
+        );
+        assert_eq!(m.taker_fee_rate.unwrap().to_string(), "0.07");
     }
 }

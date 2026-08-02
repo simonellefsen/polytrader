@@ -256,8 +256,9 @@ pub async fn ingest_tick(
         // Upsert market (resolution fields refreshed on conflict so closes are captured).
         sqlx::query(
             r#"INSERT INTO market_data.markets
-               (gamma_id, slug, question, outcomes, clob_token_ids, active, closed, updated_at, raw_json, outcome_prices, resolved_outcome, taker_fee_rate, event_id, neg_risk)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11, $12, $13)
+               (gamma_id, slug, question, outcomes, clob_token_ids, active, closed, updated_at, raw_json, outcome_prices, resolved_outcome, taker_fee_rate, event_id, neg_risk,
+                volume_24h, liquidity, tick_size, rewards_daily_rate, rewards_min_size, rewards_max_spread)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
                ON CONFLICT (gamma_id) DO UPDATE SET
                  slug = EXCLUDED.slug,
                  question = EXCLUDED.question,
@@ -270,6 +271,15 @@ pub async fn ingest_tick(
                  taker_fee_rate = COALESCE(EXCLUDED.taker_fee_rate, market_data.markets.taker_fee_rate),
                  event_id = COALESCE(EXCLUDED.event_id, market_data.markets.event_id),
                  neg_risk = EXCLUDED.neg_risk OR market_data.markets.neg_risk,
+                 -- Same COALESCE discipline as taker_fee_rate: Gamma omits these on some endpoints
+                 -- (e.g. the by-slug lookup returns less than the volume-ranked list), so a market
+                 -- re-ingested through a thinner path must not have its known values blanked.
+                 volume_24h = COALESCE(EXCLUDED.volume_24h, market_data.markets.volume_24h),
+                 liquidity = COALESCE(EXCLUDED.liquidity, market_data.markets.liquidity),
+                 tick_size = COALESCE(EXCLUDED.tick_size, market_data.markets.tick_size),
+                 rewards_daily_rate = EXCLUDED.rewards_daily_rate,
+                 rewards_min_size = COALESCE(EXCLUDED.rewards_min_size, market_data.markets.rewards_min_size),
+                 rewards_max_spread = COALESCE(EXCLUDED.rewards_max_spread, market_data.markets.rewards_max_spread),
                  updated_at = now()"#,
         )
         .bind(&m.id)
@@ -285,6 +295,12 @@ pub async fn ingest_tick(
         .bind(m.taker_fee_rate)
         .bind(&m.event_id)
         .bind(m.neg_risk)
+        .bind(m.volume_24hr)
+        .bind(m.liquidity)
+        .bind(m.tick_size)
+        .bind(m.rewards_daily_rate)
+        .bind(m.rewards_min_size)
+        .bind(m.rewards_max_spread)
         .execute(pool)
         .await?;
 
