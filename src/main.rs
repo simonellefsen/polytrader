@@ -239,9 +239,19 @@ async fn main() -> Result<()> {
                             // token_id alone made that an arbitrary lexicographic slice of a
                             // 600-token universe. Measured 2026-08-01: 86 of 301 negRisk member
                             // books were snapshot-priced for no reason other than where their
-                            // token id happened to fall. NegRisk No books are what the arb
-                            // scanner reads, so they take the budget first; token_id remains the
-                            // tiebreak purely to keep the set deterministic for the drift check.
+                            // token id happened to fall.
+                            //
+                            // Two priority tiers, in order of what the budget is FOR:
+                            //  1. negRisk No books — the arb scanner's own reads, and arb is the
+                            //     strategy that actually earns.
+                            //  2. Reward-paying markets' books — the maker-rewards shadow scan
+                            //     estimates our share from qualifying DEPTH near the mid, which
+                            //     moves far faster than the 30-minute snapshot window it otherwise
+                            //     falls back to. Added 2026-08-02 after that scan reported
+                            //     priced_from_live: 0 — tier 1 is No-side only, and reward markets
+                            //     are priced off their Yes book, so none of them were subscribed.
+                            // token_id remains the final tiebreak purely to keep the set
+                            // deterministic for the resubscribe drift check.
                             "SELECT s.token_id
                                FROM (
                                     SELECT DISTINCT ON (token_id) token_id, market_id, outcome
@@ -252,6 +262,9 @@ async fn main() -> Result<()> {
                                LEFT JOIN market_data.markets m ON m.gamma_id = s.market_id
                               ORDER BY (COALESCE(m.neg_risk, false)
                                         AND s.outcome = 'No'
+                                        AND COALESCE(m.active, false)
+                                        AND NOT COALESCE(m.closed, true)) DESC,
+                                       (m.rewards_daily_rate IS NOT NULL
                                         AND COALESCE(m.active, false)
                                         AND NOT COALESCE(m.closed, true)) DESC,
                                        s.token_id
@@ -1988,6 +2001,43 @@ async fn produce_arb_scan_journal(
             }
         }
         Err(e) => warn!(error = %e, "negrisk arb scan failed (will retry next cycle)"),
+    }
+
+    // MAKER LIQUIDITY-REWARDS SHADOW SCAN. Measures only — places nothing, and there is no executor
+    // behind it. Polymarket pays a per-market daily budget to RESTING orders whether or not they
+    // fill; this estimates what we could capture and journals it so the estimate accrues a track
+    // record against real book dynamics before any of it becomes a strategy. Two caveats travel
+    // with every number and are repeated in the payload: the share model is first-order (an upper
+    // bound), and adverse selection — the entire risk of making — is not modelled at all.
+    match crate::strategy::rewards::scan_rewards(pool, Some(live_books)).await {
+        Ok((candidates, rdiag)) => {
+            tracing::info!(
+                markets_with_rewards = rdiag.markets_with_rewards,
+                markets_priced = rdiag.markets_priced,
+                pool_usd_day = %rdiag.pool_usd_day,
+                est_capturable_usd_day = %rdiag.estimated_capturable_usd_day,
+                capital_required_usd = %rdiag.capital_required_usd,
+                priced_from_live = rdiag.priced_from_live,
+                best = ?candidates.first().map(|c| (&c.question, c.estimated_daily_usd.to_string())),
+                "maker rewards shadow scan"
+            );
+            let _ = journal
+                .record_journal_event(
+                    "maker_rewards_scan",
+                    "polytrader_rewards_scanner",
+                    "info",
+                    serde_json::json!({
+                        "strategy": "maker_liquidity_rewards",
+                        "diagnostics": rdiag,
+                        "top_candidates": candidates.iter().take(10).collect::<Vec<_>>(),
+                        "paper_only": true,
+                        "orders_placed": false,
+                        "note": "SHADOW ONLY — no orders are placed and no executor exists. estimated_daily_usd is an UPPER BOUND: the share model is our_size/(qualifying_depth+our_size), while Polymarket scores by proximity to mid and generally rewards two-sided quoting. Adverse selection is NOT modelled — a resting order earns rewards precisely because it can be hit, and it is hit when the market moves against it. A positive number here is not a positive-expectancy claim. Rank is by capturable, never by pool size: measured 2026-08-02, a $1000/day pool against 1.94M shares of competing depth yields ~$0.10/day while a $200/day pool against 4.4k shares yields ~$4.49."
+                    }),
+                )
+                .await;
+        }
+        Err(e) => warn!(error = %e, "maker rewards scan failed (will retry next cycle)"),
     }
     Ok(())
 }

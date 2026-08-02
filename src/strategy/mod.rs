@@ -30,6 +30,7 @@
 pub mod arbitrage;
 pub mod negrisk;
 pub mod overreaction;
+pub mod rewards;
 pub mod theta;
 pub mod weights;
 
