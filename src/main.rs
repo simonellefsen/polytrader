@@ -834,6 +834,12 @@ async fn produce_5min_decision_report(
         .map(|v| v.trim().eq_ignore_ascii_case("on"))
         .unwrap_or(false);
 
+    // Hoisted out of the per-market loop below. This is Kelly's bankroll term, and it cannot change
+    // while the loop runs — the loop only READS and journals; nothing it does writes a portfolio
+    // snapshot. It was re-running the identical `ORDER BY as_of DESC LIMIT 1` once per market, so at
+    // DR_MARKET_LIMIT=50 that was 50 round-trips per cycle for one unchanging number.
+    let portfolio_usdc = current_portfolio_usdc(pool).await;
+
     for (gamma_id, slug, my, mn, end_date_iso, stored_fee_rate) in markets {
         // Per-market taker fee rate: stored Gamma feeSchedule rate, else the category default.
         let taker_fee_rate = stored_fee_rate.unwrap_or_else(|| polymarket_taker_fee_rate(&slug));
@@ -921,7 +927,6 @@ async fn produce_5min_decision_report(
         // reliability buckets where a band has enough settled evidence (see calibration_buckets
         // above; a no-op until then).
         // RISK: this is a rough estimate; always apply fractional Kelly + caps.
-        let portfolio_usdc = current_portfolio_usdc(pool).await;
         let win_prob_raw = (target_mid + net).min(dec!(0.99)).max(dec!(0.01));
         let win_prob = crate::risk::calibrate_win_prob(
             win_prob_raw,
@@ -1131,6 +1136,11 @@ async fn maybe_execute_opportunity(
     // risk-free arb executor (separate path), are deliberately NOT counted or capped.
     let cap = daily_entry_cap();
     if cap > 0 {
+        // Deliberately NOT hoisted out of the caller's per-market loop, unlike
+        // `current_portfolio_usdc`. This function journals its own `action: "filled"` events, so the
+        // count it reads is one THIS loop increments — caching it across markets would let a cycle
+        // fill `cap` orders per market instead of `cap` in total. A re-read per candidate is the
+        // price of the cap actually binding.
         let entries_today: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM journal.events
              WHERE event_type = 'autonomous_paper_execution'

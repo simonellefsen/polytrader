@@ -577,15 +577,27 @@ the dated Decision-log entry below; this is the at-a-glance index.
   4. **In-play, now evidenced.** The desync diagnostic showed the only hard-to-track books are live
      in-play sports — the same class holding the only rich overrounds (27% on Canada–Morocco).
      Targeted resync on desync is the prerequisite.
-- [ ] **Query optimization** (2026-08-02, measured but not yet done). `market_data.markets` is
-  **never pruned** by GC (6,806 rows, ~650 new/day) and drives the board, both LATERAL fan-outs,
-  both arb scanners and the DR driver — the board's share of that is fixed, the rest is not.
-  `current_portfolio_usdc` runs the identical query **50× per DR cycle**; the daily-turnover
-  `COUNT(*)` and `current_drawdown_pct`'s full scan likewise re-run per market (~500–900
-  round-trips/cycle, mostly repeats). Missing indexes for clauses that have none:
-  `markets(updated_at)`, `paper_fills(created_at)`, an expression index for
-  `journal.events(payload->>'action')` — confirm each with `EXPLAIN ANALYZE` first, don't add on
-  faith. `/trades/pnl?range=all` has no lower bound (full-table `DISTINCT ON`).
+- [x] **Query optimization — mostly FALSIFIED by measurement, 2026-08-02.** Recorded here earlier
+  the same day as a list of problems inferred from *code shape* (N+1 patterns, clauses with no
+  supporting index, an unpruned table). `EXPLAIN ANALYZE` against the live DB killed most of it,
+  and the correction is worth keeping as a caution about reading structure as cost:
+  - **`market_data.markets` retention: not needed.** The table is **9 MB / 6,867 rows**, only
+    **3** rows exceed 30 days, and exactly **1** is safely deletable. The real cost was never table
+    size — it was the board scanning it *unfiltered*, already fixed by filtering on ingest recency
+    (6,806 → 588 rows), which bypasses size entirely. Building a GC pass here would have been work
+    against a premise that does not hold.
+  - **All three proposed indexes: declined.** The daily-turnover `COUNT(*)` is **0.079 ms**,
+    already served by the existing `idx_journal_events_type_created` (16 rows filtered), so no
+    `payload->>'action'` expression index is warranted. `paper_fills` `SUM(fee)` is 0.19 ms.
+    `/trades/pnl?range=all` is 2.3 ms over 3,652 rows. And `markets(updated_at)` would be *actively
+    harmful*: `updated_at` is rewritten for every market on every 5-minute tick, so that index
+    would tax the ingest hot path to save ~2 ms on a read.
+  - **Genuinely real, and fixed:** `current_portfolio_usdc` ran the identical
+    `ORDER BY as_of DESC LIMIT 1` once per market — 50 round-trips per cycle for Kelly's bankroll
+    term, which cannot change while the loop runs. Hoisted. The daily-turnover count *looks* like
+    the same bug and was deliberately left alone: that function journals the very `filled` events
+    it counts, so caching it would let a cycle fill `cap` orders **per market** instead of `cap`
+    in total.
 - [ ] **UI: one shared shell.** The nav is written twice in two different syntaxes
   (`render_board_page` uses CSS classes, `render_trades_page` inlines every style), and of the two
   pages' CSS rules only 3 are byte-identical — `.pos` even means *green text* on one page and
