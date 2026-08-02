@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::json;
+use sqlx::Row as _;
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -1166,13 +1167,13 @@ fn aggregate_strategy_signal_attribution(
     arb_best_net: Option<String>,
     arb_latest_opportunity_count: i64,
 ) -> serde_json::Value {
-    const PROCESSORS: [&str; 6] = [
+    // The live processors only. overreaction_fade (retired 2026-06-29), yahoo_finance and
+    // news_sentiment (retired 2026-08-02) were reported here as a permanent row of zeros, which is
+    // not attribution — it is three dead signals padding every reflection.
+    const PROCESSORS: [&str; 3] = [
         "orderbook_momentum",
         "spike_divergence",
-        "overreaction_fade",
         "theta_convergence",
-        "yahoo_finance",
-        "news_sentiment",
     ];
     let reports = dr_payloads.len() as i64;
 
@@ -1249,20 +1250,10 @@ fn aggregate_strategy_signal_attribution(
             "No decision reports in window — verify the 5-min DR generator is running before drawing strategy conclusions.".to_string(),
         );
     } else {
-        if let Some(o) = per_processor.get("overreaction_fade") {
-            let fired = o["fired_nonzero_score"].as_i64().unwrap_or(0);
-            let fr = o["fire_rate"].as_str().unwrap_or("0");
-            let avg_edge = o["avg_edge"].as_str().unwrap_or("0");
-            if fired == 0 {
-                learning.push(format!(
-                    "overreaction_fade never fired across {reports} reports — prices sat inside the 0.28/0.72 fade band (calm regime). Expected; no action."
-                ));
-            } else {
-                learning.push(format!(
-                    "overreaction_fade fired {fired} time(s) (fire_rate {fr}, avg_edge {avg_edge}). If avg_edge stays below the 4% net gate, widen the 0.28/0.72 thresholds or down-weight this processor."
-                ));
-            }
-        }
+        // The overreaction_fade recommendation that lived here was unconditional dead advice: the
+        // signal was unwired from the fusion engine on 2026-06-29, so it could only ever emit
+        // "never fired ... Expected; no action" — a line telling the operator, every reflection,
+        // that a deleted signal is behaving as expected.
         if kelly_n > 0 {
             let neg = capped.get("negative_kelly").copied().unwrap_or(0);
             if neg * 2 > kelly_n {
@@ -1780,15 +1771,16 @@ fn signal_health(baseline_pct: Decimal, recent_pct: Decimal, recent_n: i64) -> &
 /// glacially — recomputing it every 5-min cycle was pure DB burn. Mirrors server.rs's
 /// health_7d_baseline_cache pattern. Only successful (total > 0) computations are cached.
 #[allow(clippy::type_complexity)]
-fn baseline_7d_cache() -> &'static std::sync::Mutex<Option<(std::time::Instant, (i64, [i64; 6]))>> {
+fn baseline_7d_cache(
+) -> &'static std::sync::Mutex<Option<(std::time::Instant, (i64, [i64; TRACKED_SIGNALS.len()]))>> {
     static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<Option<(std::time::Instant, (i64, [i64; 6]))>>,
+        std::sync::Mutex<Option<(std::time::Instant, (i64, [i64; TRACKED_SIGNALS.len()]))>>,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 /// The 7d fire-rate baseline via [`baseline_7d_cache`] (1h TTL), else computed fresh.
-async fn signal_fire_counts_7d_cached(pool: &sqlx::PgPool) -> (i64, [i64; 6]) {
+async fn signal_fire_counts_7d_cached(pool: &sqlx::PgPool) -> (i64, [i64; TRACKED_SIGNALS.len()]) {
     const TTL: std::time::Duration = std::time::Duration::from_secs(3600);
     let cached = baseline_7d_cache().lock().ok().and_then(|g| {
         g.as_ref()
@@ -1807,30 +1799,59 @@ async fn signal_fire_counts_7d_cached(pool: &sqlx::PgPool) -> (i64, [i64; 6]) {
     v
 }
 
-/// Per-signal slim count-only fire-rate aggregate (total reports + per-signal fired count, in SIGNALS
-/// order) over the given interval. "fired" = the score string contains a 1-9 digit (cast-free mirror of
-/// `!Decimal::is_zero()`; can't throw on a stray non-numeric score). Returns (total, [fired; 6]).
-async fn signal_fire_counts(pool: &sqlx::PgPool, interval: &str) -> (i64, [i64; 6]) {
-    // interval is a fixed internal literal ('24 hours' / '7 days'), never user input.
+/// The signals hermes tracks and alerts on, in order.
+///
+/// `overreaction_fade` (retired 2026-06-29), `yahoo_finance` and `news_sentiment` (retired
+/// 2026-08-02) are GONE from this list. Nothing scores them any more, so their 24h fire-rate is
+/// necessarily 0 against a still-warm 7-day baseline — which made `load_and_alert_signal_health`
+/// journal confident "dormant"/"degraded" alerts about signals that had been deliberately deleted
+/// hours earlier. A monitor that cries wolf over its own retirements trains you to ignore it.
+const TRACKED_SIGNALS: [&str; 3] = [
+    "orderbook_momentum",
+    "spike_divergence",
+    "theta_convergence",
+];
+
+/// Per-signal slim count-only fire-rate aggregate (total reports + per-signal fired count, in
+/// TRACKED_SIGNALS order) over the given interval. "fired" = the score string contains a 1-9 digit
+/// (cast-free mirror of `!Decimal::is_zero()`; can't throw on a stray non-numeric score).
+///
+/// Columns are GENERATED from TRACKED_SIGNALS rather than written out beside it — the dashboard's
+/// copy of this query drifted exactly that way (a stale `overreaction_fade` column against a
+/// positionally-indexed array made three rows read another signal's baseline), and this is the
+/// same shape of code.
+async fn signal_fire_counts(
+    pool: &sqlx::PgPool,
+    interval: &str,
+) -> (i64, [i64; TRACKED_SIGNALS.len()]) {
+    // interval is a fixed internal literal ('24 hours' / '7 days'), never user input; signal names
+    // are compile-time constants.
+    let cols = TRACKED_SIGNALS
+        .iter()
+        .map(|s| {
+            format!("count(*) FILTER (WHERE payload->'report'->'attribution'->'{s}'->>'score' ~ '[1-9]')::bigint")
+        })
+        .collect::<Vec<_>>()
+        .join(",\n           ");
     let sql = format!(
         "SELECT count(*)::bigint,
-           count(*) FILTER (WHERE payload->'report'->'attribution'->'orderbook_momentum'->>'score' ~ '[1-9]')::bigint,
-           count(*) FILTER (WHERE payload->'report'->'attribution'->'spike_divergence'->>'score' ~ '[1-9]')::bigint,
-           count(*) FILTER (WHERE payload->'report'->'attribution'->'overreaction_fade'->>'score' ~ '[1-9]')::bigint,
-           count(*) FILTER (WHERE payload->'report'->'attribution'->'theta_convergence'->>'score' ~ '[1-9]')::bigint,
-           count(*) FILTER (WHERE payload->'report'->'attribution'->'yahoo_finance'->>'score' ~ '[1-9]')::bigint,
-           count(*) FILTER (WHERE payload->'report'->'attribution'->'news_sentiment'->>'score' ~ '[1-9]')::bigint
+           {cols}
          FROM journal.events
          WHERE event_type = 'decision_report' AND created_at > now() - interval '{interval}'"
     );
-    let row: Option<(i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(&sql)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-    match row {
-        Some((t, a, b, c, d, e, f)) => (t, [a, b, c, d, e, f]),
-        None => (0, [0; 6]),
+    let row: Option<sqlx::postgres::PgRow> =
+        sqlx::query(&sql).fetch_optional(pool).await.ok().flatten();
+    match row.as_ref() {
+        Some(r) => {
+            let mut fired = [0i64; TRACKED_SIGNALS.len()];
+            // Column 0 is the total; the per-signal columns follow in TRACKED_SIGNALS order by
+            // construction, since the same array generated them.
+            for (i, slot) in fired.iter_mut().enumerate() {
+                *slot = r.try_get::<i64, _>(i + 1).unwrap_or(0);
+            }
+            (r.try_get::<i64, _>(0).unwrap_or(0), fired)
+        }
+        None => (0, [0; TRACKED_SIGNALS.len()]),
     }
 }
 
@@ -1891,14 +1912,7 @@ async fn maybe_journal_alert(
 /// doesn't spam an alert every reflection cycle. Returns a JSON block for the reflection metrics.
 /// Append-only observability evidence (no trading effect); non-fatal — degrades to an empty block.
 async fn load_and_alert_signal_health(pool: &sqlx::PgPool) -> serde_json::Value {
-    const SIGNALS: [&str; 6] = [
-        "orderbook_momentum",
-        "spike_divergence",
-        "overreaction_fade",
-        "theta_convergence",
-        "yahoo_finance",
-        "news_sentiment",
-    ];
+    const SIGNALS: [&str; TRACKED_SIGNALS.len()] = TRACKED_SIGNALS;
     let pct = |fired: i64, total: i64| -> Decimal {
         if total > 0 {
             (Decimal::from(fired) / Decimal::from(total) * dec!(100)).round_dp(1)
@@ -2929,22 +2943,26 @@ mod tests {
     }
 
     #[test]
-    fn strategy_signal_attribution_aggregates_overreaction_kelly_and_arb() {
-        // Dedicated unit test for the new closed-loop strategy attribution path (per codebase
+    fn strategy_signal_attribution_aggregates_theta_kelly_and_arb() {
+        // Dedicated unit test for the closed-loop strategy attribution path (per codebase
         // convention: new Hermes attribution paths get a dedicated mock-assert test).
-        // Two decision_report payloads: one where overreaction_fade fired, one where it didn't;
+        // Two decision_report payloads: one where theta_convergence fired, one where it didn't;
         // each carries a kelly_sizing block. Plus an arb summary.
+        //
+        // Was written against overreaction_fade, which is no longer in PROCESSORS (retired
+        // 2026-06-29 and dropped from the reflection 2026-08-02). Retargeted at a LIVE signal
+        // rather than deleted — the aggregation logic it covers is unchanged and still needs a test.
         let dr_payloads = vec![
             json!({
                 "report": {"attribution": {
-                    "overreaction_fade": {"score": "0.30", "confidence": "0.55", "edge": "0.165"},
+                    "theta_convergence": {"score": "0.30", "confidence": "0.55", "edge": "0.165"},
                     "orderbook_momentum": {"score": "0", "confidence": "0.10", "edge": "0"},
                 }},
                 "kelly_sizing": {"recommended_usdc": "12.50", "capped_by": "max_position_usdc"},
             }),
             json!({
                 "report": {"attribution": {
-                    "overreaction_fade": {"score": "0", "confidence": "0", "edge": "0"},
+                    "theta_convergence": {"score": "0", "confidence": "0", "edge": "0"},
                     "orderbook_momentum": {"score": "0", "confidence": "0.10", "edge": "0"},
                 }},
                 "kelly_sizing": {"recommended_usdc": "0", "capped_by": "negative_kelly"},
@@ -2955,8 +2973,8 @@ mod tests {
             aggregate_strategy_signal_attribution(&dr_payloads, 4, Some("0.0123".to_string()), 2);
 
         assert_eq!(out["reports_considered_24h"], 2);
-        // overreaction_fade present twice, fired once
-        let ov = &out["per_processor"]["overreaction_fade"];
+        // theta_convergence present twice, fired once
+        let ov = &out["per_processor"]["theta_convergence"];
         assert_eq!(ov["present_in_reports"], 2);
         assert_eq!(ov["fired_nonzero_score"], 1);
         assert_eq!(
@@ -2985,9 +3003,16 @@ mod tests {
             .as_array()
             .expect("learning_signals array");
         assert!(!signals.is_empty());
-        assert!(signals
-            .iter()
-            .any(|s| s.as_str().unwrap_or("").contains("overreaction_fade")));
+        // This used to assert an overreaction_fade recommendation was PRESENT. It is now asserted
+        // absent: that signal was unwired from the fusion engine on 2026-06-29, so the advice could
+        // only ever say "never fired ... Expected; no action" — a reflection line about a deleted
+        // signal, emitted every cycle. Retired signals must not generate recommendations.
+        assert!(
+            !signals
+                .iter()
+                .any(|s| s.as_str().unwrap_or("").contains("overreaction_fade")),
+            "retired signals must not produce learning recommendations"
+        );
         assert!(signals
             .iter()
             .any(|s| s.as_str().unwrap_or("").contains("Arbitrage scanner")));

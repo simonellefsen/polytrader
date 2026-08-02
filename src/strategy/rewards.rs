@@ -81,6 +81,11 @@ pub struct RewardDiagnostics {
     /// Legs priced from the live WS book vs the polled snapshot.
     pub priced_from_live: usize,
     pub priced_from_snapshot: usize,
+    /// Markets excluded because NOTHING is resting inside the reward band.
+    ///
+    /// These are not opportunities, they are unreadable books. See `scan_rewards` for why they are
+    /// excluded rather than counted as a 100% share.
+    pub zero_depth_excluded: usize,
 }
 
 /// Resting size within `band` of `mid`, summed across both sides.
@@ -205,6 +210,23 @@ pub async fn scan_rewards(
         };
 
         let qualifying_depth = qualifying_depth(&bids, &asks, mid, max_spread);
+
+        // Nothing resting inside the reward band. Arithmetically our share would be 100% and we
+        // would book the ENTIRE daily budget — and the first 8 hours of live data showed exactly
+        // that: 12 of 94 scans hit this, contributing an average $191.67, i.e. **35.8% of the
+        // headline estimate**, almost all of it one market repeatedly reading zero.
+        //
+        // Treat it as unreadable rather than free. A book with no size within a few cents of its
+        // own midpoint is pathologically wide or momentarily empty, not a market we could rest
+        // 200 shares in and collect a pool from — and if it genuinely were, other makers would
+        // arrive the instant it paid. This is the same "the error lands hardest on the markets the
+        // scan recommends" failure the module guards against for `our/theirs`; the zero-denominator
+        // case needed guarding too.
+        if qualifying_depth <= Decimal::ZERO {
+            diag.zero_depth_excluded += 1;
+            continue;
+        }
+
         let share = estimated_share(min_size, qualifying_depth);
 
         diag.markets_priced += 1;
@@ -304,9 +326,23 @@ mod tests {
         // exactly where this scan finds its best candidates, so the error would land hardest
         // precisely on the markets it recommends.
         assert_eq!(estimated_share(dec!(200), dec!(1800)), dec!(0.1));
-        // An empty book does not mean infinite share; it means we are the whole pool.
-        assert_eq!(estimated_share(dec!(200), dec!(0)), dec!(1));
         assert_eq!(estimated_share(dec!(0), dec!(0)), dec!(0));
+    }
+
+    #[test]
+    fn a_book_with_nothing_in_the_band_is_excluded_not_scored_as_a_full_pool() {
+        // The arithmetic says share = 200/(0+200) = 100%, i.e. we book the whole daily budget.
+        // Live data called that out as nonsense: 12 of 94 scans in the first 8 hours hit a
+        // zero-depth book and contributed 35.8% of the headline estimate off it. `scan_rewards`
+        // now skips these into `zero_depth_excluded`, so this test pins the arithmetic that
+        // MOTIVATES the skip rather than the skip itself — if this ever stops returning 1, the
+        // guard in the scanner is no longer load-bearing and should be re-derived, not deleted.
+        assert_eq!(estimated_share(dec!(200), dec!(0)), dec!(1));
+        assert_eq!(
+            qualifying_depth(&[(dec!(0.10), dec!(500))], &[], dec!(0.50), dec!(0.035)),
+            dec!(0),
+            "a book whose only size sits 40c from the mid has zero QUALIFYING depth"
+        );
     }
 
     #[test]
