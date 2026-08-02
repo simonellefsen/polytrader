@@ -25,6 +25,7 @@ use dioxus::prelude::*;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use sqlx::Row as _;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -1234,14 +1235,52 @@ fn signal_health(baseline_pct: Decimal, recent_pct: Decimal, recent_n: usize) ->
     "ok"
 }
 
+/// The signals shown on the dashboard scorecard, in display order.
+///
+/// **This array is the single source of truth for the scorecard's SQL too** — the 7-day baseline
+/// query is generated from it (`signal_fired_count_sql`), not hand-written alongside it. That is a
+/// direct response to a real bug: the hand-written query kept a column for `overreaction_fade`
+/// after the signal was retired from this list on 2026-06-29, while the results were still indexed
+/// positionally by the list. Every row from `theta_convergence` down silently read a *different
+/// signal's* baseline — theta was compared against a dead signal (permanent bogus "elevated"),
+/// yahoo against theta's baseline ("degraded"), news against yahoo's ("dormant"). All three badges
+/// on the live dashboard were artifacts, and the one instrument built to catch a silently-dying
+/// signal was itself lying. Generating the columns makes that class of drift unrepresentable.
+pub(crate) const SCORECARD_SIGNALS: [&str; 5] = [
+    "orderbook_momentum",
+    "spike_divergence",
+    "theta_convergence",
+    "yahoo_finance",
+    "news_sentiment",
+];
+
+/// One `count(*) FILTER (…)` column per scorecard signal, in `SCORECARD_SIGNALS` order.
+///
+/// "fired" = the score string contains a 1-9 digit (any nonzero decimal does; `"0"`/`"-0"`/`"0.00"`/
+/// absent do not) — a cast-free, robust mirror of `!Decimal::is_zero()` that cannot throw on a stray
+/// non-numeric score. Signal names are compile-time constants from this crate, never user input.
+fn signal_fired_count_sql() -> String {
+    SCORECARD_SIGNALS
+        .iter()
+        .map(|s| {
+            format!(
+                "count(*) FILTER (WHERE payload->'report'->'attribution'->'{s}'->>'score' ~ '[1-9]')::bigint"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n                   ")
+}
+
 /// Process-wide 5-minute cache for the expensive 7-day signal-health baseline. That aggregate reads
 /// ~21k decision_report payloads (~1.6s) and is polled on every /trades/data hit (dashboard, 15s); it's
 /// a slow-moving multi-day trend, so serving a ≤5-min-old value is fine and cuts the DB load ~95%.
 #[allow(clippy::type_complexity)]
 fn health_7d_baseline_cache(
-) -> &'static std::sync::Mutex<Option<(std::time::Instant, (i64, [i64; 6]))>> {
-    static C: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, (i64, [i64; 6]))>>> =
-        std::sync::OnceLock::new();
+) -> &'static std::sync::Mutex<Option<(std::time::Instant, (i64, [i64; SCORECARD_SIGNALS.len()]))>>
+{
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<Option<(std::time::Instant, (i64, [i64; SCORECARD_SIGNALS.len()]))>>,
+    > = std::sync::OnceLock::new();
     C.get_or_init(|| std::sync::Mutex::new(None))
 }
 
@@ -1712,14 +1751,9 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     // Fire-rate/influence are available now; realized P&L stays empty until settlements exist — the
     // same data-gate that pauses Hermes weight tuning.
     // overreaction_fade retired 2026-06-29 (unwired from the fusion engine) — excluded from the
-    // scorecard so the UI doesn't show a permanently-dead row.
-    const SIGNALS: [&str; 5] = [
-        "orderbook_momentum",
-        "spike_divergence",
-        "theta_convergence",
-        "yahoo_finance",
-        "news_sentiment",
-    ];
+    // scorecard so the UI doesn't show a permanently-dead row. The list lives at module scope
+    // because the 7-day baseline SQL is generated from it — see SCORECARD_SIGNALS.
+    const SIGNALS: [&str; SCORECARD_SIGNALS.len()] = SCORECARD_SIGNALS;
     // 24h + 3h fire-rate/influence aggregates, computed SERVER-SIDE (2026-07-15). The old code
     // pulled the most recent 3,000 attribution blobs and looped in Rust — fine when a day held
     // <3,000 reports, but DR volume grew to ~11,000/day, silently shrinking the "LAST 24H"
@@ -1790,10 +1824,13 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     // memory) so multi-day GRADUAL decay is caught too. The 3h-vs-24h check only sees SUDDEN shifts: when
     // a signal erodes slowly the 24h baseline erodes with it, so the recent/baseline ratio stays ~1 and
     // it reads "ok" — exactly how news_sentiment's ~20%→~1.8% slide hid. Comparing the 24h fire-rate
-    // against a 7d baseline surfaces the slow slide. "fired" = the score string contains a 1-9 digit
-    // (any nonzero decimal does; "0"/"-0"/"0.00"/absent do not) — a cast-free, robust mirror of
-    // `!Decimal::is_zero()` that can't throw on a stray non-numeric score. Columns follow SIGNALS order.
-    let (baseline_7d_total, baseline_7d_fired): (i64, [i64; 6]) = {
+    // against a 7d baseline surfaces the slow slide.
+    //
+    // The per-signal columns are GENERATED from SIGNALS rather than written out beside it. They used
+    // to be hand-written, and drifted: a column for the retired `overreaction_fade` stayed behind
+    // while the results were indexed positionally, so every row from theta down read another
+    // signal's baseline (see SCORECARD_SIGNALS for the full post-mortem).
+    let (baseline_7d_total, baseline_7d_fired): (i64, [i64; SCORECARD_SIGNALS.len()]) = {
         // 1h TTL: the 7d baseline moves glacially, but the scan behind it is a ~6.5s full read of
         // a week of decision_report JSONB. At the old 300s TTL every 5-min dashboard poll recomputed
         // it (169 slow-query alerts in 14h on 2026-07-11); 1h keeps the health check honest at 1/12
@@ -1808,24 +1845,26 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
         if let Some(v) = cached {
             v
         } else {
-            let computed: Option<(i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
+            let sql = format!(
                 "SELECT count(*)::bigint,
-                   count(*) FILTER (WHERE payload->'report'->'attribution'->'orderbook_momentum'->>'score' ~ '[1-9]')::bigint,
-                   count(*) FILTER (WHERE payload->'report'->'attribution'->'spike_divergence'->>'score' ~ '[1-9]')::bigint,
-                   count(*) FILTER (WHERE payload->'report'->'attribution'->'overreaction_fade'->>'score' ~ '[1-9]')::bigint,
-                   count(*) FILTER (WHERE payload->'report'->'attribution'->'theta_convergence'->>'score' ~ '[1-9]')::bigint,
-                   count(*) FILTER (WHERE payload->'report'->'attribution'->'yahoo_finance'->>'score' ~ '[1-9]')::bigint,
-                   count(*) FILTER (WHERE payload->'report'->'attribution'->'news_sentiment'->>'score' ~ '[1-9]')::bigint
+                   {}
                  FROM journal.events
                  WHERE event_type = 'decision_report' AND created_at > now() - interval '7 days'",
-            )
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-            let v = match computed {
-                Some((t, a, b, c, d, e, f)) => (t, [a, b, c, d, e, f]),
-                None => (0, [0; 6]),
+                signal_fired_count_sql()
+            );
+            let computed: Option<sqlx::postgres::PgRow> =
+                sqlx::query(&sql).fetch_optional(pool).await.ok().flatten();
+            let v = match computed.as_ref() {
+                Some(row) => {
+                    let mut fired = [0i64; SCORECARD_SIGNALS.len()];
+                    // Column 0 is the total; the per-signal columns follow in SIGNALS order by
+                    // construction, since the same array generated them.
+                    for (i, slot) in fired.iter_mut().enumerate() {
+                        *slot = row.try_get::<i64, _>(i + 1).unwrap_or(0);
+                    }
+                    (row.try_get::<i64, _>(0).unwrap_or(0), fired)
+                }
+                None => (0, [0; SCORECARD_SIGNALS.len()]),
             };
             // Only cache a real (successful) computation, not a DB-error fallback of zeros.
             if computed.is_some() {
@@ -2812,18 +2851,50 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
         // end_date drives the AWAITING RESOLUTION badge: a held market past its end date is not
         // "live", it is parked waiting on Polymarket/UMA, and the card said nothing to distinguish
         // the two. Cast is best-effort — Gamma's end_date is free-form text in raw_json.
-        "SELECT gamma_id, slug, question, category, last_mid_yes, last_mid_no, active, closed, resolved_outcome,
-                CASE WHEN raw_json->>'end_date' ~ '^\\d{4}-\\d{2}-\\d{2}T'
-                     THEN (raw_json->>'end_date')::timestamptz END
-         FROM market_data.markets ORDER BY closed ASC, updated_at DESC",
+        //
+        // ORDERING: soonest-resolving first, `gamma_id` as a total tiebreak. It used to be
+        // `updated_at DESC`, which made the board reshuffle on almost every refresh — the ingest
+        // tick rewrites `updated_at = now()` market-by-market for ~235s of every 300s interval
+        // while the board polls every 15s, so most polls landed mid-tick and saw a different
+        // permutation of the same cards. `updated_at` is a property of OUR ingest schedule, not of
+        // the market, so it was never a meaningful sort key; `end_date` is stable and is what an
+        // operator actually scans for. The trailing `gamma_id` matters as much as the switch: even
+        // a stable key needs a total order, or rows tied on it are free to swap between queries.
+        //
+        // WHERE: the board should show what we are actually tracking — the current ingest universe,
+        // plus everything we hold regardless of whether it still ranks. `market_data.markets` is
+        // never pruned (6,806 rows and growing daily), and filtering on `closed` does almost
+        // nothing because Gamma leaves `closed=false` on markets that have long since resolved
+        // (6,519 of 6,806 are "not closed"). Recency of ingest is the honest proxy: the tick walks
+        // the whole universe inside its 300s interval, so a 2-hour window means "still tracked"
+        // with slack for a few missed ticks. Measured: 6,806 rows → 588, a 91% cut of a payload
+        // that is re-fetched every 15 seconds by every open tab.
+        "SELECT m.gamma_id, m.slug, m.question, m.category, m.last_mid_yes, m.last_mid_no,
+                m.active, m.closed, m.resolved_outcome,
+                CASE WHEN m.raw_json->>'end_date' ~ '^\\d{4}-\\d{2}-\\d{2}T'
+                     THEN (m.raw_json->>'end_date')::timestamptz END AS end_date
+         FROM market_data.markets m
+         WHERE m.updated_at > now() - interval '2 hours'
+            OR EXISTS (SELECT 1 FROM paper_trading.paper_positions p
+                        WHERE p.market_id = m.gamma_id AND p.shares > 0)
+         ORDER BY m.closed ASC,
+                  CASE WHEN m.raw_json->>'end_date' ~ '^\\d{4}-\\d{2}-\\d{2}T'
+                       THEN (m.raw_json->>'end_date')::timestamptz END ASC NULLS LAST,
+                  m.gamma_id ASC",
     )
     .fetch_all(pool)
     .await
     .unwrap_or_default();
 
-    // Latest decision report, news cache, and open position per market. Driven from the ~50-row markets
-    // table with a LATERAL LIMIT-1 lookup (backed by idx_events_type_market_created) instead of a
-    // DISTINCT ON scan over all ~92k decision_reports — ~1.3s external-merge sort → ~0.5ms.
+    // Latest decision report, news cache, and open position per market. A LATERAL LIMIT-1 lookup
+    // (backed by idx_events_type_market_created) rather than a DISTINCT ON scan over all ~92k
+    // decision_reports — ~1.3s external-merge sort → ~0.5ms.
+    //
+    // The comment here used to say "driven from the ~50-row markets table". That premise rotted:
+    // `market_data.markets` is never pruned and is now 6,806 rows, so each render was firing 6,806
+    // index seeks per fan-out for cards the board no longer shows. Both fan-outs now carry the same
+    // tracked-universe filter as the card query above, which is also what keeps them in agreement —
+    // a report for a market absent from `markets` was never renderable anyway.
     let dr_rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
         "SELECT m.gamma_id, latest.payload
          FROM market_data.markets m
@@ -2831,7 +2902,10 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
              SELECT payload FROM journal.events
              WHERE event_type = 'decision_report' AND payload->>'market_id' = m.gamma_id
              ORDER BY created_at DESC LIMIT 1
-         ) latest",
+         ) latest
+         WHERE m.updated_at > now() - interval '2 hours'
+            OR EXISTS (SELECT 1 FROM paper_trading.paper_positions p
+                        WHERE p.market_id = m.gamma_id AND p.shares > 0)",
     )
     .fetch_all(pool)
     .await
@@ -2845,7 +2919,10 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
              SELECT payload->'news' AS news FROM journal.events
              WHERE event_type = 'news_cache' AND payload->>'market_id' = m.gamma_id
              ORDER BY created_at DESC LIMIT 1
-         ) latest",
+         ) latest
+         WHERE m.updated_at > now() - interval '2 hours'
+            OR EXISTS (SELECT 1 FROM paper_trading.paper_positions p
+                        WHERE p.market_id = m.gamma_id AND p.shares > 0)",
     )
     .fetch_all(pool)
     .await
@@ -2870,14 +2947,9 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
     }
 
     // overreaction_fade retired 2026-06-29 (unwired from the fusion engine) — excluded from the
-    // scorecard so the UI doesn't show a permanently-dead row.
-    const SIGNALS: [&str; 5] = [
-        "orderbook_momentum",
-        "spike_divergence",
-        "theta_convergence",
-        "yahoo_finance",
-        "news_sentiment",
-    ];
+    // scorecard so the UI doesn't show a permanently-dead row. The list lives at module scope
+    // because the 7-day baseline SQL is generated from it — see SCORECARD_SIGNALS.
+    const SIGNALS: [&str; SCORECARD_SIGNALS.len()] = SCORECARD_SIGNALS;
     let out: Vec<serde_json::Value> = markets
         .into_iter()
         .map(|(gid, slug, question, db_category, my, mn, active, closed, resolved, end_date)| {
@@ -11973,6 +12045,35 @@ fn merge_reconciliation_journal_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_seven_day_baseline_query_has_exactly_one_column_per_scorecard_signal() {
+        // The bug this pins: the hand-written query kept a column for the retired
+        // `overreaction_fade` while results were indexed positionally by SCORECARD_SIGNALS, so
+        // theta read a dead signal's baseline, yahoo read theta's, and news read yahoo's. Three of
+        // five live dashboard badges were artifacts. Columns are now generated from the same array
+        // that indexes them, and this asserts the two can never diverge again.
+        let sql = signal_fired_count_sql();
+        let columns: Vec<&str> = sql.split("count(*) FILTER").skip(1).collect();
+        assert_eq!(
+            columns.len(),
+            SCORECARD_SIGNALS.len(),
+            "one FILTER column per signal, got {} for {} signals",
+            columns.len(),
+            SCORECARD_SIGNALS.len()
+        );
+        // ...and in order, so positional indexing of the result is correct by construction.
+        for (col, name) in columns.iter().zip(SCORECARD_SIGNALS.iter()) {
+            assert!(
+                col.contains(&format!("'{name}'")),
+                "column {col:?} should reference signal {name}"
+            );
+        }
+        assert!(
+            !sql.contains("overreaction_fade"),
+            "the retired signal must not have a column"
+        );
+    }
 
     #[test]
     fn signal_health_flags_shifts() {
