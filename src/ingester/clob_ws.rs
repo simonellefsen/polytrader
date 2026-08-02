@@ -110,6 +110,10 @@ const STALE_AFTER_SECS: i64 = 120;
 /// without letting a real gap live long.
 const DESYNC_STRIKES: u32 = 3;
 
+/// Monotonic shard-id source. See the comment in [`spawn_feed`] for why ids must never be reused.
+#[cfg(feature = "clob-ws")]
+static NEXT_SHARD_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 // ===========================================================================================
 // Modes
 // ===========================================================================================
@@ -448,6 +452,26 @@ impl LiveBookStore {
         self.is_readable(&b).then_some(b)
     }
 
+    /// Drop every book outside `keep`, and forget shards that no longer carry one.
+    ///
+    /// Called on resubscribe. The store was append-only before this existed: measured over one
+    /// 7-hour run the tracked set grew 495 → 653 against a 500-token cap, i.e. ~150 books for
+    /// tokens nobody was subscribed to any more, silently answering reads with hours-old data.
+    /// The REST audit caught it as a rising disagreement rate — 0.4% in the first hour to 5.0% by
+    /// the seventh — which is precisely the job that audit was built for.
+    pub fn retain_tokens(&self, keep: &std::collections::HashSet<String>) {
+        let live_shards: std::collections::HashSet<usize> = match self.books.write() {
+            Ok(mut g) => {
+                g.retain(|token, _| keep.contains(token));
+                g.values().map(|b| b.shard).collect()
+            }
+            Err(_) => return,
+        };
+        if let Ok(mut s) = self.shard_seen.write() {
+            s.retain(|id, _| live_shards.contains(id));
+        }
+    }
+
     pub fn tracked_tokens(&self) -> Vec<String> {
         self.books
             .read()
@@ -734,13 +758,22 @@ async fn connect_and_pump(store: &LiveBookStore, assets: &[String], shard: usize
 /// design (a feed that gives up is worse than one that keeps retrying), so the caller aborts them
 /// when the subscribed universe rotates and a fresh set is needed.
 pub fn spawn_feed(store: LiveBookStore, assets: Vec<String>) -> Vec<tokio::task::JoinHandle<()>> {
+    // Drop books for tokens this subscription no longer covers. Without this the store is
+    // append-only across resubscribes and an unsubscribed token keeps its last-known book forever.
+    store.retain_tokens(&assets.iter().cloned().collect());
+
     assets
         .chunks(CHUNK_ASSETS)
-        .enumerate()
-        .map(|(i, chunk)| {
+        .map(|chunk| {
+            // Shard ids are globally monotonic, never 0..n per subscription. Reusing 0/1 each time
+            // was the teeth of the same bug: an orphaned book still pointing at "shard 0" looked
+            // alive because the NEXT subscription's shard 0 was delivering, so a book that had
+            // stopped updating hours ago still passed `get_fresh`. A fresh id per connection means
+            // any book left behind by a resubscribe points at a shard that is dead by definition.
+            let shard = NEXT_SHARD_ID.fetch_add(1, Ordering::Relaxed);
             let store = store.clone();
             let chunk = chunk.to_vec();
-            tokio::spawn(async move { run_shard(store, chunk, i).await })
+            tokio::spawn(async move { run_shard(store, chunk, shard).await })
         })
         .collect()
 }
@@ -1156,6 +1189,65 @@ mod tests {
         assert!(s.get_fresh(TOKEN).is_none());
         let h = s.health();
         assert_eq!((h.fresh, h.stale), (0, 1));
+    }
+
+    #[test]
+    fn a_resubscribe_evicts_books_it_no_longer_covers() {
+        // The store was append-only across resubscribes: measured live, tracked grew 495 → 653
+        // against a 500-token cap. Retaining only the new set is the cleanup half of the fix.
+        let s = store_with_real_book();
+        s.apply(
+            0,
+            WsEvent::Book {
+                token_id: "dropped".into(),
+                market_id: "0x".into(),
+                bids: vec![(dec!(0.4), dec!(5))],
+                asks: vec![(dec!(0.6), dec!(5))],
+            },
+        );
+        assert_eq!(s.health().tracked, 2);
+
+        s.retain_tokens(&[TOKEN.to_string()].into_iter().collect());
+        assert_eq!(s.health().tracked, 1);
+        assert!(s.get_fresh("dropped").is_none());
+        assert!(s.get_fresh(TOKEN).is_some(), "the covered book survives");
+    }
+
+    #[test]
+    fn a_book_left_on_a_retired_shard_is_never_readable() {
+        // The teeth of the same bug, and the half that made it silent. Shard ids used to restart
+        // at 0 on every resubscribe, so an orphaned book pointing at "shard 0" looked alive the
+        // moment the NEXT subscription's shard 0 delivered a frame — a book frozen hours ago
+        // passing `get_fresh` as current. Ids are now monotonic, so a retired shard stays dead
+        // even if this eviction is somehow missed.
+        let s = LiveBookStore::new();
+        s.apply(
+            7,
+            WsEvent::Book {
+                token_id: TOKEN.into(),
+                market_id: "0x".into(),
+                bids: vec![(dec!(0.4), dec!(5))],
+                asks: vec![(dec!(0.6), dec!(5))],
+            },
+        );
+        assert!(s.get_fresh(TOKEN).is_some());
+
+        // A different shard now carries the feed. The orphan must NOT inherit its liveness.
+        s.backdate(STALE_AFTER_SECS + 1, 0);
+        s.apply(
+            8,
+            WsEvent::Book {
+                token_id: "other".into(),
+                market_id: "0x".into(),
+                bids: vec![(dec!(0.4), dec!(5))],
+                asks: vec![(dec!(0.6), dec!(5))],
+            },
+        );
+        assert!(s.get_fresh("other").is_some(), "the live shard is readable");
+        assert!(
+            s.get_fresh(TOKEN).is_none(),
+            "a book on a retired shard must not read as fresh"
+        );
     }
 
     #[test]
