@@ -6,7 +6,7 @@
 pub mod authenticated;
 pub mod live_sender;
 
-// Re-export the main client for convenience
-pub use authenticated::{RealClobClient, RealOrderIntentDryRun};
-// Re-export live sender types so call sites (server, tests) can name the gated impl.
-pub use live_sender::{GatedRealClobLiveOrderSender, LiveOrderSendRequest};
+// The `pub use` re-exports that used to live here existed for the /console handlers in
+// server.rs, removed 2026-08-02 (unused operator UI). The real call site, main.rs, always named
+// these through the fully-qualified `crate::clob::authenticated::...` / `crate::clob::live_sender`
+// path, never through this shortcut, so nothing else needs it back.

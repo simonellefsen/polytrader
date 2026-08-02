@@ -510,15 +510,14 @@ async fn do_reflection(
         "Monitor fill count vs liquidity for slippage model tuning".to_string(),
         "Feed this reflection to wiki/experiments for Hermes wiki maintenance loop".to_string(),
         "Review fee_impact + fee_adjusted_attribution in this reflection vs 4-6% net edge min (goals wiki); tune if fee drag high on positive signals".to_string(),
-        "Track clob_collateral_readiness snapshots until collateral_balance_positive and collateral_allowance_positive are both true; do not treat this as live-order approval".to_string(),
-        "Keep clob_real_trading_unlock_status journaled and false until collateral, allowance, paper-mode, live-sender, and final human review gates are all deliberately addressed".to_string(),
-        "Use clob_final_review_readiness as the single operator packet for review discussions; it remains no-send and should stay blocked until every gate has evidence".to_string(),
-        "Record clob_final_review_decision events for review outcomes; these are audit-only and must not be treated as live-order approval. (2026-06-03: enriched payloads now carry risk/collateral snapshots at approval time for attribution when used in gated real dispatch.)".to_string(),
-        "Use clob_live_sender_design_readiness before any live-sender implementation work; it remains no-send and should stay blocked until every external and explicit unlock gate is deliberate".to_string(),
-        "Use clob_live_sender_design_review as the ADR-style contract before any live-sender boundary work; a ready design review still does not permit implementation or real orders".to_string(),
-        "Track clob_live_sender_boundary_status to ensure the only live-sender implementation remains fail-closed before network dispatch".to_string(),
-        "Review clob_safety_loop human-approval (now with approve-time snapshots 2026-06-03) and submit-facade blockers before implementing kill-switch or live-send internals".to_string(),
-        "Review approval_attribution (approvals_with_snaps, pre-linked rate, hermes_approval_gap, avg_edge_net_fees stub from risk_snapshot_at_approval + paper fees) + linked pre-dispatches for human+final decision quality vs dispatch (drag, net edge); when real fills+resolutions arrive, compare outcome vs approval decision and propose wiki/strategy update if mismatch (gated via HERMES_AUTONOMOUS_WIKI_PROPOSALS)".to_string(),
+        // The 8 recommendations that used to sit here (track clob_collateral_readiness, keep
+        // clob_real_trading_unlock_status false, use clob_final_review_readiness/*_decision,
+        // clob_live_sender_design_readiness/_review, clob_live_sender_boundary_status,
+        // clob_safety_loop human-approval) all pointed at the /console operator handlers removed
+        // 2026-08-02. Nothing writes those event types any more, so the recommendations were
+        // giving false operational advice about a UI that no longer exists. `clob_safety_loop`
+        // below still reads (and gracefully zeros on) the same journal event types — degrading to
+        // an honest "nothing happened" is fine; recommending action on it was not.
         "Track decision_reports_considered_24h + decision_report_cadence (5-min DR generator now active in main per goals-and-operational-cadence.md + strategy/DecisionReport + fuse_net; real counts in hermes; DR edge quality will feed Hermes proposals for gated real path; limited (no full ranked yet); append-only, evidence-only, no new privileged, reuse existing; will enable per-signal attribution once fuller generator + fills); now also reads recent decision reports (net_edge PRIMARY) in do_reflection per goals \"Extend do_reflection...\"; start backtest harness (DR vs paper outcomes/approvals quality; see wiki goals + decisions/real-order-approval-flow)".to_string(),
         "Track tax_journal_skeleton (paper proxy count/sample per fees-tax-latency-and-execution-tiers.md 'journal should be capable...' + goals 'Journal extensions'; for future Hermes attribution of net P&L after tax/cost basis drag + backtest; limited skeleton; + recent paper fills sampled in do_reflection (via tax producer on fills) for backtest harness start (DRs vs paper fills + tax-adjusted per goals 'Query recent fills...' + 'Compare decision reports vs actual outcomes'); see writer record_tax_snapshot + record_paper_fills + wiki fees/goals + this tranche; append-only evidence-only; limited (no full join yet; see goals for fuller); + dr vs fills compare stub started (fuller continuation per goals after start tranche); + dr vs fills limited proxy attr/join (dr_net/fills_fee/tax count) started (fuller per goals 'with real join/attr' after stub tranche)".to_string(),
     ];
