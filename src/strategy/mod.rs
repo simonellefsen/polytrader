@@ -28,18 +28,12 @@
 #![allow(dead_code)]
 
 pub mod arbitrage;
-pub mod external;
 pub mod negrisk;
 pub mod overreaction;
 pub mod theta;
 pub mod weights;
 
 pub use arbitrage::ArbitrageScanner;
-pub use external::{
-    fetch_newsdata_news, fetch_yahoo_context, is_placeholder_slug, news_fetch_in_cooldown,
-    newsdata_query, newsdata_query_with_question, slug_market_direction, NewsSentimentProcessor,
-    YahooFinanceProcessor,
-};
 // OverreactionProcessor retired 2026-06-29 (no longer wired into the fusion engine); the impl remains
 // in overreaction.rs for reference. Re-export removed so the unused processor doesn't warn.
 pub use theta::ThetaConvergenceProcessor;
@@ -340,9 +334,15 @@ impl FusionEngine {
                 // (overreaction.rs) is kept for reference but no longer trades.
                 // Time-decay convergence tilt near resolution (dormant far out; low confidence).
                 Box::new(ThetaConvergenceProcessor),
-                // External advisory signals (low confidence; risk gate still governs; Hermes learns weights).
-                Box::new(YahooFinanceProcessor),
-                Box::new(NewsSentimentProcessor),
+                // yahoo_finance + news_sentiment RETIRED 2026-08-02. Not because they misfired, but
+                // because they were structurally incapable of earning: the advisory cap below means
+                // an external signal can never ORIGINATE a trade (num_mi == 0 clamps it to zero) and
+                // never flip a direction — at most cancel or double one a market-internal signal
+                // already found. With directional cut to a 1-trade/day control arm (the P5 Path A
+                // NO-GO) and the arb executors — which earn all the P&L — reading no signals at all,
+                // they cost a paid API tier and an unthrottled per-market HTTP call per cycle to
+                // tilt an edge that was already there. The advisory-cap machinery below STAYS: it is
+                // the mechanism, not the signal, and any future advisory needs it.
             ],
             weights,
         }

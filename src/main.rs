@@ -808,18 +808,8 @@ async fn produce_5min_decision_report(
     .flatten()
     .unwrap_or(serde_json::Value::Null);
 
-    // External advisory signals (Yahoo Finance + Google News RSS), gated by env. Build one HTTP
-    // client with a short timeout; fetches are best-effort and never block a decision.
-    let external_enabled = std::env::var("POLYTRADER_EXTERNAL_SIGNALS")
-        .unwrap_or_default()
-        .trim()
-        .to_lowercase()
-        == "on";
-    let http_client = reqwest::Client::builder()
-        .user_agent("polytrader/0.1 (paper-only)")
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .ok();
+    // The POLYTRADER_EXTERNAL_SIGNALS gate and its HTTP client were removed 2026-08-02 with the
+    // yahoo_finance / news_sentiment processors — the DR cycle no longer makes any outbound call.
 
     // Fee context is built PER SIDE inside the loop (evaluate_dr_side): the real Polymarket taker
     // fee needs the per-market rate (stored from Gamma; geopolitics FREE, crypto 0.07…) and the
@@ -847,29 +837,11 @@ async fn produce_5min_decision_report(
     for (gamma_id, slug, my, mn, end_date_iso, stored_fee_rate) in markets {
         // Per-market taker fee rate: stored Gamma feeSchedule rate, else the category default.
         let taker_fee_rate = stored_fee_rate.unwrap_or_else(|| polymarket_taker_fee_rate(&slug));
-        // External advisory context: Yahoo spot (free, every cycle) + newsdata.io news (metered —
-        // 200 credits/day, so cached per market with a daily budget cap). Market-level (same for both
-        // outcomes) — fetched ONCE and reused across sides so both-sides eval doesn't double news spend.
-        let mut external = serde_json::Map::new();
-        if let (true, Some(c)) = (external_enabled, &http_client) {
-            if let Some(y) = crate::strategy::fetch_yahoo_context(c, &slug).await {
-                external.insert("yahoo".to_string(), y);
-            }
-            // News only for directional markets — arb-only (sports) markets don't use it, so don't
-            // spend newsdata credits on them.
-            if !is_arb_only_market(&slug) {
-                if let Some(mut news) =
-                    get_news_context_cached(pool, journal, c, &gamma_id, &slug).await
-                {
-                    // Derived from the slug per-cycle (not baked into the cache) so cached payloads
-                    // pick it up too: down-markets invert headline polarity in the news processor.
-                    news["market_direction"] =
-                        serde_json::json!(crate::strategy::slug_market_direction(&slug));
-                    external.insert("news".to_string(), news);
-                }
-            }
-        }
-        let external = serde_json::Value::Object(external);
+        // External advisory context (Yahoo spot + newsdata.io headlines) was removed 2026-08-02
+        // along with the two processors that consumed it — see strategy/mod.rs for why. The
+        // attribution key stays present and empty so decision-report consumers (hermes, the
+        // backtest harness, the scorecard) keep a stable payload shape across the change.
+        let external = serde_json::Value::Object(serde_json::Map::new());
         // Days to resolution (for the theta/convergence signal), parsed from the market's gamma end
         // date. Absent/unparseable (e.g. not re-ingested with end_date yet) ⇒ omitted, and theta stays
         // dormant. Negative (already past end date, e.g. UMA dispute) is passed through; theta gates it.
@@ -2539,114 +2511,6 @@ fn polymarket_taker_fee(
     shares: rust_decimal::Decimal,
 ) -> rust_decimal::Decimal {
     polymarket_fee(polymarket_taker_fee_rate(slug), price, shares)
-}
-
-/// News context for a market via newsdata.io, with aggressive credit economy (free plan = 200/day).
-///
-/// Strategy: cache each market's news in `journal.events` (event_type `news_cache`) with a 2h TTL.
-/// - Fresh cache (<2h) → reuse, 0 credits.
-/// - Stale + under daily budget (180/day, headroom below the 200 cap) → fetch 1 credit, cache it.
-/// - Stale + budget exhausted → fall back to the most recent stale cache (or no news).
-///
-/// Returns the `news` JSON object (or None). NEWSDATA_API_KEY comes from the environment (k8s secret).
-async fn get_news_context_cached(
-    pool: &sqlx::PgPool,
-    journal: &Arc<JournalWriter>,
-    client: &reqwest::Client,
-    gamma_id: &str,
-    slug: &str,
-) -> Option<serde_json::Value> {
-    const TTL: &str = "2 hours";
-    const DAILY_CAP: i64 = 180;
-
-    // 1. Fresh cache?
-    let fresh: Option<serde_json::Value> = sqlx::query_scalar(
-        "SELECT payload->'news' FROM journal.events
-         WHERE event_type = 'news_cache' AND payload->>'market_id' = $1
-           AND created_at > now() - interval '2 hours'
-         ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(gamma_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-    if let Some(n) = fresh {
-        if n.is_object() {
-            return Some(n);
-        }
-    }
-
-    let api_key = std::env::var("NEWSDATA_API_KEY").unwrap_or_default();
-    if api_key.trim().is_empty() {
-        return None;
-    }
-
-    // 2. Daily budget: each news_cache write == 1 credit spent. Stay under the 200/day free cap.
-    let used_today: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM journal.events WHERE event_type = 'news_cache' AND created_at > now() - interval '24 hours'",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
-
-    if used_today >= DAILY_CAP || crate::strategy::news_fetch_in_cooldown() {
-        // Budget exhausted (or the provider 429'd recently — the journal-count budget can't see
-        // failed fetches, so without this check an exhausted quota gets retry-hammered every
-        // cycle) — reuse the most recent stale cache rather than spend a credit.
-        let stale: Option<serde_json::Value> = sqlx::query_scalar(
-            "SELECT payload->'news' FROM journal.events
-             WHERE event_type = 'news_cache' AND payload->>'market_id' = $1
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(gamma_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-        return stale.filter(|n| n.is_object());
-    }
-
-    // 3. Fetch (1 credit) + cache.
-    // Placeholder slugs ("untitled-market-1-<ts>") carry no topic, so the query built from them is
-    // literally "untitled market" — a wasted metered credit that returns publishing-trade headlines
-    // and feeds them to news_sentiment. Pull the real `question` for those (rare: 2 markets live on
-    // 2026-08-01, both held) rather than plumbing it through the whole DR row for every market.
-    let query = if crate::strategy::is_placeholder_slug(slug) {
-        let question: Option<String> =
-            sqlx::query_scalar("SELECT question FROM market_data.markets WHERE gamma_id = $1")
-                .bind(gamma_id)
-                .fetch_optional(pool)
-                .await
-                .ok()
-                .flatten();
-        crate::strategy::newsdata_query_with_question(slug, question.as_deref().unwrap_or(""))
-    } else {
-        crate::strategy::newsdata_query(slug)
-    };
-    let (count, polarity, titles) =
-        crate::strategy::fetch_newsdata_news(client, api_key.trim(), &query).await?;
-    let news = serde_json::json!({
-        "query": query,
-        "headline_count": count,
-        "polarity": polarity.to_string(),
-        "top_titles": titles,
-        "provider": "newsdata.io",
-    });
-    let _ = journal
-        .record_journal_event(
-            "news_cache",
-            "newsdata_fetch",
-            "info",
-            serde_json::json!({
-                "market_id": gamma_id,
-                "ttl": TTL,
-                "credits_used_today_before": used_today,
-                "news": news,
-            }),
-        )
-        .await;
-    Some(news)
 }
 
 /// Recent absolute price move for an outcome: |current_mid − oldest_mid| over the last ~3h of

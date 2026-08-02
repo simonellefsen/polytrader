@@ -244,16 +244,13 @@ spec:
             # passes the 20% per-market cap individually, but together they are one giant correlated bet.
             - name: POLYTRADER_MAX_CLUSTER_EXPOSURE_PCT
               value: "0.35"
-            # External advisory signals: Yahoo Finance spot (asset markets) + newsdata.io news
-            # headline sentiment, fed into FusionEngine as low-confidence advisory inputs.
-            - name: POLYTRADER_EXTERNAL_SIGNALS
-              value: "on"
-            # newsdata.io API key (free plan, 200 credits/day — usage is cached + budget-capped).
-            - name: NEWSDATA_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: polytrader-newsdata
-                  key: NEWSDATA_API_KEY
+            # POLYTRADER_EXTERNAL_SIGNALS and NEWSDATA_API_KEY were removed 2026-08-02 with the
+            # yahoo_finance / news_sentiment processors. They were structurally incapable of
+            # earning: the advisory cap means an external signal can never originate a trade and
+            # never flip a direction, only tilt one a market-internal signal already found — and
+            # directional is a 1-trade/day control arm while the arb executors that earn all the
+            # P&L read no signals at all. The `polytrader-newsdata` Secret is now unreferenced and
+            # can be deleted from the cluster whenever convenient.
             # READ-ONLY real CLOB access: lets the fail-closed shadow pipeline validate would-be
             # orders against real account/market state (balance, allowance, tick size). No writes.
             # Real ORDER submission stays gated separately (ENABLE_REAL_ORDER_SUBMISSION, unset).

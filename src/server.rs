@@ -1090,13 +1090,13 @@ fn signal_health(baseline_pct: Decimal, recent_pct: Decimal, recent_n: usize) ->
 /// signal's* baseline — theta was compared against a dead signal (permanent bogus "elevated"),
 /// yahoo against theta's baseline ("degraded"), news against yahoo's ("dormant"). All three badges
 /// on the live dashboard were artifacts, and the one instrument built to catch a silently-dying
-/// signal was itself lying. Generating the columns makes that class of drift unrepresentable.
-pub(crate) const SCORECARD_SIGNALS: [&str; 5] = [
+/// signal was itself lying. Generating the columns makes that class of drift unrepresentable —
+/// retiring `yahoo_finance` and `news_sentiment` on 2026-08-02 was a one-line edit here, and the
+/// SQL, the array width and the positional indexing all followed automatically.
+pub(crate) const SCORECARD_SIGNALS: [&str; 3] = [
     "orderbook_momentum",
     "spike_divergence",
     "theta_convergence",
-    "yahoo_finance",
-    "news_sentiment",
 ];
 
 /// One `count(*) FILTER (…)` column per scorecard signal, in `SCORECARD_SIGNALS` order.
@@ -1448,8 +1448,6 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     let config_json = serde_json::json!({
         "risk": risk_cfg.to_json(),
         "autonomous_paper_execution": env_flag("POLYTRADER_AUTONOMOUS_PAPER_EXECUTION")
-            .map(|v| v.to_lowercase() == "on").unwrap_or(false),
-        "external_signals": env_flag("POLYTRADER_EXTERNAL_SIGNALS")
             .map(|v| v.to_lowercase() == "on").unwrap_or(false),
         "ingest_interval_secs": ingest_interval_secs.to_string(),
         "decision_cadence_secs": "300",
@@ -2360,8 +2358,6 @@ function renderParams(c){
       "Total markets in the scan universe. Arb-only markets (sports) are never traded directionally — only risk-free YES+NO arbitrage. More markets = wider opportunity funnel (sizing/risk unchanged)."],
     ["Autonomous execution", onoff(c.autonomous_paper_execution),
       "When on, passing decisions automatically place Kelly-sized PAPER orders. When off, the system only evaluates and journals — no positions are opened."],
-    ["External signals", onoff(c.external_signals),
-      "When on, Yahoo Finance spot + news-headline sentiment feed the fusion engine as low-confidence advisory inputs (capped influence). When off, only market-internal signals are used."],
     ["Real orders", '<span class="neg">disabled</span>',
       "Real-money order dispatch. Structurally disabled in this build — only a fail-closed sender is wired, behind a proven + funded + operator-approved gate. Nothing is ever sent to the live exchange."],
   ];
@@ -2497,7 +2493,7 @@ async function load() {
   document.getElementById("positions").innerHTML = pos.length ? `<table>
     <tr><th>Market</th><th>Side</th><th>Shares</th><th>Avg entry</th><th>Current</th><th>Locked</th><th>Unrealized</th></tr>
     ${pos.map(r => `<tr>
-      <td title="${fmt(r.question)}">${fmt(r.slug||r.market_id)}</td>
+      <td title="${fmt(r.slug||r.market_id)}">${fmt(r.question||r.slug||r.market_id)}</td>
       <td>${fmt(r.outcome)}</td>
       <td>${num(r.shares)}</td>
       <td>${num(r.avg_entry_price)}</td>
@@ -2756,22 +2752,9 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
     .unwrap_or_default();
     let dr_map: HashMap<String, serde_json::Value> = dr_rows.into_iter().collect();
 
-    let news_rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
-        "SELECT m.gamma_id, latest.news
-         FROM market_data.markets m
-         CROSS JOIN LATERAL (
-             SELECT payload->'news' AS news FROM journal.events
-             WHERE event_type = 'news_cache' AND payload->>'market_id' = m.gamma_id
-             ORDER BY created_at DESC LIMIT 1
-         ) latest
-         WHERE m.updated_at > now() - interval '2 hours'
-            OR EXISTS (SELECT 1 FROM paper_trading.paper_positions p
-                        WHERE p.market_id = m.gamma_id AND p.shares > 0)",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-    let news_map: HashMap<String, serde_json::Value> = news_rows.into_iter().collect();
+    // The news_cache fan-out that used to sit here went with the news_sentiment signal
+    // (2026-08-02) — nothing writes that event type any more, so it was a per-render index scan
+    // that could only ever return rows for markets last seen before the retirement.
 
     let pos_rows: Vec<(String, String, Decimal, Decimal)> = sqlx::query_as(
         "SELECT market_id, outcome, shares, avg_entry_price FROM paper_trading.paper_positions WHERE shares > 0",
@@ -2909,7 +2892,6 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
                 "resolved_outcome": resolved,
                 "held": position.is_some(),
                 "signal": signal,
-                "news": news_map.get(&gid),
                 "position": position,
                 "awaiting_hours": awaiting_hours.map(|h| format!("{h:.0}")),
                 "end_date": end_date.map(|d| d.format("%Y-%m-%d %H:%MZ").to_string()),
@@ -2971,12 +2953,7 @@ fn render_board_page(prefix: &str) -> String {
   .bar .no { background:#6e2620; display:flex; align-items:center; justify-content:flex-end; padding:0 7px; color:#fff; flex:1; white-space:nowrap; }
   .sig { font-size:12px; color:#8b949e; }
   .chip { font-size:11px; padding:1px 7px; border-radius:10px; border:1px solid #1f6feb55; color:#58a6ff; }
-  .chip.fade { color:#f0883e; border-color:#bb540955; }
-  .chip.news { color:#56d364; border-color:#23863655; }
-  .chip.yahoo { color:#79c0ff; border-color:#1f6feb55; }
   .edge.pos { color:#3fb950; } .edge.neg { color:#f85149; } .muted { color:#8b949e; }
-  .news { font-size:12px; color:#8b949e; border-top:1px solid #21262d; padding-top:8px; }
-  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; vertical-align:middle; }
   .empty { color:#8b949e; padding:24px; text-align:center; }
   footer { color:#8b949e; font-size:12px; padding:8px 24px 24px; max-width:1240px; margin:0 auto; }
 </style></head>
@@ -2997,8 +2974,10 @@ const PREFIX = "__PREFIX__";
 const fmt=(v)=>v==null?"—":v;
 const pct=(v)=>{const n=parseFloat(v); return isNaN(n)?null:Math.round(n*1000)/10;};
 const edgeCls=(v)=>{const n=parseFloat(v); return n>0?"pos":(n<0?"neg":"muted");};
-const chipCls=(n)=>n.includes("fade")?"fade":(n.includes("news")?"news":(n.includes("yahoo")?"yahoo":""));
-const polDot=(p)=>{const n=parseFloat(p); if(isNaN(n))return"#8b949e"; return n>0.15?"#3fb950":(n<-0.15?"#f85149":"#8b949e");};
+// All three branches this used to have are gone: "fade" died with overreaction_fade
+// (2026-06-29) and was dead CSS for a month, "news"/"yahoo" with the external signals
+// (2026-08-02). Every remaining signal is market-internal and shares the default chip style.
+const chipCls=()=>"";
 
 async function load(){
   let d; try { d = await (await fetch(PREFIX+"/board/data",{cache:"no-store"})).json(); }
@@ -3014,7 +2993,7 @@ async function load(){
   const cards = all.map(m => {
     const yes = pct(m.yes), no = pct(m.no);
     const haveBar = yes!=null && no!=null;
-    const sig = m.signal, pos = m.position, news = m.news;
+    const sig = m.signal, pos = m.position;
     const firedChips = (sig&&sig.fired||[]).map(f=>`<span class="chip ${chipCls(f.name)}">${f.name.replace(/_/g,' ')} ${f.score}</span>`).join(" ");
     // A held market past its own end date is NOT live — it is parked waiting on Polymarket to close
     // it and on a UMA proposer to post an outcome. Rendering it as LIVE (which the board did until
@@ -3057,7 +3036,6 @@ async function load(){
         <span class="spacer"></span>${firedChips||'<span class="muted">no signal fired</span>'}
       </div>`:'<div class="sig muted" title="Decision reports are capped at 40 markets per 5-min cycle (DR_MARKET_LIMIT), prioritising the directional universe + bootstrap list. ~5.5k markets are DR-eligible, so most never get one — this is our own throughput cap, not a Polymarket delay. Arb-only markets never need a DR.">not in the decision-report pool</div>'}
       ${posLine}
-      ${news?`<div class="news"><span class="dot" style="background:${polDot(news.polarity)}"></span>news ${fmt(news.headline_count)} headlines · polarity ${fmt(news.polarity)}${(news.top_titles&&news.top_titles[0])?` — <span class="muted">${news.top_titles[0]}</span>`:''}</div>`:''}
     </div>`;
   }).join("");
   document.getElementById("grid").innerHTML = cards || `<div class="empty">No markets ingested yet.</div>`;
