@@ -1244,6 +1244,17 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     // virtual_usdc+locked, the same denominator the risk gate uses). Surface the count plus how much of
     // that exposure budget is used, so the operator can see headroom at a glance.
     let open_positions = positions.len();
+    // Reset-boundary filter, same rule as write_mark_to_market_snapshot: summing LIFETIME fees
+    // would charge the fresh seed for pre-reset execution.
+    let fees_paid: Decimal = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(fee), 0) FROM paper_trading.paper_fills
+         WHERE created_at >= COALESCE(
+           (SELECT max(as_of) FROM paper_trading.virtual_portfolio_snapshots
+            WHERE snapshot_reason = 'manual_paper_reset'), '-infinity'::timestamptz)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(Decimal::ZERO);
     let risk_cfg = crate::risk::RiskConfig::from_env();
     let portfolio_json = match portfolio {
         Some((usdc, locked, _unreal, realized, as_of)) => {
@@ -1264,6 +1275,11 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
                 "max_total_exposure": max_total_exposure.to_string(),
                 "exposure_pct": exposure_pct.to_string(),
                 "max_position_usdc": risk_cfg.max_position_usdc.to_string(),
+                // Cumulative fee drag since the last reset. write_mark_to_market_snapshot has
+                // computed this figure all along and folded it into cash without ever showing it,
+                // so the one number that says what execution COSTS was invisible while realized
+                // P&L (which is already net of it) was front and centre.
+                "fees_paid": fees_paid.round_dp(2).to_string(),
                 "as_of": as_of.to_rfc3339(),
             })
         }
@@ -1929,10 +1945,11 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
                  multi-day GRADUAL decay the 3h-vs-24h check is blind to — the 24h baseline erodes with \
                  the signal). Both: 'degraded' = fire-rate more than halved, 'dormant' = went silent, \
                  'elevated' = doubled, 'insufficient_data' = too few reports to judge. Raw score is the \
-                 average |score| BEFORE the advisory domination cap (2026-07-13) — for news_sentiment/ \
-                 yahoo_finance this overstates real sway on the fused decision, since fuse_named bounds \
-                 their actual contribution to at most the market-internal numerator's magnitude; Weight \
-                 (Hermes's learned trust) is the more honest read of real influence post-cap. Settled \
+                 average |score| BEFORE the advisory domination cap (2026-07-13). Every remaining \
+                 signal is market-internal, so the cap no longer distorts this column — the two \
+                 advisory signals it used to overstate (news_sentiment, yahoo_finance) were retired \
+                 2026-08-02. Weight (Hermes's learned trust) is still the better read of real \
+                 influence. Settled \
                  record = win/loss of settled markets where the signal fired in the final decision \
                  report (count-based, overlapping). Realized P&L populates at 10 settled.",
     });
@@ -2319,7 +2336,7 @@ function renderSignals(s){
     </tr>`;
   };
   el.innerHTML = `<table>
-    <tr><th>Signal</th><th title="Share of recent decision reports where this signal contributed a non-zero score">Fire rate</th><th title="Average absolute RAW score when it fires, BEFORE the advisory domination cap (2026-07-13). For news_sentiment/yahoo_finance this OVERSTATES real influence on the fused decision — their raw score can run far above market-internal signals, but fuse_named bounds their actual contribution to at most the market-internal numerator's magnitude. Compare against Weight (Hermes's learned trust), not this column, to judge real sway.">Raw score</th><th title="Hermes's current confidence multiplier (1.00× = neutral)">Weight</th><th title="Win-loss record of settled markets (by net realized P&amp;L) where this signal fired in the final decision report. Available now, independent of Hermes.">Settled record</th><th title="Realized P&amp;L attributed to this signal (Hermes proportional split); populates at 10 settled">Settled P&amp;L</th></tr>
+    <tr><th>Signal</th><th title="Share of recent decision reports where this signal contributed a non-zero score">Fire rate</th><th title="Average absolute RAW score when it fires. This used to overstate influence for the two advisory signals (news_sentiment, yahoo_finance), whose raw scores ran far above market-internal ones while the domination cap bounded their real contribution — both were retired 2026-08-02, so every signal here is now market-internal and uncapped. Weight (Hermes's learned trust) remains the better read of real sway.">Raw score</th><th title="Hermes's current confidence multiplier (1.00× = neutral)">Weight</th><th title="Win-loss record of settled markets (by net realized P&amp;L) where this signal fired in the final decision report. Available now, independent of Hermes.">Settled record</th><th title="Realized P&amp;L attributed to this signal (Hermes proportional split); populates at 10 settled">Settled P&amp;L</th></tr>
     ${s.rows.map(row).join("")}
   </table>
   <div class="t" style="padding:8px 2px;">${s.note||""}</div>`;
@@ -2470,6 +2487,7 @@ async function load() {
     ["Locked", "$" + fmt(p.total_locked)],
     ["Realized P&L", "$" + fmt(p.realized_pnl)],
     ["Unrealized P&L", "$" + fmt(p.live_unrealized_pnl)],
+    ["Fees paid", "$" + fmt(p.fees_paid), "since last reset · already net of realized"],
     ["Open positions", (p.open_positions ?? "—") + "", "≤ $" + fmt(p.max_position_usdc) + " each"],
     ["Exposure used", (p.exposure_pct ?? "0") + "%", "$" + fmt(p.total_locked) + " / $" + fmt(p.max_total_exposure) + " cap"],
   ];
@@ -2686,6 +2704,8 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
         bool,
         Option<String>,
         Option<chrono::DateTime<chrono::Utc>>,
+        Option<Decimal>,
+        Option<Decimal>,
     );
     let markets: Vec<MktRow> = sqlx::query_as(
         // end_date drives the AWAITING RESOLUTION badge: a held market past its end date is not
@@ -2712,7 +2732,8 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
         "SELECT m.gamma_id, m.slug, m.question, m.category, m.last_mid_yes, m.last_mid_no,
                 m.active, m.closed, m.resolved_outcome,
                 CASE WHEN m.raw_json->>'end_date' ~ '^\\d{4}-\\d{2}-\\d{2}T'
-                     THEN (m.raw_json->>'end_date')::timestamptz END AS end_date
+                     THEN (m.raw_json->>'end_date')::timestamptz END AS end_date,
+                m.taker_fee_rate, m.rewards_daily_rate
          FROM market_data.markets m
          WHERE m.updated_at > now() - interval '2 hours'
             OR EXISTS (SELECT 1 FROM paper_trading.paper_positions p
@@ -2779,7 +2800,7 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
     const SIGNALS: [&str; SCORECARD_SIGNALS.len()] = SCORECARD_SIGNALS;
     let out: Vec<serde_json::Value> = markets
         .into_iter()
-        .map(|(gid, slug, question, db_category, my, mn, active, closed, resolved, end_date)| {
+        .map(|(gid, slug, question, db_category, my, mn, active, closed, resolved, end_date, fee_rate, rewards_rate)| {
             let category = db_category.unwrap_or_else(|| classify_category(&slug, &question).to_string());
             let signal = dr_map.get(&gid).map(|dr| {
                 let attr = dr.pointer("/report/attribution");
@@ -2894,6 +2915,12 @@ async fn board_data_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
                 "signal": signal,
                 "position": position,
                 "awaiting_hours": awaiting_hours.map(|h| format!("{h:.0}")),
+                // Both were already in the DB and invisible on the board. The fee rate is what
+                // moves the negRisk arb line (a fee-free market's bar really is 1.00, a 7% one's is
+                // ~1.05), so a card that shows a price without it hides why a basket was declined.
+                // rewards_daily_rate is the maker-rewards budget — see the shadow scan.
+                "fee_rate": fee_rate.map(|r| r.round_dp(4).to_string()),
+                "rewards_daily": rewards_rate.map(|r| r.round_dp(0).to_string()),
                 "end_date": end_date.map(|d| d.format("%Y-%m-%d %H:%MZ").to_string()),
             })
         })
@@ -2946,6 +2973,8 @@ fn render_board_page(prefix: &str) -> String {
   /* Parked, not live: past end date, waiting on Polymarket/UMA. Deliberately not red — this is a
      normal state that routinely runs days, not a fault. */
   .tag.await { color:#a371f7; border-color:#8957e555; }
+  .tag.free { color:#3fb950; border-color:#23863655; }
+  .tag.rw { color:#d29922; border-color:#9e6a0355; }
   .tag.won { color:#3fb950; border-color:#23863655; }
   .tag.lost { color:#f85149; border-color:#da363355; }
   .bar { height:22px; border-radius:6px; overflow:hidden; display:flex; font-size:11px; font-weight:600; }
@@ -2999,6 +3028,16 @@ async function load(){
     // it and on a UMA proposer to post an outcome. Rendering it as LIVE (which the board did until
     // 2026-08-01) makes an on-schedule wait look like a stuck position. Nothing on our side gates
     // this; settlement fires as soon as Gamma reports closed + a resolved outcome.
+    // Fee rate drives the arb line, so a card showing a price without it hides why a basket was
+    // declined: on a fee-free market the buy-all-No bar really is 1.00, on a 7% one it is ~1.05.
+    // FREE is called out in green because those are the events where an arb can actually clear.
+    const feeR = m.fee_rate!=null ? parseFloat(m.fee_rate) : null;
+    const feeTag = feeR==null ? ''
+      : (feeR === 0 ? `<span class="tag free" title="feesEnabled:false — no taker fee. The buy-all-No arb line here is exactly 1.00, which is why the negRisk completion budget prioritises these events.">FEE FREE</span>`
+                    : `<span class="tag" title="Polymarket taker fee rate. Fee = rate x shares x p x (1-p), so it peaks at p=0.50. This is what lifts the negRisk arb line above 1.00.">fee ${(feeR*100).toFixed(1)}%</span>`);
+    // Maker liquidity-rewards budget. Shadow-scanned only — nothing rests orders today.
+    const rw = m.rewards_daily!=null ? parseFloat(m.rewards_daily) : null;
+    const rewardTag = rw ? `<span class="tag rw" title="Polymarket pays this per day to orders RESTING in this book, whether or not they fill. Shared across all qualifying makers, so the capturable share depends on competing depth near the mid — see the maker_rewards_scan journal. We place no maker orders today.">rewards $${rw}/d</span>` : '';
     const awaitingH = m.awaiting_hours!=null ? parseInt(m.awaiting_hours,10) : null;
     const awaitingLbl = awaitingH==null ? '' : (awaitingH < 48 ? `${awaitingH}h` : `${Math.floor(awaitingH/24)}d`);
     const statusTag = m.resolved_outcome ? `<span class="tag ${ (pos&&pos.outcome===m.resolved_outcome)?'won': (pos?'lost':'') }">RESOLVED · ${fmt(m.resolved_outcome)}</span>`
@@ -3028,6 +3067,8 @@ async function load(){
         ${m.category?`<span class="tag cat">${m.category}</span>`:''}
         ${statusTag}
         ${holdTag}
+        ${feeTag}
+        ${rewardTag}
       </div>
       ${haveBar?`<div class="bar"><div class="yes" style="width:${yes}%">YES ${yes}%</div><div class="no">${no}% NO</div></div>`:'<div class="muted">no orderbook yet</div>'}
       ${sig?`<div class="sig row">
