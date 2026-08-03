@@ -2055,6 +2055,63 @@ async fn trades_page_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     Html(render_trades_page(&prefix))
 }
 
+/// One nav bar, used by every page. Before this it was written out three times — once per page,
+/// in three different syntaxes (CSS classes on the board page, fully inline `style=` on trades,
+/// and a Rust `format!` spliced into raw HTML on the now-deleted Console) — so adding a tab meant
+/// a three-file, three-syntax edit, and the styles had already drifted apart (compare `nav a` vs
+/// the old inline `padding:5px 12px;border-radius:7px;font-size:13px;`, which happened to still
+/// match by coincidence, not by construction). `active` is the tab's own `TABS` label.
+struct NavTab {
+    label: &'static str,
+    href_suffix: &'static str,
+}
+const TABS: &[NavTab] = &[
+    NavTab {
+        label: "Markets",
+        href_suffix: "",
+    },
+    NavTab {
+        label: "Trades",
+        href_suffix: "/trades",
+    },
+];
+fn nav_html(active: &str) -> String {
+    let links: String = TABS
+        .iter()
+        .map(|t| {
+            let href = if t.href_suffix.is_empty() {
+                "__ROOT__".to_string()
+            } else {
+                format!("__PREFIX__{}", t.href_suffix)
+            };
+            let cls = if t.label == active {
+                " class=\"active\""
+            } else {
+                ""
+            };
+            format!(r#"<a href="{href}"{cls}>{}</a>"#, t.label)
+        })
+        .collect();
+    format!(r#"<nav>{links}</nav>"#)
+}
+
+/// CSS rules that mean the same thing on every page — NOT the page-specific ones. `.card`, `.pos`
+/// and `.tag` are deliberately excluded: `.pos` alone means *unrealized-gain green text* on the
+/// trades page and *the whole position-row container* on the board page, so folding them into one
+/// shared block would be a silent behavior change dressed up as deduplication, not real sharing.
+const SHELL_CSS: &str = r##"
+  :root { color-scheme: dark; }
+  body { margin:0; background:#0d1117; color:#e6edf3; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:14px 24px; border-bottom:1px solid #21262d; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; }
+  nav { display:flex; gap:4px; margin-left:auto; }
+  nav a { color:#8b949e; text-decoration:none; padding:5px 12px; border-radius:7px; font-size:13px; }
+  nav a:hover { background:#161b22; color:#e6edf3; }
+  nav a.active { background:#1f6feb22; color:#58a6ff; }
+  .muted { color:#8b949e; }
+  .empty { color:#8b949e; padding:18px; text-align:center; }
+"##;
+
 /// Render the self-contained trades dashboard HTML. `__PREFIX__` placeholders are replaced with the
 /// subpath prefix so fetches resolve under reverse-proxy deployments. (No format! to avoid escaping
 /// every brace in the embedded CSS/JS.)
@@ -2066,10 +2123,7 @@ fn render_trades_page(prefix: &str) -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Polytrader — Paper Trades</title>
 <style>
-  :root { color-scheme: dark; }
-  body { margin:0; background:#0d1117; color:#e6edf3; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; }
-  header { padding:16px 24px; border-bottom:1px solid #21262d; display:flex; align-items:center; gap:12px; }
-  h1 { font-size:18px; margin:0; }
+__SHELL_CSS__
   .badge { background:#1f6feb22; color:#58a6ff; border:1px solid #1f6feb55; padding:2px 8px; border-radius:12px; font-size:12px; }
   .paper { background:#23863622; color:#3fb950; border-color:#23863655; }
   main { padding:24px; max-width:1100px; margin:0 auto; }
@@ -2082,10 +2136,12 @@ fn render_trades_page(prefix: &str) -> String {
   th,td { text-align:left; padding:8px 12px; border-bottom:1px solid #21262d; font-variant-numeric:tabular-nums; }
   th { color:#8b949e; font-weight:500; font-size:12px; }
   tr:last-child td { border-bottom:none; }
-  .pos { color:#3fb950; } .neg { color:#f85149; } .muted { color:#8b949e; }
+  /* This .pos means unrealized-gain GREEN TEXT (a color utility class), unlike the board page's
+     .pos, which is a position-ROW CONTAINER — same name, incompatible meanings, which is exactly
+     why it stayed out of SHELL_CSS above. */
+  .pos { color:#3fb950; } .neg { color:#f85149; }
   .pill { font-size:11px; padding:1px 7px; border-radius:10px; border:1px solid #30363d; }
   .arb { color:#d2a8ff; border-color:#8957e555; } .dir { color:#58a6ff; border-color:#1f6feb55; }
-  .empty { color:#8b949e; padding:18px; text-align:center; }
   .chartbox { background:#161b22; border:1px solid #21262d; border-radius:8px; padding:10px 12px; }
   .chartbox svg { display:block; width:100%; height:auto; }
   .t { color:#8b949e; font-size:12px; }
@@ -2098,10 +2154,7 @@ fn render_trades_page(prefix: &str) -> String {
   <span class="badge paper">PAPER ONLY</span>
   <span class="badge" id="updated">loading…</span>
   <span class="badge" id="llm" title="Hermes AI model health">AI: …</span>
-  <nav style="display:flex;gap:4px;margin-left:auto;">
-    <a href="__ROOT__" style="color:#8b949e;text-decoration:none;padding:5px 12px;border-radius:7px;font-size:13px;">Markets</a>
-    <a href="__PREFIX__/trades" style="background:#1f6feb22;color:#58a6ff;text-decoration:none;padding:5px 12px;border-radius:7px;font-size:13px;">Trades</a>
-  </nav>
+  __NAV__
 </header>
 <main>
   <div class="cards" id="cards"></div>
@@ -2584,7 +2637,10 @@ setInterval(load, 15000);
 </body>
 </html>"##;
     let root = if prefix.is_empty() { "/" } else { prefix };
-    PAGE.replace("__PREFIX__", prefix).replace("__ROOT__", root)
+    PAGE.replace("__SHELL_CSS__", SHELL_CSS)
+        .replace("__NAV__", &nav_html("Trades"))
+        .replace("__PREFIX__", prefix)
+        .replace("__ROOT__", root)
 }
 
 /// Slug/question-derived category (Gamma doesn't tag these markets — category is always null there).
@@ -2947,20 +3003,16 @@ fn render_board_page(prefix: &str) -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Polytrader — Markets</title>
 <style>
-  :root { color-scheme: dark; }
-  body { margin:0; background:#0d1117; color:#e6edf3; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; }
-  header { padding:14px 24px; border-bottom:1px solid #21262d; display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
-  h1 { font-size:18px; margin:0; }
+__SHELL_CSS__
   .badge { background:#23863622; color:#3fb950; border:1px solid #23863655; padding:2px 8px; border-radius:12px; font-size:12px; }
-  nav { display:flex; gap:4px; margin-left:auto; }
-  nav a { color:#8b949e; text-decoration:none; padding:5px 12px; border-radius:7px; font-size:13px; }
-  nav a:hover { background:#161b22; color:#e6edf3; }
-  nav a.active { background:#1f6feb22; color:#58a6ff; }
   main { padding:20px; max-width:1240px; margin:0 auto; }
   .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(360px,1fr)); gap:14px; }
   .card { background:#161b22; border:1px solid #21262d; border-radius:10px; padding:14px 16px; display:flex; flex-direction:column; gap:10px; }
   .card.resolved { opacity:.72; }
   .card.held { border-color:#bb8009; box-shadow:0 0 0 1px #bb800955, 0 0 16px #bb800922; }
+  /* This .pos means the whole POSITION-ROW CONTAINER, unlike the trades page's .pos, which is a
+     GREEN-TEXT color utility — same name, incompatible meanings, which is exactly why it stayed
+     out of SHELL_CSS above. */
   .pos { font-size:12px; border-top:1px solid #21262d; padding-top:8px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   .pos .lbl { color:#e3b341; font-weight:600; }
   .pnl.pos2 { color:#3fb950; } .pnl.neg2 { color:#f85149; }
@@ -2982,8 +3034,7 @@ fn render_board_page(prefix: &str) -> String {
   .bar .no { background:#6e2620; display:flex; align-items:center; justify-content:flex-end; padding:0 7px; color:#fff; flex:1; white-space:nowrap; }
   .sig { font-size:12px; color:#8b949e; }
   .chip { font-size:11px; padding:1px 7px; border-radius:10px; border:1px solid #1f6feb55; color:#58a6ff; }
-  .edge.pos { color:#3fb950; } .edge.neg { color:#f85149; } .muted { color:#8b949e; }
-  .empty { color:#8b949e; padding:24px; text-align:center; }
+  .edge.pos { color:#3fb950; } .edge.neg { color:#f85149; }
   footer { color:#8b949e; font-size:12px; padding:8px 24px 24px; max-width:1240px; margin:0 auto; }
 </style></head>
 <body>
@@ -2991,10 +3042,7 @@ fn render_board_page(prefix: &str) -> String {
   <h1>Polytrader — Markets</h1>
   <span class="badge">PAPER</span>
   <span class="tag" id="updated">loading…</span>
-  <nav>
-    <a href="__ROOT__" class="active">Markets</a>
-    <a href="__PREFIX__/trades">Trades</a>
-  </nav>
+  __NAV__
 </header>
 <main><div class="grid" id="grid"></div></main>
 <footer>Auto-refreshes every 15s · live public Polymarket data · all trading simulated, no real orders.</footer>
@@ -3085,7 +3133,10 @@ load(); setInterval(load, 15000);
 </script>
 </body></html>"##;
     let root = if prefix.is_empty() { "/" } else { prefix };
-    PAGE.replace("__PREFIX__", prefix).replace("__ROOT__", root)
+    PAGE.replace("__SHELL_CSS__", SHELL_CSS)
+        .replace("__NAV__", &nav_html("Markets"))
+        .replace("__PREFIX__", prefix)
+        .replace("__ROOT__", root)
 }
 
 async fn paper_rejections_handler(
@@ -5754,6 +5805,62 @@ async fn record_journal_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shared_nav_marks_exactly_one_tab_active_and_uses_the_full_prefix_placeholder() {
+        // The nav used to be written out three times in three syntaxes and had already drifted.
+        // This exercises the one function that replaced them: exactly one tab carries `active`,
+        // the other tabs are plain links, and hrefs use the SAME placeholder tokens the page-level
+        // .replace() calls fill in — a typo here would silently ship a dead link.
+        let trades_nav = nav_html("Trades");
+        assert_eq!(trades_nav.matches("class=\"active\"").count(), 1);
+        assert!(trades_nav.contains(r#"<a href="__ROOT__">Markets</a>"#));
+        assert!(trades_nav.contains(r#"<a href="__PREFIX__/trades" class="active">Trades</a>"#));
+
+        let markets_nav = nav_html("Markets");
+        assert_eq!(markets_nav.matches("class=\"active\"").count(), 1);
+        assert!(markets_nav.contains(r#"<a href="__ROOT__" class="active">Markets</a>"#));
+    }
+
+    #[test]
+    fn an_unknown_active_tab_marks_nothing_rather_than_guessing() {
+        // A typo'd tab name (e.g. a future page passing "trades" lowercase) must not silently mark
+        // the wrong tab, or no tab, as active without being obvious about it — asserting zero
+        // matches here is what makes that failure mode visible in a test rather than on the page.
+        assert_eq!(
+            nav_html("nonexistent").matches("class=\"active\"").count(),
+            0
+        );
+    }
+
+    #[test]
+    fn both_rendered_pages_are_free_of_leftover_placeholder_tokens() {
+        // The whole point of the __SHELL_CSS__ / __NAV__ / __PREFIX__ / __ROOT__ tokens is that
+        // every one of them gets filled before the HTML reaches a browser. A missed `.replace()`
+        // call would ship the literal token text onto the page — this is the check that would
+        // have caught the "Trades" hardcoded into both call sites during this refactor.
+        for page in [render_trades_page(""), render_board_page("")] {
+            for token in ["__SHELL_CSS__", "__NAV__", "__PREFIX__", "__ROOT__"] {
+                assert!(
+                    !page.contains(token),
+                    "leftover placeholder {token} in rendered page"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_page_marks_its_own_tab_active_not_the_others() {
+        let trades = render_trades_page("");
+        let board = render_board_page("");
+        // Structural check via the surrounding nav markup, not a raw substring match — "Trades"
+        // and "Markets" both appear elsewhere on each page (titles, headings), so asserting on the
+        // exact active-anchor tag is what actually pins which tab is highlighted.
+        assert!(trades.contains(r#"href="/trades" class="active">Trades</a>"#));
+        assert!(!trades.contains(r#"href="/" class="active">Markets</a>"#));
+        assert!(board.contains(r#"href="/" class="active">Markets</a>"#));
+        assert!(!board.contains(r#"href="/trades" class="active">Trades</a>"#));
+    }
 
     #[test]
     fn the_seven_day_baseline_query_has_exactly_one_column_per_scorecard_signal() {
