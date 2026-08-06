@@ -1955,9 +1955,16 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     });
 
     let gate_simulation = serde_json::json!({
-        "note": "One live run, two gates. 'Lenient' is the active gate (all fills); 'Strict' is the \
-                 shadow subset that also clears the stricter edge — i.e. how a tighter gate would have \
-                 done on the same data.",
+        "note": "DIRECTIONAL ENTRIES ONLY. The min-net-edge gate governs the 5-min decision-report \
+                 executor and nothing else, so arb settlements are deliberately excluded — they are \
+                 the large majority of P&L (86% negRisk baskets + 8% two-leg arb vs 6% directional, \
+                 measured 2026-08-06), and none of it passed through this gate. Read these totals as \
+                 'how the directional control arm did', never as a system-wide record. The settled \
+                 win rate in particular is close to uninformative: the directional arm buys \
+                 near-certainties (76 of 76 entries since the last reset were at $0.99), so ~99% win \
+                 by construction at about a cent per share. One live run, two gates: 'Lenient' is the \
+                 active gate (all directional fills); 'Strict' is the shadow subset that also clears \
+                 the stricter edge — i.e. how a tighter gate would have done on the same data.",
         "lenient": band_json("Lenient (live)", risk_cfg.min_net_edge.to_string(), len_n, len_not, len_unr, len_real, len_settled, len_wins),
         "strict": band_json("Strict (shadow)", shadow_threshold.to_string(), str_n, str_not, str_unr, str_real, str_settled, str_wins),
     });
@@ -2164,7 +2171,7 @@ __SHELL_CSS__
   <div id="pnl-chart" class="chartbox"><div class="empty">loading P&amp;L history…</div></div>
   <h2>Signal Scorecard <span class="pill" id="signals-window"></span></h2>
   <div id="signals"></div>
-  <h2>Gate Simulation <span class="pill dir" id="gatesim-edges"></span></h2>
+  <h2>Gate Simulation <span class="pill" style="border-color:#8957e555;color:#a371f7">directional only</span> <span class="pill dir" id="gatesim-edges"></span></h2>
   <div id="gatesim"></div>
   <h2>Parameters <span class="pill" id="params-mode">paper · read-only</span></h2>
   <div id="params"></div>
@@ -2343,7 +2350,7 @@ function renderGateSim(gs){
       <td>${b.fills}</td>
       <td>$${b.notional}</td>
       <td class="${cls(b.open_unrealized)}">${sign(b.open_unrealized)}</td>
-      <td class="${cls(b.settled_realized)}">${sign(b.settled_realized)} <span class="muted">(${b.settled}·${b.wins}w)</span></td>
+      <td class="${cls(b.settled_realized)}">${sign(b.settled_realized)} <span class="muted" title="Settled count and wins for DIRECTIONAL entries only. A high win rate here is close to uninformative: the directional arm buys near-certainties (76 of 76 entries since the last reset were at $0.99), so ~99% of them win by construction and each returns about a cent per share. It is not a record of the system overall.">(${b.settled}·${b.wins}w)</span></td>
       <td class="${cls(b.total_pnl)}"><b>${sign(b.total_pnl)}</b></td>
     </tr>`;
   el.innerHTML = `<table>
@@ -3055,6 +3062,9 @@ const edgeCls=(v)=>{const n=parseFloat(v); return n>0?"pos":(n<0?"neg":"muted");
 // (2026-06-29) and was dead CSS for a month, "news"/"yahoo" with the external signals
 // (2026-08-02). Every remaining signal is market-internal and shares the default chip style.
 const chipCls=()=>"";
+// Price at or beyond which a market counts as decided. 0.995 not 0.999: the saturated readings
+// appear well before a market pins to 0.999, and a market at 99.5% has no tradeable edge either.
+const PRICED_OUT = 0.995;
 
 async function load(){
   let d; try { d = await (await fetch(PREFIX+"/board/data",{cache:"no-store"})).json(); }
@@ -3086,6 +3096,16 @@ async function load(){
     // Maker liquidity-rewards budget. Shadow-scanned only — nothing rests orders today.
     const rw = m.rewards_daily!=null ? parseFloat(m.rewards_daily) : null;
     const rewardTag = rw ? `<span class="tag rw" title="Polymarket pays this per day to orders RESTING in this book, whether or not they fill. Shared across all qualifying makers, so the capturable share depends on competing depth near the mid — see the maker_rewards_scan journal. We place no maker orders today.">rewards $${rw}/d</span>` : '';
+    // A market trading at an extreme is decided in all but the formal settlement, and its signal
+    // readings stop being measurements: orderbook_momentum saturates at its MAX_SCORE of 0.12 on a
+    // fully one-sided book, and theta_convergence saturates at 0.250 (lean x urgency x GAIN, capped
+    // at 0.5 x 1 x 0.5) once the end date has passed. Six unrelated markets — a Hong Kong
+    // temperature, four football matches, a transfer rumour — all reported an identical
+    // 0.12 / 0.250 / -0.001 triplet for exactly this reason. Suppressed rather than shown, because
+    // a displayed "-0.001 net edge" reads as an adverse measurement rather than an absent one.
+    const yesMid = parseFloat(m.yes), noMid = parseFloat(m.no);
+    const extreme = (v) => !isNaN(v) && (v >= PRICED_OUT || v <= 1 - PRICED_OUT);
+    const pricedOut = extreme(yesMid) || extreme(noMid);
     const awaitingH = m.awaiting_hours!=null ? parseInt(m.awaiting_hours,10) : null;
     const awaitingLbl = awaitingH==null ? '' : (awaitingH < 48 ? `${awaitingH}h` : `${Math.floor(awaitingH/24)}d`);
     const statusTag = m.resolved_outcome ? `<span class="tag ${ (pos&&pos.outcome===m.resolved_outcome)?'won': (pos?'lost':'') }">RESOLVED · ${fmt(m.resolved_outcome)}</span>`
@@ -3119,11 +3139,11 @@ async function load(){
         ${rewardTag}
       </div>
       ${haveBar?`<div class="bar"><div class="yes" style="width:${yes}%">YES ${yes}%</div><div class="no">${no}% NO</div></div>`:'<div class="muted">no orderbook yet</div>'}
-      ${sig?`<div class="sig row">
+      ${sig?(pricedOut?`<div class="sig muted" title="This market's price is pinned at an extreme (>=${(100*PRICED_OUT).toFixed(1)}% / <=${(100*(1-PRICED_OUT)).toFixed(1)}%) — the outcome is decided and only formal settlement remains. The signal processors still run and still emit numbers here, but those numbers are SATURATION, not measurement: orderbook_momentum caps at 0.12 on a fully one-sided book and theta_convergence caps at 0.250 (lean x urgency x GAIN = 0.5 x 1 x 0.5) once a market is past its end date at an extreme price. That is why every priced-out market used to show an identical 0.12 / 0.250 / -0.001 triplet regardless of whether it was a football match or a weather market. Displaying them implied an active edge reading where there is simply no edge left to have, and they also padded orderbook_momentum's headline fire rate.">priced out — signals saturated, no edge left to measure</div>`:`<div class="sig row">
         <span>net edge <b class="edge ${edgeCls(sig.net_edge)}">${parseFloat(sig.net_edge||0).toFixed(3)}</b></span>
         ${sig.kelly_usdc&&parseFloat(sig.kelly_usdc)>0?`<span class="muted">· Kelly $${parseFloat(sig.kelly_usdc).toFixed(0)} (${fmt(sig.target_outcome)})</span>`:''}
         <span class="spacer"></span>${firedChips||'<span class="muted">no signal fired</span>'}
-      </div>`:'<div class="sig muted" title="Decision reports are capped at 40 markets per 5-min cycle (DR_MARKET_LIMIT), prioritising the directional universe + bootstrap list. ~5.5k markets are DR-eligible, so most never get one — this is our own throughput cap, not a Polymarket delay. Arb-only markets never need a DR.">not in the decision-report pool</div>'}
+      </div>`):'<div class="sig muted" title="Decision reports are capped at 40 markets per 5-min cycle (DR_MARKET_LIMIT), prioritising the directional universe + bootstrap list. ~5.5k markets are DR-eligible, so most never get one — this is our own throughput cap, not a Polymarket delay. Arb-only markets never need a DR.">not in the decision-report pool</div>'}
       ${posLine}
     </div>`;
   }).join("");
@@ -5805,6 +5825,65 @@ async fn record_journal_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two board-page fixes from the 2026-08-06 review, asserted on the rendered page source
+    /// rather than on a Rust helper, because both live entirely in the embedded JS.
+    #[test]
+    fn priced_out_markets_suppress_their_saturated_signal_readings() {
+        let page = render_board_page("");
+
+        // The threshold has to exist and be BELOW the 0.999 that Polymarket pins settled markets
+        // at — the saturated 0.12 / 0.250 readings appear well before that, and a market at 99.5%
+        // has no tradeable edge either.
+        assert!(
+            page.contains("const PRICED_OUT = 0.995;"),
+            "priced-out threshold missing"
+        );
+        // Both sides count: a market at 0.001 NO is as decided as one at 0.999 YES.
+        assert!(
+            page.contains("v >= PRICED_OUT || v <= 1 - PRICED_OUT"),
+            "threshold must be symmetric across both outcomes"
+        );
+        // The suppression must gate the whole net-edge + chips row, not just the chips — a bare
+        // "net edge -0.001" on a decided market is exactly the misleading reading being removed.
+        assert!(
+            page.contains("pricedOut?") && page.contains("no edge left to measure"),
+            "net-edge row must be replaced, not merely stripped of chips"
+        );
+        // And it must NOT swallow the distinct "no decision report at all" case, which is a
+        // throughput fact about our own DR cap rather than a statement about the market.
+        assert!(
+            page.contains("not in the decision-report pool"),
+            "the no-DR case must survive the priced-out branch"
+        );
+    }
+
+    #[test]
+    fn the_gate_simulation_declares_that_it_covers_directional_entries_only() {
+        // It reports ~6% of realized P&L while looking like a system-wide record, which is exactly
+        // how a careful reader concluded the settled win rate was impossible. Scope is now stated
+        // in the heading (visible without hovering), not only in the footer note.
+        let page = render_trades_page("");
+        assert!(
+            page.contains("directional only"),
+            "the heading must carry the scope"
+        );
+        let heading = page
+            .split("<h2>Gate Simulation")
+            .nth(1)
+            .expect("gate simulation heading");
+        let heading = &heading[..heading.find("</h2>").expect("heading end")];
+        assert!(
+            heading.contains("directional only"),
+            "scope pill must be inside the heading, got: {heading}"
+        );
+        // The settled-record cell is where the win rate is actually read, so the caveat belongs
+        // there too rather than only in the footer.
+        assert!(
+            page.contains("DIRECTIONAL entries only"),
+            "settled-record cell needs its own scope tooltip"
+        );
+    }
 
     #[test]
     fn the_shared_nav_marks_exactly_one_tab_active_and_uses_the_full_prefix_placeholder() {
