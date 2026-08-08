@@ -345,6 +345,31 @@ only if `would_have_forgone` is much rarer than `would_have_prevented`. That rat
 every `autonomous_negrisk_arb_execution` event. **Flip to `enforce` against those counts, not against
 the theory above.**
 
+### First live pre-flight results — 6/6 correct, both error cells empty (2026-08-08, n=6)
+
+| `preflight_outcome` | n | capital committed | avg units |
+|---|---|---|---|
+| `predicted_complete` | 1 | $387.23 | 202 |
+| `would_have_prevented` | 5 | $65.60 | 44.5 |
+| `would_have_forgone` | **0** | — | — |
+| `preflight_missed` | **0** | — | — |
+
+Every prediction correct in both directions. Two observations that matter more than the count:
+
+**The failure mode is total, not marginal.** Every rejected basket reported `worst_fill_ratio: 0` — a
+leg with NO fillable size at our limit, not a leg that was slightly short. Pre-flight is
+discriminating "this leg is unavailable" rather than making close calls, which is why precision is
+high and why it is unlikely to degrade with more samples.
+
+**Enforcement would have preserved the capital that matters.** The one basket that passed committed
+$387.23; the five it would have blocked committed $65.60 between them — all of it into baskets whose
+payout floor was already broken. This is coherent rather than lucky: `units` is bounded by
+thinnest-leg depth, so a small unit count is itself evidence that some leg is nearly empty, and
+pre-flight catches the same condition directly and more precisely.
+
+**Still n=6 and shadow stays on.** `would_have_forgone` is the cell that decides this and it needs
+opportunities to appear before its emptiness means anything.
+
 Also fixed the same day: the settlements table was still rendering bare gamma ids. The 2026-08-07 fix
 had landed on the executions and open-positions tables (loop variable `r`) but not settlements (loop
 variable `s`), and the test asserted the title expression appeared *anywhere in the page* — where it
