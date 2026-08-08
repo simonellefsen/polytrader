@@ -1375,13 +1375,46 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     .await
     .unwrap_or_default();
     // Recent settlements for the UI list only (capped); aggregates below use the full set.
-    let settlements: Vec<serde_json::Value> = settle_rows
+    //
+    // The settlement journal payload records only `market_id`, so the table read as a column of
+    // bare gamma ids — unreadable without looking each one up by hand. Titles are enriched here
+    // with ONE batched lookup over just the 25 displayed rows (`= ANY($1)`), not a per-row join:
+    // `settle_rows` is every settlement since the last reset (399 and growing), and joining the
+    // whole set to render 25 of them would scale the cost with history rather than with the page.
+    let recent: Vec<&(serde_json::Value, chrono::DateTime<chrono::Utc>)> =
+        settle_rows.iter().take(25).collect();
+    let recent_ids: Vec<String> = recent
         .iter()
-        .take(25)
+        .filter_map(|(p, _)| {
+            p.get("market_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .collect();
+    let title_by_id: HashMap<String, (Option<String>, Option<String>)> =
+        sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT gamma_id, question, slug FROM market_data.markets WHERE gamma_id = ANY($1)",
+        )
+        .bind(&recent_ids)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, q, sl)| (id, (q, sl)))
+        .collect();
+
+    let settlements: Vec<serde_json::Value> = recent
+        .iter()
         .map(|(p, at)| {
+            let id = p.get("market_id").and_then(|v| v.as_str()).unwrap_or("");
+            let (question, slug) = title_by_id.get(id).cloned().unwrap_or((None, None));
             serde_json::json!({
                 "at": at.to_rfc3339(),
                 "market_id": p.get("market_id"),
+                // A market GC'd or never ingested leaves these null; the renderer falls back to the
+                // id so a row never renders blank.
+                "question": question,
+                "slug": slug,
                 "outcome": p.get("outcome"),
                 "won": p.get("won"),
                 "realized_pnl": p.get("realized_pnl"),
@@ -2547,7 +2580,7 @@ function renderExec(){
         <td class="t">${new Date(r.at).toLocaleString()}</td>
         <td><span class="pill ${isArb?'arb':'dir'}">${isArb?'arb':'directional'}</span></td>
         <td class="${aCls}">${fmt(r.action)}</td>
-        <td>${fmt(r.market_id)}</td>
+        <td title="${fmt(r.market_id)}${r.slug?' · '+r.slug:''}">${fmt(r.question||r.slug||r.market_id)}</td>
         <td>${fmt(r.outcome)}</td>
         <td>${detail}</td>
       </tr>`;
@@ -2591,7 +2624,7 @@ async function load() {
   document.getElementById("positions").innerHTML = pos.length ? `<table>
     <tr><th>Market</th><th>Side</th><th>Shares</th><th>Avg entry</th><th>Current</th><th>Locked</th><th>Unrealized</th></tr>
     ${pos.map(r => `<tr>
-      <td title="${fmt(r.slug||r.market_id)}">${fmt(r.question||r.slug||r.market_id)}</td>
+      <td title="${fmt(r.market_id)}${r.slug?' · '+r.slug:''}">${fmt(r.question||r.slug||r.market_id)}</td>
       <td>${fmt(r.outcome)}</td>
       <td>${num(r.shares)}</td>
       <td>${num(r.avg_entry_price)}</td>
@@ -5849,6 +5882,33 @@ mod tests {
 
     /// The two board-page fixes from the 2026-08-06 review, asserted on the rendered page source
     /// rather than on a Rust helper, because both live entirely in the embedded JS.
+    #[test]
+    fn the_settlements_table_shows_the_market_title_with_the_id_as_fallback() {
+        let page = render_trades_page("");
+        // Title first, identifier in the tooltip -- the same precedence the open-positions table
+        // uses. The settlement journal records only a gamma id, so this column used to be a wall of
+        // bare numbers.
+        assert!(
+            page.contains(r#"${fmt(r.question||r.slug||r.market_id)}</td>"#),
+            "settlements market cell should prefer question, then slug, then id"
+        );
+        // The gamma id is REPLACED in the visible cell but retained on hover -- it is what every
+        // DB query and journal lookup keys on, so losing it entirely would trade one kind of
+        // unreadability for another.
+        assert!(
+            page.contains(r#"title="${fmt(r.market_id)}${r.slug?' · '+r.slug:''}""#),
+            "the id must stay reachable in the tooltip"
+        );
+        // The fallback chain matters and is NOT dead code: a market pruned by GC, or one settled
+        // before it was ever ingested, resolves to no title at all. Without the trailing
+        // ||r.market_id the row would render blank and look like data loss rather than a missing
+        // label.
+        assert!(
+            page.contains("r.question||r.slug||r.market_id"),
+            "must fall back to the id so a row never renders empty"
+        );
+    }
+
     #[test]
     fn both_pages_link_the_favicon_through_the_subpath_placeholder() {
         // The app tree is mounted twice — at `/` and nested under `/polytrader` for the shared
