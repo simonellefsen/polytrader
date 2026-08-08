@@ -80,6 +80,20 @@ const MAX_OPEN_QUOTES: usize = 40;
 /// accrual is rounding noise and the slot is better spent on a market that might teach us something.
 const MIN_TRACKED_DAILY_USD: Decimal = dec!(0.10);
 
+/// How long past its horizon a filled quote may wait for a readable book before it is abandoned as
+/// unmeasurable.
+///
+/// This exists because of a measured selection bias, not as a tidy-up. At 6h the tracker had three
+/// measured fills averaging a gap-through (|mid_at_fill - price|) of **0.0087**, and one fill it
+/// could NOT price whose gap-through was **0.0500** — 5.7x further. The mechanism is plausible and
+/// unkind: a market that moves violently is also one whose book goes thin, wide, or drops out of the
+/// live feed, so the fills most likely to be unmeasurable are the worst ones. Silently leaving them
+/// pending would quietly delete the left tail of the P&L distribution.
+///
+/// So they are abandoned and COUNTED (`fills_abandoned`). An abandoned fill is not a zero — it is a
+/// known unknown, and the count is what stops the measured mean from being read as complete.
+const MAX_HORIZON_WAIT_SECS: i64 = FILL_HORIZON_SECS * 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuoteSide {
     Bid,
@@ -115,6 +129,14 @@ pub struct MakerShadowDiagnostics {
     /// Quotes skipped because the book could not be read this cycle — accrue nothing rather than
     /// assume they kept qualifying.
     pub unpriced: usize,
+    /// Fills past their horizon still waiting for a readable book. A backlog here means
+    /// `horizon_pnl_usd` describes fewer fills than have actually happened.
+    pub fills_overdue: usize,
+    /// Fills given up on as unmeasurable (see `MAX_HORIZON_WAIT_SECS`). **Read this alongside
+    /// `horizon_pnl_usd` or read neither**: the unmeasurable fills skew toward the violent moves, so
+    /// a mean computed without them is optimistic by an unknown amount, and this count is the only
+    /// signal of how much is missing.
+    pub fills_abandoned: usize,
 }
 
 /// Whether a price rests inside the reward-qualifying band around the midpoint.
@@ -202,6 +224,15 @@ pub fn select_new_quotes<'a>(
         .iter()
         .filter(|c| !already_tracked.contains(&c.market_id))
         .filter(|c| c.estimated_daily_usd >= MIN_TRACKED_DAILY_USD)
+        // Only quote what we can OBSERVE. A candidate priced from a polled snapshot rather than the
+        // live book is one whose snapshot may already be ~52 minutes old (measured 2026-08-08),
+        // well past this module's own 30-minute freshness bar — so it would be placed and then sit
+        // unevaluated, accruing nothing and, if filled, never yielding a P&L number.
+        //
+        // This does not eliminate the problem, because a book can go unreadable AFTER placement;
+        // `fills_abandoned` exists for that. It removes the avoidable half: never start tracking
+        // something already known to be unobservable.
+        .filter(|c| c.from_live_book)
         .take(room)
         .collect()
 }
@@ -238,10 +269,34 @@ pub async fn track_shadow_quotes(
             QuoteSide::Ask
         };
 
-        let Some(mid) = current_mid(pool, books, &row.token_id, &row.market_id).await else {
+        let mid_now = current_mid(pool, books, &row.token_id, &row.market_id).await;
+        let Some(mid) = mid_now else {
             // No readable book. Advance nothing: crediting qualifying time we did not observe is
             // exactly how a measurement starts flattering itself.
             diag.unpriced += 1;
+            // A FILLED quote with no book is different from an open one: it is a P&L number we owe
+            // and cannot collect. Track how overdue the backlog is, and eventually give up loudly
+            // rather than leave it pending forever — an invisible pending fill is a deleted data
+            // point, and the deleted ones skew bad (see MAX_HORIZON_WAIT_SECS).
+            if row.status == "filled" {
+                if let Some(filled_at) = row.filled_at {
+                    let overdue = (now - filled_at).num_seconds();
+                    if overdue > MAX_HORIZON_WAIT_SECS {
+                        sqlx::query(
+                            "UPDATE paper_trading.shadow_quotes
+                                SET status = 'cancelled', last_evaluated_at = now(),
+                                    closed_reason = 'horizon unmeasurable — book unreadable'
+                              WHERE id = $1",
+                        )
+                        .bind(row.id)
+                        .execute(pool)
+                        .await?;
+                        diag.fills_abandoned += 1;
+                    } else if overdue > FILL_HORIZON_SECS {
+                        diag.fills_overdue += 1;
+                    }
+                }
+            }
             continue;
         };
 
@@ -614,6 +669,20 @@ mod tests {
         let picked = select_new_quotes(&ranked, &tracked, 0);
         let ids: Vec<&str> = picked.iter().map(|c| c.market_id.as_str()).collect();
         assert_eq!(ids, vec!["a", "c"], "tracked and dust both excluded");
+
+        // A candidate we cannot observe is never quoted, however attractive it looks. Its snapshot
+        // may already be past this module's freshness bar, so it would rest unevaluated -- accruing
+        // nothing and, if filled, never producing a P&L number.
+        let mut stale = candidate("snapshot_only", dec!(99));
+        stale.from_live_book = false;
+        let with_stale = vec![stale, candidate("a", dec!(5))];
+        let picked = select_new_quotes(&with_stale, &std::collections::HashSet::new(), 0);
+        let ids: Vec<&str> = picked.iter().map(|c| c.market_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["a"],
+            "the highest-ranked candidate is skipped when it is not live-priced"
+        );
 
         // At the cap, nothing new opens — the measurement stays a bounded sample.
         assert!(select_new_quotes(&ranked, &tracked, MAX_OPEN_QUOTES).is_empty());

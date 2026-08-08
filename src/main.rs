@@ -2057,6 +2057,8 @@ async fn produce_arb_scan_journal(
                         horizon_pnl_usd = %mdiag.horizon_pnl_usd,
                         duty_cycle_pct = %mdiag.duty_cycle_pct,
                         unpriced = mdiag.unpriced,
+                        fills_overdue = mdiag.fills_overdue,
+                        fills_abandoned = mdiag.fills_abandoned,
                         "maker shadow quotes"
                     );
                     let _ = journal

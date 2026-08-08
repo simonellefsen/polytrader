@@ -220,11 +220,18 @@ spec:
             # silently downgraded, because it is not implemented.
             - name: POLYTRADER_ENABLE_CLOB_WS
               value: "shadow"
-            # Cap on subscribed tokens, sharded 250/connection. 500 covers the current universe
-            # (~430 books after the negRisk completion pass) with headroom; the cap exists so a
-            # runaway universe cannot open unlimited sockets against a public endpoint.
+            # Cap on subscribed tokens, sharded 250/connection. The cap exists so a runaway universe
+            # cannot open unlimited sockets against a public endpoint.
+            #
+            # 2026-08-08: 500 -> 700, because 500 had become BINDING and was silently degrading a
+            # downstream measurement. `tracked` sat at exactly 500 (it was 498 the day before), so
+            # the reward markets' YES tokens were being squeezed out of the subscription; the maker
+            # shadow tracker then fell back to polled snapshots averaging ~52 minutes old, past its
+            # own 30-minute freshness bar, leaving ~9 of 37 quotes unevaluated on every cycle. A cap
+            # at its ceiling is not a safety limit doing its job, it is a number chosen when the
+            # universe was ~430 and never revisited. 700 restores headroom at 3 sockets.
             - name: POLYTRADER_CLOB_WS_MAX_ASSETS
-              value: "500"
+              value: "700"
             # Tokens re-checked against REST per minute. 8/min ≈ every tracked book audited about
             # once an hour — enough to catch a systematic error quickly without adding meaningful
             # load to an endpoint the poller is already using.
