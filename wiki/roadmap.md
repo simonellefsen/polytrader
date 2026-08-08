@@ -400,6 +400,41 @@ GC prunes only FINISHED quotes (cancelled, or filled *and* horizon-marked). Age 
 long-lived open quote — the single most informative case for the duty cycle — before it produced its
 number.
 
+### The reward ranking IS a volatility ranking (n=39 markets, measured 2026-08-08)
+
+Prompted by the first two fills landing in the same market. That turned out to be coincidence — the
+tracked book is 36 quotes across 36 distinct markets — but it raised a structural question that could
+be answered immediately from existing data instead of waiting on fills. Qualifying depth (from
+`maker_rewards_scan`) against realised 24h mid volatility (from `orderbook_snapshots`):
+
+| qualifying depth | markets | mid stdev | mid range | est reward/day |
+|---|---|---|---|---|
+| **<1k** | 7 | **0.0544** | 0.1849 | **$3.384** |
+| 1k–10k | 8 | 0.0260 | 0.0947 | $1.442 |
+| 10k–100k | 18 | 0.0175 | 0.0640 | $0.894 |
+| >100k | 6 | **0.0134** | 0.0463 | **$0.358** |
+
+**Monotonic in both columns across all four buckets.** The thinnest books are ~4x more volatile and
+pay ~9.5x more capture. This is not a coincidence and not a correlation to be explained away: share
+is `our_size/(depth + our_size)`, so capture is high *because* depth is thin, and thin depth is what
+lets a book move. **The scan ranks by capturable share, which means it ranks by volatility, which
+means it recommends most strongly exactly the markets where a resting quote is picked off hardest.**
+
+This reframes the whole increment. The 2026-08-02 finding was "rank by capturable, not by pool size,
+because they are near-inverses". True — but the ranking it corrected *to* selects for the risk the
+model omits. Both scans were measuring the numerator of a ratio whose denominator is adverse
+selection.
+
+Consistency check: a quote resting ~0.035 from mid at 50 shares, picked off by a ~0.04 adverse move,
+loses ~$2.00. The two measured fills lost **$2.25** and **$2.03**. The fills match what the
+volatility buckets predict, which is weak evidence that the mechanism is understood rather than that
+two unlucky draws occurred.
+
+**What is and is not established.** Depth↔volatility: solid, n=39, monotonic. Depth↔reward: solid by
+construction. Therefore reward↔volatility: solid. That adverse selection *exceeds* reward: **NOT
+established** — n=2 fills, net −$2.91 against +$1.36 accrued. The arithmetic says it is close; close
+is not negative. Keep collecting.
+
 ## 🧹 Operator UI review: three lying instruments, two deletions, one falsified hypothesis — 2026-08-02
 
 Operator asked for a fresh-eyes UI pass (why do the market cards reshuffle on every refresh? do we

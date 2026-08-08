@@ -119,6 +119,22 @@ pub(crate) fn estimated_share(our_size: Decimal, competing_depth: Decimal) -> De
 }
 
 /// Rank best-capturable first — NOT by pool size, which is close to the inverse (see module docs).
+///
+/// **This ranking selects for volatility, and that is structural rather than incidental** (measured
+/// 2026-08-08 across 39 reward markets; see the roadmap entry). Share is
+/// `our_size/(depth + our_size)`, so capture is high precisely *because* competing depth is thin —
+/// and thin depth is what lets a book move:
+///
+/// | qualifying depth | mid stdev (24h) | est reward/day |
+/// |---|---|---|
+/// | <1k    | 0.0544 | $3.384 |
+/// | >100k  | 0.0134 | $0.358 |
+///
+/// Monotonic across four buckets: the thinnest books are ~4x more volatile and pay ~9.5x more.
+/// So the markets this function recommends most strongly are the ones where a resting quote is
+/// picked off hardest — which is the risk [`crate::strategy::maker`] exists to measure, and which
+/// nothing in `estimated_daily_usd` accounts for. Do not read the head of this list as "best"
+/// without netting it against that.
 pub(crate) fn rank(mut candidates: Vec<RewardCandidate>) -> Vec<RewardCandidate> {
     candidates.sort_by(|a, b| {
         b.estimated_daily_usd
