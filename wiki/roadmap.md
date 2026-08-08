@@ -289,6 +289,69 @@ as far from tradeable as the 1.031 event the old metric was pointing at.
   the events where an arb could actually clear, rather than at the ones with the biggest raw
   overround and an unpayable bar.
 
+## 📡 P5 increment 3 — baskets are pre-flighted before any leg is committed — 2026-08-08
+
+Increments 1 and 2 built a live book and let the scanner price from it. This one changes what the
+**executor** does with it: every leg of a negRisk basket is now checked against its own book at one
+instant, before a single leg is bought.
+
+**The defect.** `execute_negrisk_opportunity` was a `for` loop calling `submit_order` per leg, and
+each call commits independently. A basket that fails on leg 3 of 5 has already bought legs 1 and 2 —
+so a strategy whose entire justification is that it holds no directional risk was, on 22 occasions,
+opening directional positions. The buy-all-No floor of ≥ (legs−1) per unit exists at a **common unit
+count across all legs**; it does not degrade gracefully to "most of a basket".
+
+**The evidence that made this the top item.** Over 119 settled events, 2026-08-02..08:
+
+| Basket outcome | n | Realized | Avg | Worst single event | Losers |
+|---|---|---|---|---|---|
+| Complete | 97 | **+$1,297.79** | +$13.38 | **−$0.50** | 25 |
+| Materially partial | 22 | **−$56.64** | −$2.57 | **−$22.02** | 16 |
+
+The `worst` column is the argument, not the average. A complete basket's worst outcome across 97
+events is fee-and-rounding noise; an incomplete one's is −$22.02. Difference in means t ≈ 3.07
+(p ≈ 0.003); 16/22 partials losing is one-sided binomial p = 0.026. But the statistics are almost
+beside the point — a complete basket *cannot* lose, so this is a structural property that more data
+can refine but not overturn. Partial rate was also **deteriorating**, not stabilising: full-fill rate
+by day ran 85.7 → 50.0 → 80.0 → 60.0 → 72.2 → 25.0 → 40.0%, and 2026-08-08 alone had $1,478 of
+capital in materially-partial baskets. Waiting accumulated the problem rather than measuring it.
+
+**What was checked before building, and what it changed.** Whether `basket_filled` was itself honest,
+given a leg counted as filled on ANY nonempty fill — a 1-share fill on a 167-unit order would have
+counted. It is honest: 69 of 70 `basket_filled` events filled ≥99% of intended notional, average
+100.0%. So the complete-basket column above is not contaminated and the numbers stand. The
+size check is now explicit anyway (`BasketLegPlan::is_complete`), because that was true by luck.
+
+**What was deliberately NOT claimed.** No venue offers an atomic cross-market fill, and this does not
+simulate one. What it simulates is what a real implementation can actually do: read every book,
+decide, then fire. The residual — the book moving between the plan and the commit — survives this
+change and is measured rather than assumed (`preflight_missed` below). Synthetic (bookless) fills are
+excluded from feasibility so a basket cannot pass pre-flight on liquidity that does not exist.
+
+**Shipped in shadow, per the same discipline as increments 1 and 2.** `POLYTRADER_BASKET_PREFLIGHT`
+defaults to `shadow`: the plan is computed and journaled, behaviour is unchanged. The reason is an
+asymmetry, not caution for its own sake. Aborting is never worse *for a given basket* — but its
+opportunity cost is unmeasured, and the cells are lopsided:
+
+| `preflight_outcome` | Meaning | Worth |
+|---|---|---|
+| `predicted_complete` | passed, filled | the plan held |
+| `preflight_missed` | passed, came up short | the irreducible residual — the honest ceiling on this increment |
+| `would_have_prevented` | abort, would have been short | the benefit: +$2.57/event |
+| `would_have_forgone` | abort, would have filled fine | the cost: **−$12.78/event** |
+
+A wrongly-aborted basket costs ~5× what a correctly-prevented partial saves, so enforcement is right
+only if `would_have_forgone` is much rarer than `would_have_prevented`. That ratio is now counted on
+every `autonomous_negrisk_arb_execution` event. **Flip to `enforce` against those counts, not against
+the theory above.**
+
+Also fixed the same day: the settlements table was still rendering bare gamma ids. The 2026-08-07 fix
+had landed on the executions and open-positions tables (loop variable `r`) but not settlements (loop
+variable `s`), and the test asserted the title expression appeared *anywhere in the page* — where it
+did, twice, in the other two tables. The test is now scoped to the settlements block and asserts the
+absence of the bare-id cell. An assertion that cannot fail is worse than no assertion: it reports that
+something was checked.
+
 ## 🧹 Operator UI review: three lying instruments, two deletions, one falsified hypothesis — 2026-08-02
 
 Operator asked for a fresh-eyes UI pass (why do the market cards reshuffle on every refresh? do we
@@ -618,7 +681,19 @@ the dated Decision-log entry below; this is the at-a-glance index.
     entry below.* NegRisk legs now price from the live book where one is fresh and in sync, with
     the poller as fallback. The paper engine reads the same store, because legs are LIMIT orders.
     First measured divergence: live shortfall **−0.0031** vs snapshot **−0.0041** on the same pass.
-  - [ ] **Increment 3 — simultaneous multi-leg fill simulation**, then maker quoting. Only after 2.
+  - [x] **Increment 3a — simultaneous multi-leg fill simulation** → *DONE 2026-08-08 (shadow), see
+    the dated entry above.* Every leg pre-flighted against its own book at one instant before any
+    leg commits; `POLYTRADER_BASKET_PREFLIGHT=shadow` journals the counterfactual without changing
+    behaviour. **Next action: read `preflight_outcome` after ~a day and flip to `enforce` if
+    `would_have_forgone` is rare relative to `would_have_prevented`.**
+  - [ ] **Increment 3b — maker quoting.** Unblocked by 3a (a quoting strategy that lies about its
+    own fills is worse than none). The shadow rewards scanner has run 7 days / 1,645 scans and its
+    estimate has stopped moving — median **$40–50/day capturable on ~$2,500 of capital** against a
+    $8.3–9.8k/day pool. It has hit its measurement ceiling: every remaining question (can we hold a
+    quote inside `rewardsMaxSpread`, are we re-quoted before the book moves, is the share model
+    right) is downstream of actually resting an order. Note the estimate is MODELLED
+    (`our_size/(competing_depth + our_size)`), a first-order stand-in for Polymarket's real
+    proximity-weighted scoring — right order of magnitude, not a forecast.
 - [x] **Widen the negrisk funnel** (2026-07-25, from the Path B GO) → *DONE 2026-08-01. Triggered by
   the operator question "why are we not opening new positions, are we being too cautious?" — the
   directional throttle was deliberate (the P5 NO-GO), but arb, the GO path, had gone quiet and that

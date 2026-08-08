@@ -2641,7 +2641,7 @@ async function load() {
     <tr><th>Time</th><th>Market</th><th>Side</th><th>Result</th><th>Payout</th><th>Realized P&amp;L</th></tr>
     ${st.recent.map(s => `<tr>
       <td class="t">${new Date(s.at).toLocaleString()}</td>
-      <td>${fmt(s.market_id)}</td>
+      <td title="${fmt(s.market_id)}${s.slug?' · '+s.slug:''}">${fmt(s.question||s.slug||s.market_id)}</td>
       <td>${fmt(s.outcome)}</td>
       <td class="${s.won?'pos':'neg'}">${s.won?'WON':'lost'}</td>
       <td>$${num(s.payout)}</td>
@@ -5885,27 +5885,46 @@ mod tests {
     #[test]
     fn the_settlements_table_shows_the_market_title_with_the_id_as_fallback() {
         let page = render_trades_page("");
+        // SCOPED to the settlements block, not the whole page. The first version of this test
+        // asserted the title expression appeared ANYWHERE in the document -- and it does, twice,
+        // in the executions and open-positions tables, which use the loop variable `r`. The
+        // settlements loop uses `s`, so it kept rendering bare gamma ids for a full day while the
+        // test stayed green. An assertion that cannot fail is worse than no assertion: it reports
+        // that something was checked.
+        let block = page
+            .split_once(r#"document.getElementById("settlements").innerHTML"#)
+            .expect("settlements table must be rendered from the trades page")
+            .1
+            .split_once("No settlements yet")
+            .expect("settlements block must end with its own empty-state message")
+            .0;
         // Title first, identifier in the tooltip -- the same precedence the open-positions table
         // uses. The settlement journal records only a gamma id, so this column used to be a wall of
         // bare numbers.
         assert!(
-            page.contains(r#"${fmt(r.question||r.slug||r.market_id)}</td>"#),
+            block.contains(r#"${fmt(s.question||s.slug||s.market_id)}</td>"#),
             "settlements market cell should prefer question, then slug, then id"
         );
         // The gamma id is REPLACED in the visible cell but retained on hover -- it is what every
         // DB query and journal lookup keys on, so losing it entirely would trade one kind of
         // unreadability for another.
         assert!(
-            page.contains(r#"title="${fmt(r.market_id)}${r.slug?' · '+r.slug:''}""#),
+            block.contains(r#"title="${fmt(s.market_id)}${s.slug?' · '+s.slug:''}""#),
             "the id must stay reachable in the tooltip"
         );
         // The fallback chain matters and is NOT dead code: a market pruned by GC, or one settled
         // before it was ever ingested, resolves to no title at all. Without the trailing
-        // ||r.market_id the row would render blank and look like data loss rather than a missing
+        // ||s.market_id the row would render blank and look like data loss rather than a missing
         // label.
         assert!(
-            page.contains("r.question||r.slug||r.market_id"),
+            block.contains("s.question||s.slug||s.market_id"),
             "must fall back to the id so a row never renders empty"
+        );
+        // The bare-id cell this replaced. Asserted explicitly so a future edit that reverts to it
+        // fails here rather than silently shipping the wall of numbers again.
+        assert!(
+            !block.contains(r#"<td>${fmt(s.market_id)}</td>"#),
+            "settlements must not render the id as the visible cell"
         );
     }
 

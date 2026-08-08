@@ -230,6 +230,27 @@ spec:
             # load to an endpoint the poller is already using.
             - name: POLYTRADER_CLOB_WS_AUDIT_SAMPLE
               value: "8"
+            # === P5 increment 3 — atomic multi-leg basket pre-flight (2026-08-08) ===
+            # Before ANY leg is committed, every leg is checked against its own book at one instant.
+            # If a leg cannot fill in full, the basket is not an arb: the >= (legs-1) payout floor
+            # only exists at a common unit count, and the sequential loop this replaces would buy
+            # legs 1-2, fail on leg 3, and leave a DIRECTIONAL position where an arb was intended.
+            #
+            # The evidence, 119 settled events over 2026-08-02..08:
+            #   complete baskets   97 events  +$1,297.79  worst single event  -$0.50 (the floor holding)
+            #   partial baskets    22 events     -$56.64  worst single event -$22.02, 16 of 22 losing
+            # Difference in means t ~ 3.07. More to the point it is structural, not statistical: a
+            # complete basket cannot lose.
+            #
+            # "shadow" (default) computes the plan and journals the counterfactual WITHOUT changing
+            # behaviour. "enforce" aborts baskets that fail pre-flight. Shadow comes first because
+            # the abort's opportunity cost is unmeasured and asymmetric: a basket wrongly aborted
+            # forgoes +$12.78 while a partial correctly prevented saves only -$2.57, so enforcement
+            # is right only if `would_have_forgone` is much rarer than `would_have_prevented`. Both
+            # are counted on every autonomous_negrisk_arb_execution event as `preflight_outcome`.
+            # Flip to "enforce" against those counts, not against the theory.
+            - name: POLYTRADER_BASKET_PREFLIGHT
+              value: "shadow"
             # P6 turnover budget (2026-07-12): max autonomous directional ENTRIES per UTC day.
             # Friction is paid per trade while the directional book runs ~flat gross, so the
             # marginal entry is usually P&L-negative. Exits + risk-free arb are NOT capped. 0 = off.

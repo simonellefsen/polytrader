@@ -29,6 +29,94 @@ pub struct PaperTradingEngine {
     live_books: Option<crate::ingester::clob_ws::LiveBookStore>,
 }
 
+/// What one leg of a basket would fill right now, per `PaperTradingEngine::plan_basket`.
+#[derive(Debug, Clone)]
+pub struct BasketLegPlan {
+    pub market_id: String,
+    pub outcome: String,
+    /// Size the basket needs from this leg. A basket is only an arb at a COMMON unit count, so a
+    /// leg that can fill 90% is not 90% useful — it is a leg that breaks the payout floor.
+    pub requested: Decimal,
+    /// Size available at or inside the leg's limit price, excluding synthetic (bookless) fills.
+    pub fillable: Decimal,
+    /// Cost of the fillable portion, fees included.
+    pub cost: Decimal,
+    /// False when no book could be loaded at all (market never ingested, or GC'd).
+    pub had_book: bool,
+}
+
+impl BasketLegPlan {
+    /// Whether this leg can supply the whole requested size. Deliberately all-or-nothing: see
+    /// `requested`.
+    pub fn is_complete(&self) -> bool {
+        self.fillable >= self.requested
+    }
+
+    /// Fraction of the requested size the book can supply, for diagnostics. Zero-size legs report
+    /// complete (1) rather than dividing by zero — a basket never requests zero, but a diagnostic
+    /// that panics is worse than one that is uninteresting.
+    pub fn fill_ratio(&self) -> Decimal {
+        if self.requested <= dec!(0) {
+            dec!(1)
+        } else {
+            (self.fillable / self.requested).min(dec!(1))
+        }
+    }
+}
+
+/// The pre-flight verdict for a whole basket.
+#[derive(Debug, Clone)]
+pub struct BasketPlan {
+    pub legs: Vec<BasketLegPlan>,
+}
+
+impl BasketPlan {
+    /// The decision. Every leg must be able to fill in full — this is the property that makes the
+    /// >= (legs-1) payout floor real, and it does not degrade gracefully.
+    pub fn is_executable(&self) -> bool {
+        !self.legs.is_empty() && self.legs.iter().all(|l| l.is_complete())
+    }
+
+    /// Legs the book cannot fill in full — the ones that would have broken the basket.
+    pub fn short_legs(&self) -> usize {
+        self.legs.iter().filter(|l| !l.is_complete()).count()
+    }
+
+    /// The binding constraint: the least-fillable leg. A basket is exactly as executable as this.
+    pub fn worst_fill_ratio(&self) -> Decimal {
+        self.legs
+            .iter()
+            .map(|l| l.fill_ratio())
+            .min()
+            .unwrap_or(dec!(0))
+    }
+
+    /// Cost of the legs that CAN fill — i.e. the capital the old sequential loop would have
+    /// committed to a basket that was never going to be complete.
+    pub fn committed_cost_if_executed(&self) -> Decimal {
+        self.legs.iter().map(|l| l.cost).sum()
+    }
+
+    /// Compact per-leg detail for the journal. Only the short legs, since a complete basket's legs
+    /// are uninteresting and this is written on every scan.
+    pub fn short_leg_detail(&self) -> Vec<serde_json::Value> {
+        self.legs
+            .iter()
+            .filter(|l| !l.is_complete())
+            .map(|l| {
+                serde_json::json!({
+                    "market_id": l.market_id,
+                    "outcome": l.outcome,
+                    "requested": l.requested.to_string(),
+                    "fillable": l.fillable.to_string(),
+                    "fill_ratio": l.fill_ratio().round_dp(4).to_string(),
+                    "had_book": l.had_book,
+                })
+            })
+            .collect()
+    }
+}
+
 impl PaperTradingEngine {
     pub fn new(pool: PgPool, journal: Arc<JournalWriter>) -> Self {
         Self {
@@ -272,6 +360,70 @@ impl PaperTradingEngine {
 
         tracing::info!(order_id = %order.id, num_fills = fills.len(), "paper order executed and journaled (full tx + FOR UPDATE delivered)");
         Ok(fills)
+    }
+
+    /// P5 increment 3 — pre-flight a multi-leg basket against every leg's book AT ONE INSTANT,
+    /// committing nothing.
+    ///
+    /// The problem this exists to solve: `submit_order` commits each leg independently, so a
+    /// basket executed as a `for` loop over its legs can buy legs 1-2, fail on leg 3, and leave us
+    /// holding a DIRECTIONAL position where an arb was intended. A buy-all-No negRisk basket pays at
+    /// least (legs-1) per unit only when it is COMPLETE; an incomplete one degrades to a floor of
+    /// (filled_legs - 1), which is no floor at all.
+    ///
+    /// Measured on this system over 2026-08-02..08 (119 settled events): 97 complete baskets earned
+    /// +$1,297.79 with a worst single event of **-$0.50** (fee/rounding noise, the floor holding),
+    /// while 22 materially-partial baskets lost -$56.64 with a worst event of **-$22.02** and 16 of
+    /// 22 losing. The difference in means is significant (t ~ 3.07); more to the point it is
+    /// structural rather than statistical — a complete basket *cannot* lose.
+    ///
+    /// What this does NOT claim: real venues offer no atomic cross-market fill, and neither does
+    /// this. What a real implementation can do is exactly what happens here — read every book,
+    /// decide, then fire. So "pre-flight, then commit all or nothing" is a FAITHFUL simulation of
+    /// the achievable execution, not an optimistic one. The residual — the book moving between the
+    /// plan and the commit — is real, survives this change, and is measured by the caller comparing
+    /// the plan against the fills it actually got.
+    ///
+    /// Fills are planned against the same source `submit_order` will match on (live WS book where
+    /// one is fresh and in sync, polled snapshot otherwise), so the plan and the commit agree by
+    /// construction unless the book genuinely moves in between.
+    pub async fn plan_basket(&self, orders: &[PaperOrder]) -> Result<BasketPlan> {
+        let mut legs = Vec::with_capacity(orders.len());
+        for order in orders {
+            let book = self
+                .load_latest_book_snapshot(&order.market_id, &order.outcome)
+                .await
+                .context("loading book snapshot for basket pre-flight")?;
+            let had_book = book.is_some();
+            let mut probe = order.clone();
+            let fills = self.match_against_book(&mut probe, book.as_ref()).await?;
+
+            // Count ONLY liquidity that a real book actually showed. `match_against_book` fills a
+            // MARKET order's remainder off the last known mid and tags it `synthetic_no_book`;
+            // treating that as fillable would let a basket pass pre-flight on liquidity that does
+            // not exist. Basket legs are limit orders today (so this cannot currently trigger), but
+            // the guard is what makes that a property of the code rather than of the caller.
+            let real: Vec<&PaperFill> = fills
+                .iter()
+                .filter(|f| {
+                    f.against_book
+                        .as_ref()
+                        .and_then(|b| b.get("source"))
+                        .and_then(|s| s.as_str())
+                        != Some("synthetic_no_book")
+                })
+                .collect();
+
+            legs.push(BasketLegPlan {
+                market_id: order.market_id.clone(),
+                outcome: order.outcome.clone(),
+                requested: order.size,
+                fillable: real.iter().map(|f| f.size).sum(),
+                cost: real.iter().map(|f| f.price * f.size + f.fee).sum(),
+                had_book,
+            });
+        }
+        Ok(BasketPlan { legs })
     }
 
     /// Map (market_id, "Yes"/"No") -> token_id via DB, fetch latest snapshot row, parse jsonb.
@@ -695,5 +847,103 @@ impl PaperTradingEngine {
             .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leg(requested: &str, fillable: &str) -> BasketLegPlan {
+        BasketLegPlan {
+            market_id: "m".to_string(),
+            outcome: "No".to_string(),
+            requested: Decimal::from_str(requested).unwrap(),
+            fillable: Decimal::from_str(fillable).unwrap(),
+            cost: dec!(0),
+            had_book: true,
+        }
+    }
+
+    /// The whole point of the increment: a basket is executable only when EVERY leg can fill in
+    /// full. "Nearly all of it" is the failure mode, not a partial success — the >= (legs-1) payout
+    /// floor exists at a common unit count across all legs or it does not exist.
+    #[test]
+    fn a_basket_is_executable_only_when_every_leg_fills_in_full() {
+        let all_good = BasketPlan {
+            legs: vec![leg("100", "100"), leg("100", "250"), leg("100", "100")],
+        };
+        assert!(all_good.is_executable());
+        assert_eq!(all_good.short_legs(), 0);
+
+        // One leg 1 share short out of 300 requested across the basket. The old sequential loop
+        // would have bought the other two legs and held a directional position.
+        let one_short = BasketPlan {
+            legs: vec![leg("100", "100"), leg("100", "99"), leg("100", "100")],
+        };
+        assert!(!one_short.is_executable());
+        assert_eq!(one_short.short_legs(), 1);
+    }
+
+    /// An empty plan must NOT read as executable. `Iterator::all` is vacuously true on an empty
+    /// collection, so the natural one-liner would wave through a basket with no legs at all —
+    /// which is exactly what a bug upstream (an opportunity whose legs failed to build) looks like.
+    #[test]
+    fn an_empty_basket_is_not_executable() {
+        assert!(!BasketPlan { legs: vec![] }.is_executable());
+    }
+
+    /// The binding constraint is the WORST leg, not the average. A basket with three perfect legs
+    /// and one that can supply a tenth is a tenth of a basket, and reporting ~78% would make an
+    /// unexecutable basket look marginal.
+    #[test]
+    fn worst_fill_ratio_reports_the_binding_leg_not_the_average() {
+        let plan = BasketPlan {
+            legs: vec![
+                leg("100", "100"),
+                leg("100", "100"),
+                leg("100", "100"),
+                leg("100", "10"),
+            ],
+        };
+        assert_eq!(plan.worst_fill_ratio(), dec!(0.1));
+        // Over-deep legs cap at 1 so a single very deep leg cannot mask a starved one by pulling
+        // the ratio above parity.
+        let deep = BasketPlan {
+            legs: vec![leg("100", "9999"), leg("100", "50")],
+        };
+        assert_eq!(deep.worst_fill_ratio(), dec!(0.5));
+    }
+
+    /// Diagnostics must not panic on a degenerate input. A zero-size request cannot arise from the
+    /// sizing path today, but `fill_ratio` is called on every scan and a division by zero here
+    /// would take down the executor rather than skip a basket.
+    #[test]
+    fn a_zero_size_leg_does_not_divide_by_zero() {
+        assert_eq!(leg("0", "0").fill_ratio(), dec!(1));
+        assert!(leg("0", "0").is_complete());
+    }
+
+    /// Only the short legs are journaled, with enough detail to tell a thin book from a missing
+    /// one — `had_book` distinguishes "the market has no depth at our limit" from "we never
+    /// ingested this market", which need different fixes.
+    #[test]
+    fn short_leg_detail_names_only_the_legs_that_failed() {
+        let mut missing = leg("100", "0");
+        missing.had_book = false;
+        missing.market_id = "gone".to_string();
+        let plan = BasketPlan {
+            legs: vec![leg("100", "100"), missing, leg("300", "100")],
+        };
+        let detail = plan.short_leg_detail();
+        assert_eq!(detail.len(), 2, "complete legs are not worth journaling");
+        assert_eq!(detail[0]["market_id"], "gone");
+        assert_eq!(detail[0]["had_book"], false);
+        assert_eq!(detail[0]["fill_ratio"], "0");
+        // A thin book, distinguishable from the missing one above by `had_book` alone -- the two
+        // need different fixes (widen the limit / size down, versus repair ingest).
+        assert_eq!(detail[1]["had_book"], true);
+        assert_eq!(detail[1]["fill_ratio"], "0.3333");
+        assert_eq!(detail[1]["requested"], "300");
     }
 }

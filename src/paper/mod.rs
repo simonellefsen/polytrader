@@ -11,6 +11,11 @@ mod engine;
 mod models;
 
 pub use engine::PaperTradingEngine;
+// Basket pre-flight types (P5 increment 3). Callers reach these through `plan_basket`'s return
+// value rather than by name, so they are re-exported for the module's public surface, not for a
+// current import site — same reason the models below carry the attribute.
+#[allow(unused_imports)]
+pub use engine::{BasketLegPlan, BasketPlan};
 #[allow(unused_imports)]
 pub use models::{
     OrderSide, OrderStatus, OrderType, PaperFill, PaperOrder, PaperPosition, VirtualPortfolio,

@@ -2042,6 +2042,29 @@ async fn produce_arb_scan_journal(
     Ok(())
 }
 
+/// P5 increment 3 — classify a basket's pre-flight prediction against what actually happened.
+///
+/// The four cells are not symmetric and the asymmetry is the whole decision:
+///
+/// - `predicted_complete` — pre-flight passed, basket filled. The plan held; nothing to learn.
+/// - `preflight_missed` — pre-flight passed, basket came up SHORT. The book moved between the plan
+///   and the commit. Irreducible: no pre-flight removes it, and its rate is the honest ceiling on
+///   what this increment can achieve.
+/// - `would_have_prevented` — pre-flight said abort, basket did come up short. The benefit, at the
+///   measured -$2.57/event a partial costs.
+/// - `would_have_forgone` — pre-flight said abort but the basket filled COMPLETELY anyway. The
+///   cost, at +$12.78/event. Because that is ~5x the benefit per event, enforcement is only correct
+///   if this cell is much rarer than `would_have_prevented` — which is exactly what shadow mode is
+///   deployed to find out, and why the default is not `enforce`.
+fn classify_preflight_outcome(executable: bool, complete: bool) -> &'static str {
+    match (executable, complete) {
+        (true, true) => "predicted_complete",
+        (true, false) => "preflight_missed",
+        (false, false) => "would_have_prevented",
+        (false, true) => "would_have_forgone",
+    }
+}
+
 /// Execute a NegRisk buy-all-No basket in paper: buy `units` No shares in every leg. At most one
 /// member of the event resolves Yes, so the basket pays at least (legs−1)×units at resolution —
 /// risk-free on price, same snapshot caveats as the two-leg arb. Paper-only; journaled.
@@ -2127,12 +2150,15 @@ async fn execute_negrisk_opportunity(
     // the basket's return on collateral as its expected edge.
     let basket_edge_bps = negrisk_basket_edge_bps(opp.net_profit_per_unit, opp.total_cost);
 
-    let mut filled_legs = 0usize;
-    let mut total_filled_cost = dec!(0);
-    for (leg_index, leg) in opp.legs.iter().enumerate() {
-        let order_id = uuid::Uuid::new_v4();
-        let order = crate::paper::PaperOrder {
-            id: order_id,
+    // P5 increment 3 — build every leg's order UP FRONT so the whole basket can be pre-flighted
+    // against all its books at one instant, before a single leg is committed. The loop below then
+    // executes an already-vetted plan instead of discovering leg by leg that the basket is not
+    // going to complete.
+    let orders: Vec<crate::paper::PaperOrder> = opp
+        .legs
+        .iter()
+        .map(|leg| crate::paper::PaperOrder {
+            id: uuid::Uuid::new_v4(),
             market_id: leg.market_id.clone(),
             outcome: "No".to_string(),
             side: crate::paper::OrderSide::Buy,
@@ -2151,7 +2177,76 @@ async fn execute_negrisk_opportunity(
                 "paper_only": true,
                 "real_orders_enabled": false,
             })),
-        };
+        })
+        .collect();
+
+    let plan = match engine.plan_basket(&orders).await {
+        Ok(p) => Some(p),
+        Err(e) => {
+            // A pre-flight that cannot run must not silently become a pre-flight that passes.
+            // Fall through to the old sequential behaviour and say so — degrading to the previous
+            // (worse but understood) path beats both blocking the strategy and pretending we
+            // checked.
+            warn!(event = %opp.event_id, error = %e, "basket pre-flight failed; executing unvetted");
+            None
+        }
+    };
+
+    // Shadow first, exactly as the WS feed itself shipped (`POLYTRADER_ENABLE_CLOB_WS=shadow`).
+    // The abort is never worse FOR A GIVEN BASKET — skipping beats holding a broken floor — but its
+    // opportunity cost is unmeasured: a pre-flight that is too strict rejects baskets that would
+    // have filled, and forgoing +$12.78/event costs far more than the -$2.57/event it saves. Shadow
+    // mode journals the counterfactual without changing behaviour so that rate can be read off real
+    // data before it is enforced.
+    let preflight_mode = std::env::var("POLYTRADER_BASKET_PREFLIGHT")
+        .unwrap_or_else(|_| "shadow".to_string())
+        .trim()
+        .to_lowercase();
+    let enforcing = preflight_mode == "enforce";
+    let would_abort = plan.as_ref().is_some_and(|p| !p.is_executable());
+
+    if let Some(p) = plan.as_ref() {
+        info!(
+            event = %opp.event_id, legs = opp.legs.len(), short_legs = p.short_legs(),
+            worst_fill_ratio = %p.worst_fill_ratio().round_dp(4),
+            executable = p.is_executable(), mode = %preflight_mode,
+            "negrisk basket pre-flight"
+        );
+    }
+
+    if would_abort && enforcing {
+        let p = plan.as_ref().expect("would_abort implies a plan exists");
+        info!(event = %opp.event_id, short_legs = p.short_legs(),
+            "negrisk basket aborted by pre-flight (nothing committed)");
+        let _ = journal
+            .record_journal_event(
+                "autonomous_negrisk_arb_execution",
+                "polytrader_arb_executor",
+                "info",
+                serde_json::json!({
+                    "action": "basket_aborted_preflight",
+                    "event_id": opp.event_id,
+                    "legs": opp.legs.len(),
+                    "short_legs": p.short_legs(),
+                    "worst_fill_ratio": p.worst_fill_ratio().round_dp(4).to_string(),
+                    "units": units.to_string(),
+                    "capital_not_committed": p.committed_cost_if_executed().round_dp(2).to_string(),
+                    "short_leg_detail": p.short_leg_detail(),
+                    "note": "P5 increment 3: at least one leg could not fill in full, so the >= legs-1 payout floor was unreachable. Nothing was committed — the alternative is holding a directional position where an arb was intended.",
+                    "paper_only": true,
+                }),
+            )
+            .await;
+        return Ok(());
+    }
+
+    let mut filled_legs = 0usize;
+    let mut total_filled_cost = dec!(0);
+    for (leg_index, (leg, order)) in opp.legs.iter().zip(orders).enumerate() {
+        // The order is the one the pre-flight actually vetted, not a rebuild of it — a second
+        // construction here could drift from the plan (a different limit, a different size) and the
+        // pre-flight would then be vouching for an order that was never sent.
+        let order_id = order.id;
         let leg_filled = match engine.submit_order(order).await {
             Ok(fills) if !fills.is_empty() => {
                 filled_legs += 1;
@@ -2207,6 +2302,24 @@ async fn execute_negrisk_opportunity(
     let complete = filled_legs == opp.legs.len();
     info!(event = %opp.event_id, legs = opp.legs.len(), filled_legs, %units, complete,
         "autonomous negrisk arb executed (paper-only)");
+
+    // Plan-vs-actual. This is the measurement that decides whether pre-flight is worth enforcing,
+    // and it splits four ways:
+    //   - predicted_complete   : pre-flight passed AND the basket filled → the plan held.
+    //   - preflight_missed     : pre-flight PASSED but the basket came up short → the book moved
+    //                            between the plan and the commit. This is the irreducible residual
+    //                            that no amount of pre-flight removes, and its rate is the honest
+    //                            ceiling on what increment 3 can deliver.
+    //   - would_have_prevented : pre-flight said abort and the basket did indeed come up short →
+    //                            in shadow mode, a partial we chose to take anyway; the saving
+    //                            enforcement would have realised.
+    //   - would_have_forgone   : pre-flight said abort but the basket filled COMPLETELY anyway →
+    //                            the opportunity cost of enforcing, at +$12.78/event the number
+    //                            that could make this change net-negative. This is precisely why
+    //                            the default is shadow.
+    let preflight_outcome = plan
+        .as_ref()
+        .map(|p| classify_preflight_outcome(p.is_executable(), complete));
     let _ = journal
         .record_journal_event(
             "autonomous_negrisk_arb_execution",
@@ -2223,6 +2336,13 @@ async fn execute_negrisk_opportunity(
                 "min_payout_per_unit": opp.min_payout.to_string(),
                 "net_profit_per_unit": opp.net_profit_per_unit.to_string(),
                 "note": "Buy-all-No negRisk basket. A partial fill (filled_legs < legs) weakens the >= legs-1 payout floor toward filled_legs-1 — flagged via action; still bounded loss (paper).",
+                "preflight_mode": preflight_mode,
+                "preflight_executable": plan.as_ref().map(|p| p.is_executable()),
+                "preflight_short_legs": plan.as_ref().map(|p| p.short_legs()),
+                "preflight_worst_fill_ratio": plan
+                    .as_ref()
+                    .map(|p| p.worst_fill_ratio().round_dp(4).to_string()),
+                "preflight_outcome": preflight_outcome,
                 "paper_only": true,
                 "real_orders_enabled": false,
             }),
@@ -2739,6 +2859,30 @@ mod tests {
         );
         // Degenerate cost → 0 (no divide-by-zero).
         assert_eq!(negrisk_basket_units(dec!(50), dec!(750), dec!(0)), dec!(0));
+    }
+
+    /// The two cells that decide whether pre-flight should be enforced are the ones where the
+    /// prediction and the outcome DISAGREE, and they are easy to write backwards — the benefit case
+    /// is (not executable, not complete) and the cost case is (not executable, complete), which
+    /// differ by a single bool. Getting them the wrong way round would invert the enforcement
+    /// decision while every number still looked plausible.
+    #[test]
+    fn preflight_outcomes_name_the_benefit_and_the_cost_the_right_way_round() {
+        use super::classify_preflight_outcome;
+        // Agreement: the plan held, or the book moved under it.
+        assert_eq!(classify_preflight_outcome(true, true), "predicted_complete");
+        assert_eq!(classify_preflight_outcome(true, false), "preflight_missed");
+        // Disagreement. Aborting a basket that WOULD have come up short is the saving...
+        assert_eq!(
+            classify_preflight_outcome(false, false),
+            "would_have_prevented"
+        );
+        // ...and aborting one that would have filled fine is the loss. At +$12.78 forgone against
+        // -$2.57 saved, this cell is ~5x as expensive per event as the one above is valuable.
+        assert_eq!(
+            classify_preflight_outcome(false, true),
+            "would_have_forgone"
+        );
     }
 
     #[test]
