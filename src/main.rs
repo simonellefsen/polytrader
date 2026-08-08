@@ -2386,6 +2386,16 @@ async fn execute_negrisk_opportunity(
                     .as_ref()
                     .map(|p| p.worst_fill_ratio().round_dp(4).to_string()),
                 "preflight_outcome": preflight_outcome,
+                // Recorded on the EXECUTION event, not only on the abort event, because the abort
+                // event never fires in shadow mode — and shadow mode is where the learning happens.
+                // Without this the shadow run reports THAT a leg was short but never WHICH, and
+                // `had_book` is the field that separates "the book is thin at our limit" (a market
+                // condition, size down or widen) from "we never ingested this market" (an ingest
+                // gap, and a fix that belongs upstream of the executor entirely).
+                "preflight_short_leg_detail": plan
+                    .as_ref()
+                    .filter(|p| !p.is_executable())
+                    .map(|p| p.short_leg_detail()),
                 "paper_only": true,
                 "real_orders_enabled": false,
             }),
