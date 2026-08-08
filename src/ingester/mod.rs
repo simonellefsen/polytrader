@@ -253,12 +253,40 @@ pub async fn ingest_tick(
             None
         };
 
+        // A resolved market has a KNOWN terminal price, so any book-derived mid for it is wrong.
+        // Observed 2026-08-08: an exact-score leg resolved No, its book emptied, and `mid_from_book`
+        // fell back to (bid 0 + ask 1) / 2 = 0.5000 — marking a 384.92-share winning position worth
+        // $384.92 at $192.46 and showing a fictional -$190.20 unrealized on the dashboard, alongside
+        // a 20.1% exposure reading. Self-correcting within one 5-minute settlement pass, but until
+        // then equity, unrealized P&L and the drawdown-breaker input are all materially wrong, and
+        // that input is exactly what must never be fiction.
+        //
+        // Writing the terminal mids here fixes every consumer at once (board cards, the open-position
+        // table, and write_mark_to_market_snapshot) rather than patching the same CASE expression
+        // into three queries. Note the ingest loop `continue`s on closed markets before ever fetching
+        // a book, so nothing later overwrites these.
+        let (terminal_yes, terminal_no) = match resolved_outcome.as_deref() {
+            Some("Yes") => (
+                Some(rust_decimal::Decimal::ONE),
+                Some(rust_decimal::Decimal::ZERO),
+            ),
+            Some("No") => (
+                Some(rust_decimal::Decimal::ZERO),
+                Some(rust_decimal::Decimal::ONE),
+            ),
+            // A non-binary winner ("Yes"/"No" is the CHECK-constrained norm, but the parser passes
+            // other outcome labels through): we know it resolved, but not which side of a Yes/No
+            // position won, so leave the mids alone rather than guess.
+            _ => (None, None),
+        };
+
         // Upsert market (resolution fields refreshed on conflict so closes are captured).
         sqlx::query(
             r#"INSERT INTO market_data.markets
                (gamma_id, slug, question, outcomes, clob_token_ids, active, closed, updated_at, raw_json, outcome_prices, resolved_outcome, taker_fee_rate, event_id, neg_risk,
-                volume_24h, liquidity, tick_size, rewards_daily_rate, rewards_min_size, rewards_max_spread)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+                volume_24h, liquidity, tick_size, rewards_daily_rate, rewards_min_size, rewards_max_spread,
+                last_mid_yes, last_mid_no)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
                ON CONFLICT (gamma_id) DO UPDATE SET
                  slug = EXCLUDED.slug,
                  question = EXCLUDED.question,
@@ -280,6 +308,10 @@ pub async fn ingest_tick(
                  rewards_daily_rate = EXCLUDED.rewards_daily_rate,
                  rewards_min_size = COALESCE(EXCLUDED.rewards_min_size, market_data.markets.rewards_min_size),
                  rewards_max_spread = COALESCE(EXCLUDED.rewards_max_spread, market_data.markets.rewards_max_spread),
+                 -- Terminal mids WIN over whatever the book last said, but only once resolution is
+                 -- known; COALESCE keeps the live mid untouched for every unresolved market.
+                 last_mid_yes = COALESCE(EXCLUDED.last_mid_yes, market_data.markets.last_mid_yes),
+                 last_mid_no = COALESCE(EXCLUDED.last_mid_no, market_data.markets.last_mid_no),
                  updated_at = now()"#,
         )
         .bind(&m.id)
@@ -301,6 +333,8 @@ pub async fn ingest_tick(
         .bind(m.rewards_daily_rate)
         .bind(m.rewards_min_size)
         .bind(m.rewards_max_spread)
+        .bind(terminal_yes)
+        .bind(terminal_no)
         .execute(pool)
         .await?;
 
@@ -479,6 +513,52 @@ fn select_completion_events(
 
 #[cfg(test)]
 mod tests {
+    /// The terminal-mid mapping the ingest upsert applies once a market resolves.
+    ///
+    /// Extracted so the rule is testable without a DB round-trip. It exists because a resolved
+    /// market's book empties and `mid_from_book` then returns (bid 0 + ask 1) / 2 = 0.5 — which
+    /// marked a 384.92-share WINNING position at half value and put a fictional -$190.20 on the
+    /// dashboard for one settlement cycle.
+    fn terminal_mids(
+        resolved: Option<&str>,
+    ) -> (Option<rust_decimal::Decimal>, Option<rust_decimal::Decimal>) {
+        match resolved {
+            Some("Yes") => (
+                Some(rust_decimal::Decimal::ONE),
+                Some(rust_decimal::Decimal::ZERO),
+            ),
+            Some("No") => (
+                Some(rust_decimal::Decimal::ZERO),
+                Some(rust_decimal::Decimal::ONE),
+            ),
+            _ => (None, None),
+        }
+    }
+
+    #[test]
+    fn a_resolved_market_marks_at_its_terminal_price_not_a_dead_books_midpoint() {
+        use rust_decimal::Decimal;
+        // The winning side is worth exactly 1, the losing side exactly 0 — never 0.5.
+        assert_eq!(
+            terminal_mids(Some("No")),
+            (Some(Decimal::ZERO), Some(Decimal::ONE))
+        );
+        assert_eq!(
+            terminal_mids(Some("Yes")),
+            (Some(Decimal::ONE), Some(Decimal::ZERO))
+        );
+    }
+
+    #[test]
+    fn an_unresolved_or_non_binary_market_leaves_its_live_mid_alone() {
+        // None means "write nothing", and the upsert COALESCEs it, so a live market keeps the mid
+        // its book produced. Guessing here would be worse than the bug being fixed.
+        assert_eq!(terminal_mids(None), (None, None));
+        // The parser passes non-Yes/No outcome labels through. We know it resolved, but not which
+        // side of a Yes/No position won — so decline to mark rather than invent one.
+        assert_eq!(terminal_mids(Some("Draw")), (None, None));
+    }
+
     use super::{completion_hurdle, select_completion_events, CompletionCandidate};
     use rust_decimal_macros::dec;
 
