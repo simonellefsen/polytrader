@@ -26,6 +26,27 @@
 //! horizon is what allows that outcome to be observed at all. The sign of `horizon_pnl_usd` is
 //! therefore a real result rather than an artifact of the trigger.
 //!
+//! ## This tracker does NOT re-quote, and that bounds every number it produces
+//!
+//! A real maker re-prices when the midpoint moves. This one places a quote and lets it drift:
+//! nothing ever moves a resting price back inside the band. Measured 2026-08-08 after five hours,
+//! the aggregate duty cycle fell 96.6% -> 71.8%, dragged down by a tail of quotes sitting at 1.7%
+//! and 3.4% — out of band for hours, earning nothing, still counted as tracked.
+//!
+//! So the duty cycle here is the **no-re-quote** duty cycle, a LOWER bound on what a real strategy
+//! would sustain. It does not follow that the strategy looks better than measured, because
+//! re-quoting cuts both ways: a price dragged back to the band is a price back in front of the
+//! order flow, so more qualifying time buys more fills and more adverse selection. The two effects
+//! push the net in opposite directions and neither is measured here.
+//!
+//! Compounding this, [`quote_price`] deliberately sits at the FAR EDGE of the band, which is the
+//! choice that maximises time-to-fill and simultaneously minimises time-to-disqualification — any
+//! adverse move at all puts it outside. A quote at the midpoint would hold its qualification far
+//! longer and be hit far sooner. That placement is therefore not a neutral detail but a free
+//! parameter that dominates the duty cycle, and it was picked (see `quote_price`) rather than
+//! measured. Treat "duty cycle 72%" as "duty cycle at the band edge, without re-quoting", never as
+//! a property of maker quoting as such.
+//!
 //! ## Known bias, stated rather than buried
 //!
 //! The mid-crossing fill rule UNDER-counts fills: a resting bid can be hit by a seller without the
