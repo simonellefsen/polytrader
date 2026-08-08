@@ -2036,6 +2036,49 @@ async fn produce_arb_scan_journal(
                     }),
                 )
                 .await;
+
+            // P5 increment 3b — SHADOW MAKER QUOTES. Still places nothing, but unlike the scan
+            // above this follows specific prices THROUGH TIME, which is the only way to reach the
+            // two numbers the snapshot estimator structurally cannot produce: the duty cycle (the
+            // scan annualises an instantaneous share as if a quote qualified all day) and adverse
+            // selection (the scan's own docs call it "the entire risk of making" and model none of
+            // it). Netting horizon_pnl against accrued_reward is the first honest read on whether
+            // making pays here at all.
+            match crate::strategy::maker::track_shadow_quotes(pool, Some(live_books), &candidates)
+                .await
+            {
+                Ok(mdiag) => {
+                    tracing::info!(
+                        open_quotes = mdiag.open_quotes,
+                        placed = mdiag.placed,
+                        filled = mdiag.filled,
+                        horizons_measured = mdiag.horizons_measured,
+                        accrued_reward_usd = %mdiag.accrued_reward_usd,
+                        horizon_pnl_usd = %mdiag.horizon_pnl_usd,
+                        duty_cycle_pct = %mdiag.duty_cycle_pct,
+                        unpriced = mdiag.unpriced,
+                        "maker shadow quotes"
+                    );
+                    let _ = journal
+                        .record_journal_event(
+                            "maker_shadow_quotes",
+                            "polytrader_maker_shadow",
+                            "info",
+                            serde_json::json!({
+                                "strategy": "maker_liquidity_rewards",
+                                "diagnostics": mdiag,
+                                "paper_only": true,
+                                "orders_placed": false,
+                                "net_usd": (mdiag.accrued_reward_usd + mdiag.horizon_pnl_usd).round_dp(4).to_string(),
+                                "note": "SHADOW ONLY — virtual quotes tracked against the live book; nothing is placed and no position is taken. accrued_reward_usd integrates the re-observed share per interval rather than annualising one instant. horizon_pnl_usd marks each filled quote ONE HOUR after the fill, not at the fill: the fill trigger IS the mid crossing our price, so an instant mark would report the trigger back as a finding. The fill rule (mid crosses the quote) UNDER-counts fills, so adverse selection is under-counted and net_usd is OPTIMISTIC. Read a positive net as 'not yet falsified', not as proven."
+                            }),
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    warn!(error = %e, "maker shadow quote tracking failed (will retry next cycle)")
+                }
+            }
         }
         Err(e) => warn!(error = %e, "maker rewards scan failed (will retry next cycle)"),
     }

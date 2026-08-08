@@ -44,6 +44,12 @@ const PORTFOLIO_RAW_DAYS: i64 = 7;
 const STALE_LATEST_CAP_DAYS: i64 = 3;
 /// Rows deleted per batch (bounds lock time / WAL per statement).
 const BATCH: i64 = 10_000;
+/// Keep shadow maker quotes (P5 increment 3b) this long after they finish. They are a measurement
+/// sample, not a ledger — the conclusions get written to the roadmap, and the aggregate lives on in
+/// the `maker_shadow_quotes` journal events. Only FINISHED quotes are eligible: an open quote is
+/// live state and a filled one still awaiting its horizon mark has not produced its number yet, so
+/// pruning either would silently delete the measurement mid-flight.
+const SHADOW_QUOTE_DAYS: i64 = 30;
 
 /// The six FusionEngine signals whose per-day fire counts we roll up. (overreaction_fade retired but
 /// kept here so historical days that used it still summarize correctly.)
@@ -65,6 +71,7 @@ pub struct GcStats {
     pub reports_deleted: u64,
     pub telemetry_deleted: u64,
     pub portfolio_snapshots_deleted: u64,
+    pub shadow_quotes_deleted: u64,
 }
 
 /// Run one full GC pass: roll up, then prune. Non-fatal per step — a failure in one is logged and the
@@ -95,6 +102,10 @@ pub async fn run_gc(pool: &PgPool) -> GcStats {
     match prune_portfolio_snapshots(pool).await {
         Ok(n) => s.portfolio_snapshots_deleted = n,
         Err(e) => tracing::warn!(error = %e, "gc: portfolio snapshot prune failed"),
+    }
+    match prune_shadow_quotes(pool).await {
+        Ok(n) => s.shadow_quotes_deleted = n,
+        Err(e) => tracing::warn!(error = %e, "gc: shadow quote prune failed"),
     }
     tracing::info!(?s, "gc pass complete");
     s
@@ -204,6 +215,28 @@ async fn prune_portfolio_snapshots(pool: &PgPool) -> Result<u64> {
                WHERE as_of < now() - interval '{PORTFOLIO_RAW_DAYS} days'
                  AND snapshot_reason = 'mark_to_market'
                ORDER BY date_trunc('hour', as_of), as_of DESC)
+           LIMIT {BATCH})"
+    );
+    delete_in_batches(pool, &q).await
+}
+
+/// Prune FINISHED shadow maker quotes past the retention window (P5 increment 3b).
+///
+/// "Finished" is doing real work here. A quote is only eligible once it is cancelled, or filled AND
+/// marked at its horizon — the two states where it has already yielded its number. An open quote is
+/// live state, and a filled quote still inside its measurement horizon would be deleted before
+/// producing the adverse-selection figure the whole increment exists for. Age alone is not a safe
+/// predicate: a quote that never fills stays open indefinitely and would otherwise be pruned out
+/// from under the duty-cycle measurement, which is precisely the case where a long-lived quote is
+/// the most informative one we have.
+async fn prune_shadow_quotes(pool: &PgPool) -> Result<u64> {
+    let q = format!(
+        "DELETE FROM paper_trading.shadow_quotes
+         WHERE id IN (
+           SELECT id FROM paper_trading.shadow_quotes
+           WHERE placed_at < now() - interval '{SHADOW_QUOTE_DAYS} days'
+             AND (status = 'cancelled'
+                  OR (status = 'filled' AND mid_at_horizon IS NOT NULL))
            LIMIT {BATCH})"
     );
     delete_in_batches(pool, &q).await

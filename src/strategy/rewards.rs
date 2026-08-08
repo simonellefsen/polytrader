@@ -266,7 +266,7 @@ pub async fn scan_rewards(
     Ok((rank(out), diag))
 }
 
-fn parse_levels(v: &serde_json::Value) -> Vec<(Decimal, Decimal)> {
+pub(crate) fn parse_levels(v: &serde_json::Value) -> Vec<(Decimal, Decimal)> {
     v.as_array()
         .map(|arr| {
             arr.iter()

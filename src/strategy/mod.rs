@@ -28,6 +28,7 @@
 #![allow(dead_code)]
 
 pub mod arbitrage;
+pub mod maker;
 pub mod negrisk;
 pub mod overreaction;
 pub mod rewards;
