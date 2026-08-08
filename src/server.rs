@@ -277,7 +277,9 @@ pub async fn start_server(
 
     // Routes that should always be available at the root for Kubernetes probes / internal use.
     // (Probes hit /health directly; ngrok policy with rewrite forwards stripped paths here.)
-    let probe_routes = Router::new().route("/health", get(health_handler));
+    let probe_routes = Router::new()
+        .route("/health", get(health_handler))
+        .route("/favicon.svg", get(favicon_handler));
 
     // Main application routes mounted at clean root paths. When SUBPATH_PREFIX is set,
     // the same routes are also nested under that prefix. The public ngrok policy should
@@ -360,6 +362,23 @@ pub async fn start_server(
         .await
         .map_err(|e| anyhow::anyhow!("server error: {}", e))?;
     Ok(())
+}
+
+/// The tab icon. `include_str!` keeps it an editable .svg file in the repo rather than a base64
+/// blob nobody can diff, and SVG means one asset for every density instead of a .ico pyramid.
+///
+/// Lives on the PROBE router, not the app router: the app tree is mounted twice (at `/` and nested
+/// under the `/polytrader` subpath the shared ngrok tunnel forwards), and probe routes are merged
+/// into both, so `<link href="__PREFIX__/favicon.svg">` resolves either way.
+async fn favicon_handler() -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "image/svg+xml"),
+            // Immutable content at a stable path; a day of caching keeps it out of every reload.
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        include_str!("assets/favicon.svg"),
+    )
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -2129,6 +2148,7 @@ fn render_trades_page(prefix: &str) -> String {
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Polytrader — Paper Trades</title>
+<link rel="icon" type="image/svg+xml" href="__PREFIX__/favicon.svg"/>
 <style>
 __SHELL_CSS__
   .badge { background:#1f6feb22; color:#58a6ff; border:1px solid #1f6feb55; padding:2px 8px; border-radius:12px; font-size:12px; }
@@ -3009,6 +3029,7 @@ fn render_board_page(prefix: &str) -> String {
 <html lang="en"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Polytrader — Markets</title>
+<link rel="icon" type="image/svg+xml" href="__PREFIX__/favicon.svg"/>
 <style>
 __SHELL_CSS__
   .badge { background:#23863622; color:#3fb950; border:1px solid #23863655; padding:2px 8px; border-radius:12px; font-size:12px; }
@@ -5828,6 +5849,43 @@ mod tests {
 
     /// The two board-page fixes from the 2026-08-06 review, asserted on the rendered page source
     /// rather than on a Rust helper, because both live entirely in the embedded JS.
+    #[test]
+    fn both_pages_link_the_favicon_through_the_subpath_placeholder() {
+        // The app tree is mounted twice — at `/` and nested under `/polytrader` for the shared
+        // ngrok tunnel. A hard-coded "/favicon.svg" would 404 on the tunnel, so the href must carry
+        // the same __PREFIX__ token the page-level .replace() fills in, exactly like the nav.
+        for page in [render_board_page(""), render_trades_page("")] {
+            assert!(
+                page.contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg"/>"#),
+                "favicon link missing or not prefix-substituted"
+            );
+        }
+        // ...and with a subpath, it resolves under it rather than at the tunnel root.
+        assert!(render_board_page("/polytrader").contains(r#"href="/polytrader/favicon.svg"#));
+    }
+
+    #[test]
+    fn the_favicon_asset_is_self_contained_and_legible_at_tab_size() {
+        let svg = include_str!("assets/favicon.svg");
+        // A favicon is fetched standalone, so it cannot rely on page CSS or external refs.
+        assert!(svg.contains("xmlns=\"http://www.w3.org/2000/svg\""));
+        assert!(
+            !svg.contains("<image") && !svg.contains("url("),
+            "no external references — the asset must render on its own"
+        );
+        // It carries its own background, or it would vanish against a dark tab strip.
+        assert!(
+            svg.contains("fill=\"#0d1117\""),
+            "needs its own tile background"
+        );
+        // viewBox rather than fixed width/height, so it scales to 16px and to a 180px touch icon.
+        assert!(svg.contains("viewBox=\"0 0 32 32\""));
+        assert!(
+            !svg.contains("width=\"32\" height=\"32\"><"),
+            "should scale via viewBox, not a pinned pixel size"
+        );
+    }
+
     #[test]
     fn priced_out_markets_suppress_their_saturated_signal_readings() {
         let page = render_board_page("");

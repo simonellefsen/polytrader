@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Polytrader">
+  <!-- Echoes the dashboard's defining visual: a green step-line P&L chart on the same #0d1117 the
+       pages use. Deliberately only two risers — a favicon renders at 16px, where the real chart's
+       300 points would collapse into a smudge, so this keeps the SHAPE (flat, jump, flat, jump)
+       and drops the detail. The tile carries its own background rather than inheriting the
+       browser's, so it reads the same on a light or dark tab strip. -->
+  <rect width="32" height="32" rx="7" fill="#0d1117"/>
+  <path d="M4 23 H11 V17 H19 V10 H28 V27 H4 Z" fill="#3fb950" fill-opacity="0.20"/>
+  <path d="M4 23 H11 V17 H19 V10 H28"
+        fill="none" stroke="#3fb950" stroke-width="2.8"
+        stroke-linejoin="round" stroke-linecap="round"/>
+</svg>
