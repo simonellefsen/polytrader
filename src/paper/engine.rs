@@ -456,10 +456,35 @@ impl PaperTradingEngine {
             return Ok(None);
         };
 
-        let idx = outcomes
+        // Resolve outcome -> token STRICTLY. The previous `.unwrap_or(0)` silently fell back to the
+        // FIRST token whenever the name did not match, which is not a missing book but the WRONG
+        // one — priced, filled and journaled with no warning.
+        //
+        // It was reachable and it fired. Most markets are `["Yes", "No"]`, but 1,400+ active ones
+        // are not: 1,003 `["Over", "Under"]`, 414 `["Up", "Down"]`, and hundreds of two-team
+        // markets. Asking such a market for "No" matches nothing, so index 0 was used — the "Over" /
+        // "Up" / first-team side. Live evidence (2026-07-04, market 2769783,
+        // `["Alexandra Eala", "Iga Swiatek"]`): a directional BUY of "No" with a **limit of 0.978**
+        // filled at **0.19**, a 79-cent gap that only makes sense against a different token's book.
+        //
+        // Refusing is deliberately chosen over guessing. Mapping "Yes"->0 / "No"->1 would probably
+        // be right — the affirmative side is conventionally listed first — but "probably right"
+        // is not a basis for pricing a trade, and the cost of refusing is 2 orders out of 869. The
+        // warning names the market and its outcomes so that if these markets ever matter, the fix
+        // is driven by data rather than by an assumption about Polymarket's ordering.
+        let Some(idx) = outcomes
             .iter()
             .position(|o| o.eq_ignore_ascii_case(outcome))
-            .unwrap_or(0);
+        else {
+            tracing::warn!(
+                market = %market_id,
+                requested_outcome = %outcome,
+                available_outcomes = ?outcomes,
+                "no token matches the requested outcome; refusing to price this order rather than \
+                 defaulting to the first token (see load_latest_book_snapshot)"
+            );
+            return Ok(None);
+        };
         let token_id = match tokens.get(idx) {
             Some(t) if !t.is_empty() => t.clone(),
             _ => return Ok(None),
@@ -860,6 +885,39 @@ impl PaperTradingEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the outcome -> token index resolution that `load_latest_book_snapshot` performs.
+    ///
+    /// Extracted as a pure helper for the test because the real call needs a database; the rule
+    /// itself is what matters and it is what regressed. `None` MUST mean "refuse", never "use the
+    /// first token" — the `.unwrap_or(0)` this replaced silently priced "No" orders in
+    /// `["Over","Under"]` / `["Up","Down"]` / two-team markets against the wrong side of the book.
+    fn resolve_outcome_idx(outcomes: &[&str], requested: &str) -> Option<usize> {
+        outcomes
+            .iter()
+            .position(|o| o.eq_ignore_ascii_case(requested))
+    }
+
+    #[test]
+    fn an_unmatched_outcome_refuses_rather_than_defaulting_to_the_first_token() {
+        // The ordinary case still resolves, including case-insensitively.
+        assert_eq!(resolve_outcome_idx(&["Yes", "No"], "No"), Some(1));
+        assert_eq!(resolve_outcome_idx(&["Yes", "No"], "yes"), Some(0));
+
+        // The 1,400+ active markets that are not Yes/No. Every one of these previously resolved to
+        // index 0 and traded against the first outcome's book.
+        assert_eq!(resolve_outcome_idx(&["Over", "Under"], "No"), None);
+        assert_eq!(resolve_outcome_idx(&["Up", "Down"], "No"), None);
+        assert_eq!(
+            resolve_outcome_idx(&["Alexandra Eala", "Iga Swiatek"], "No"),
+            None,
+            "the market that actually fired this: a limit BUY at 0.978 filled at 0.19"
+        );
+
+        // Named outcomes still resolve when asked for by their real name, so refusing above is a
+        // guard on the mapping, not a blanket refusal to trade these markets.
+        assert_eq!(resolve_outcome_idx(&["Over", "Under"], "Under"), Some(1));
+    }
 
     fn leg(requested: &str, fillable: &str) -> BasketLegPlan {
         BasketLegPlan {
