@@ -460,6 +460,45 @@ construction. Therefore reward↔volatility: solid. That adverse selection *exce
 established** — n=2 fills, net −$2.91 against +$1.36 accrued. The arithmetic says it is close; close
 is not negative. Keep collecting.
 
+### The measurement was quietly deleting its own worst fills — and the WS cap was why
+
+Found the same day by asking why one fill sat 74 minutes past its horizon unmeasured.
+
+**The bias.** Three measured fills averaged a gap-through (`|mid_at_fill − price|`) of **0.0087**;
+the one fill that could NOT be priced had a gap-through of **0.0500** — 5.7× further. The mechanism
+is unkind and plausible: a market that moves violently is also one whose book goes thin, wide, or
+drops out of the live feed, so the fills most likely to be unmeasurable are the worst ones. Left
+pending indefinitely they would silently remove the left tail of the P&L distribution — a *fourth*
+optimistic bias, on top of undercounted fills, no re-quoting, and the unmeasured placement choice.
+
+**The root cause was a cap resting exactly on its ceiling.** `POLYTRADER_CLOB_WS_MAX_ASSETS=500` had
+become binding — `tracked` read exactly 500 (498 the day before). Measured tier sizes:
+
+| tier | tokens |
+|---|---|
+| 1 — negRisk No | 384 |
+| 2 — reward markets | 132 |
+| tiers 1+2 | **516** |
+| total candidates | 732 |
+
+516 > 500, so **tier 2 was being truncated by 16 tokens**. Reward markets fell back to polled
+snapshots averaging ~52 minutes old, past the tracker's own 30-minute bar, leaving ~9 of 37 quotes
+unevaluated every cycle. A cap sitting exactly at its ceiling is not a limit doing its job; it is a
+number chosen when the universe was ~430 and never revisited. Raised to 700, which covers both
+priority tiers with 184 slots of headroom.
+
+**Cost of the raise, recorded honestly.** Currently-desynced books rose from 0–2/500 to an
+oscillating 6–18/700 (0.9–2.6%), consistent with the added 200 tokens being the lower-quality
+unranked tail. No correctness cost: `audit_disagreed` stayed **0** across every audit, `stale` 0,
+`reconnects` 0 — a desynced book is withheld by `get_fresh` and reads fall back to the snapshot. A
+cap of ~550 would have covered both tiers with less tail; 700 was chosen so tier growth does not
+immediately re-truncate.
+
+**Fixes:** overdue fills are abandoned after 4× the horizon and **counted** (`fills_abandoned`,
+`fills_overdue`) — an abandoned fill is a known unknown, not a zero, and the count is what stops the
+measured mean being read as complete. Placement now requires `from_live_book`, so the tracker never
+starts following a market it already knows it cannot observe.
+
 ## 🧹 Operator UI review: three lying instruments, two deletions, one falsified hypothesis — 2026-08-02
 
 Operator asked for a fresh-eyes UI pass (why do the market cards reshuffle on every refresh? do we
