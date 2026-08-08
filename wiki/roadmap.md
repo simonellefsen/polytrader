@@ -352,6 +352,54 @@ did, twice, in the other two tables. The test is now scoped to the settlements b
 absence of the bare-id cell. An assertion that cannot fail is worse than no assertion: it reports that
 something was checked.
 
+## 📡 P5 increment 3b — shadow maker quotes, tracked through time — 2026-08-08
+
+`scan_rewards` (2026-08-02) is a **snapshot estimator**: it reads one instant, computes our share of
+the qualifying depth, and multiplies by a full daily rate. Its own module docs name the two
+assumptions that buys, and neither had ever been measured:
+
+1. **That a quote keeps qualifying.** The estimate annualises an instantaneous share. If the mid
+   drifts out from under our price after twenty minutes, real capture is ~1/72 of the headline.
+2. **That resting is free.** "Adverse selection is not modelled at all, and it is the entire risk of
+   making." A resting order is filled precisely when the market moves against it.
+
+Neither is reachable from a snapshot, because both are about a specific price surviving over hours.
+So this tracks virtual quotes across cycles against the live book. It still places nothing and takes
+no position; the new state lives in `paper_trading.shadow_quotes`.
+
+**Fill P&L is measured one hour AFTER the fill, not at it — and this is the load-bearing design
+choice.** The fill trigger *is* the mid crossing our price, so a mark at t=0 is negative by
+construction: we would be reporting our own trigger condition back to ourselves as a finding. The
+horizon lets the move revert, and mean reversion is what a maker is actually paid for, so a bid
+filled on a downtick that recovers reads as the win it is. The sign of `horizon_pnl_usd` is
+therefore a result rather than an artifact.
+
+Rewards are integrated per interval at the share **re-observed that interval**, not extrapolated from
+placement — a quote crowded out mid-day earns the crowded rate from that point on, which is exactly
+the dynamic the snapshot estimator cannot see.
+
+**Bias recorded, not buried.** The mid-crossing fill rule UNDER-counts fills (a resting bid can be
+hit without the mid ever reaching it), so adverse selection is under-counted and the net is
+**optimistic**. Read a positive net as "not yet falsified", never as "proven". The honest fix needs a
+trade feed we do not currently receive.
+
+**First 15 minutes live** (too short to conclude anything, recorded as a shakedown):
+
+| cycle | open | placed | filled | accrued | duty cycle |
+|---|---|---|---|---|---|
+| 07:10 | 29 | 29 | 0 | $0 | — |
+| 07:15 | 32 | 3 | 0 | $0.0653 | 96.6% |
+| 07:20 | 31 | 0 | 1 | $0.1340 | 94.9% |
+
+Early duty cycle ~95% — close to the 100% the scanner assumes, which is mildly reassuring for
+assumption (1). One fill inside 15 minutes across ~31 quotes is the number to watch: it implies a
+turnover fast enough that assumption (2) is where the answer will actually come from. **Do not draw
+a conclusion until fills have cleared their 1h horizons and `horizon_pnl_usd` has a real sample.**
+
+GC prunes only FINISHED quotes (cancelled, or filled *and* horizon-marked). Age alone would delete a
+long-lived open quote — the single most informative case for the duty cycle — before it produced its
+number.
+
 ## 🧹 Operator UI review: three lying instruments, two deletions, one falsified hypothesis — 2026-08-02
 
 Operator asked for a fresh-eyes UI pass (why do the market cards reshuffle on every refresh? do we
@@ -686,14 +734,20 @@ the dated Decision-log entry below; this is the at-a-glance index.
     leg commits; `POLYTRADER_BASKET_PREFLIGHT=shadow` journals the counterfactual without changing
     behaviour. **Next action: read `preflight_outcome` after ~a day and flip to `enforce` if
     `would_have_forgone` is rare relative to `would_have_prevented`.**
-  - [ ] **Increment 3b — maker quoting.** Unblocked by 3a (a quoting strategy that lies about its
-    own fills is worse than none). The shadow rewards scanner has run 7 days / 1,645 scans and its
-    estimate has stopped moving — median **$40–50/day capturable on ~$2,500 of capital** against a
-    $8.3–9.8k/day pool. It has hit its measurement ceiling: every remaining question (can we hold a
-    quote inside `rewardsMaxSpread`, are we re-quoted before the book moves, is the share model
-    right) is downstream of actually resting an order. Note the estimate is MODELLED
-    (`our_size/(competing_depth + our_size)`), a first-order stand-in for Polymarket's real
-    proximity-weighted scoring — right order of magnitude, not a forecast.
+  - [x] **Increment 3b-1 — shadow maker quotes** → *DONE 2026-08-08, see the dated entry above.*
+    Virtual quotes tracked across cycles in `paper_trading.shadow_quotes`; still places nothing.
+    Produces the two numbers the snapshot scanner structurally cannot: the qualification duty cycle
+    and, netted against accrued rewards, adverse selection. **Next action: after fills clear their
+    1h horizons, read `horizon_pnl_usd` against `accrued_reward_usd` on the `maker_shadow_quotes`
+    events. If the net is negative, maker quoting is falsified here and increment 3b-2 should not be
+    built.**
+  - [ ] **Increment 3b-2 — actually quote (paper).** ONLY if 3b-1's net comes back positive. Would
+    need a resting-order primitive in the paper engine, which does not exist today: `submit_order`
+    matches immediately and rejects the remainder, so there is no notion of an order that sits in
+    the book and fills later. That is the real build, and 3b-1 exists so it is not started on faith.
+    Note the standing caveat that the share model is first-order
+    (`our_size/(competing_depth + our_size)`) against Polymarket's real proximity-weighted, generally
+    two-sided scoring — right order of magnitude, not a forecast.
 - [x] **Widen the negrisk funnel** (2026-07-25, from the Path B GO) → *DONE 2026-08-01. Triggered by
   the operator question "why are we not opening new positions, are we being too cautious?" — the
   directional throttle was deliberate (the P5 NO-GO), but arb, the GO path, had gone quiet and that
