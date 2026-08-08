@@ -387,6 +387,13 @@ impl PaperTradingEngine {
     /// Fills are planned against the same source `submit_order` will match on (live WS book where
     /// one is fresh and in sync, polled snapshot otherwise), so the plan and the commit agree by
     /// construction unless the book genuinely moves in between.
+    ///
+    /// Note that each leg's book is therefore loaded TWICE — once here and once by `submit_order`.
+    /// That is deliberate, not an oversight to optimise away. Caching the planned book and handing
+    /// it to the commit would make the plan right by construction and destroy the only measurement
+    /// that matters: `preflight_missed`, the rate at which the book moves between the decision and
+    /// the fill. This runs on the execution path (a handful of baskets an hour), not the scan path,
+    /// so the cost is a few extra reads against liquidity we are about to spend real size on.
     pub async fn plan_basket(&self, orders: &[PaperOrder]) -> Result<BasketPlan> {
         let mut legs = Vec::with_capacity(orders.len());
         for order in orders {
