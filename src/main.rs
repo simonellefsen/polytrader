@@ -2101,6 +2101,39 @@ async fn produce_arb_scan_journal(
 ///   cost, at +$12.78/event. Because that is ~5x the benefit per event, enforcement is only correct
 ///   if this cell is much rarer than `would_have_prevented` — which is exactly what shadow mode is
 ///   deployed to find out, and why the default is not `enforce`.
+/// Whether a basket that pre-flight wants to ABORT should be let through anyway, as a measurement
+/// holdout.
+///
+/// Enforcement has an epistemic cost that is easy to miss: an aborted basket commits nothing, so it
+/// never produces an outcome to compare the plan against, so `would_have_forgone` — the one cell
+/// that argues against enforcing — becomes **structurally unobservable**. Turning enforcement on
+/// therefore switches off the only measurement that could show enforcement is wrong. That is exactly
+/// the shape of mistake the pre-registered P5 criterion exists to prevent, and it applies to
+/// operational settings too.
+///
+/// So a small fraction of would-abort baskets execute anyway and get classified normally. It is the
+/// same reasoning that kept directional trading as a control arm at `ROTATION_LIMIT=5` rather than
+/// switching it off: keep the regime observable, at a cost bounded to a trickle.
+///
+/// Cost, measured: ~12 aborts per 10h at ~$2.57 of expected partial loss each, so a 10% holdout
+/// risks roughly **$0.31 per 10 hours** to keep the false-abort rate measurable. That is a very
+/// cheap insurance premium against silently running a rule that has stopped being right.
+///
+/// Selection is a hash of the event id, not an RNG: the same event always gets the same treatment,
+/// so a retried or re-scanned basket cannot flip between abort and holdout and pollute the sample.
+fn is_preflight_holdout(event_id: &str, holdout_pct: u32) -> bool {
+    if holdout_pct == 0 {
+        return false;
+    }
+    if holdout_pct >= 100 {
+        return true;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    event_id.hash(&mut h);
+    (h.finish() % 100) < holdout_pct as u64
+}
+
 fn classify_preflight_outcome(executable: bool, complete: bool) -> &'static str {
     match (executable, complete) {
         (true, true) => "predicted_complete",
@@ -2253,6 +2286,17 @@ async fn execute_negrisk_opportunity(
         .to_lowercase();
     let enforcing = preflight_mode == "enforce";
     let would_abort = plan.as_ref().is_some_and(|p| !p.is_executable());
+    // Keep the false-abort rate measurable under enforcement — see `is_preflight_holdout`.
+    let holdout_pct = std::env::var("POLYTRADER_BASKET_PREFLIGHT_HOLDOUT_PCT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(10);
+    let holdout = would_abort && enforcing && is_preflight_holdout(&opp.event_id, holdout_pct);
+    if holdout {
+        info!(event = %opp.event_id, holdout_pct,
+            "negrisk basket would ABORT but is a measurement holdout — executing to keep \
+             would_have_forgone observable");
+    }
 
     if let Some(p) = plan.as_ref() {
         info!(
@@ -2263,7 +2307,7 @@ async fn execute_negrisk_opportunity(
         );
     }
 
-    if would_abort && enforcing {
+    if would_abort && enforcing && !holdout {
         let p = plan.as_ref().expect("would_abort implies a plan exists");
         info!(event = %opp.event_id, short_legs = p.short_legs(),
             "negrisk basket aborted by pre-flight (nothing committed)");
@@ -2392,6 +2436,13 @@ async fn execute_negrisk_opportunity(
                     .as_ref()
                     .map(|p| p.worst_fill_ratio().round_dp(4).to_string()),
                 "preflight_outcome": preflight_outcome,
+                // True when pre-flight wanted to abort and this basket was let through anyway to
+                // keep the measurement alive. Under `enforce`, `would_have_forgone` and
+                // `would_have_prevented` can ONLY come from holdouts — every other would-abort
+                // basket is stopped before it produces an outcome. So the false-abort rate must be
+                // read as (forgone / (forgone + prevented)) over rows where this is true, NOT over
+                // all rows, or it will look far better than it is.
+                "preflight_holdout": holdout,
                 // Recorded on the EXECUTION event, not only on the abort event, because the abort
                 // event never fires in shadow mode — and shadow mode is where the learning happens.
                 // Without this the shadow run reports THAT a leg was short but never WHICH, and
@@ -2925,6 +2976,36 @@ mod tests {
     /// is (not executable, not complete) and the cost case is (not executable, complete), which
     /// differ by a single bool. Getting them the wrong way round would invert the enforcement
     /// decision while every number still looked plausible.
+    /// The holdout is what keeps enforcement falsifiable, so its selection must be STABLE — an RNG
+    /// would let a re-scanned basket flip between abort and holdout, biasing the very sample the
+    /// revert decision rests on.
+    #[test]
+    fn the_preflight_holdout_is_stable_per_event_and_honours_its_bounds() {
+        use super::is_preflight_holdout;
+        // Same event, same answer, every time.
+        let first = is_preflight_holdout("759351", 10);
+        for _ in 0..50 {
+            assert_eq!(is_preflight_holdout("759351", 10), first);
+        }
+        // 0 disables entirely (pure enforcement, measurement off); 100 holds everything out
+        // (equivalent to shadow for would-abort baskets).
+        assert!(!is_preflight_holdout("759351", 0));
+        assert!(!is_preflight_holdout("anything", 0));
+        assert!(is_preflight_holdout("759351", 100));
+        assert!(is_preflight_holdout("anything", 100));
+
+        // Roughly the requested rate across many distinct events. Loose bounds: this asserts the
+        // knob is wired to reality, not that a hash is uniform.
+        let n = 4000;
+        let held = (0..n)
+            .filter(|i| is_preflight_holdout(&format!("event-{i}"), 10))
+            .count();
+        assert!(
+            (200..600).contains(&held),
+            "10% holdout over {n} events produced {held}, which is not near 10%"
+        );
+    }
+
     #[test]
     fn preflight_outcomes_name_the_benefit_and_the_cost_the_right_way_round() {
         use super::classify_preflight_outcome;
