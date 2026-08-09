@@ -2032,8 +2032,13 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
                  that leg's outcome — and measured that day, 407 of 450 settlements (90.4%) were arb. \
                  The column was therefore ~90% a statement about how buy-all-No baskets resolve, and \
                  its drift toward 50% was arithmetic rather than evidence. Fire rate, raw score and \
-                 weight are NOT scoped this way — they cover every decision report. Realized P&L \
-                 populates at 10 settled.",
+                 weight are NOT scoped this way — they cover every decision report. EXPECT THIS \
+                 COLUMN TO BE SPARSE: crediting a signal needs the market's decision reports to \
+                 still exist, and GC prunes them, so of 42 directional settlements since the reset \
+                 only 5 still had reports (2026-08-09). A small n here is the honest number, not a \
+                 broken one — the arb settlements that used to pad it were never evidence about a \
+                 signal. It also means Settled P&L, which needs 10, may not populate for a long \
+                 time. Realized P&L populates at 10 settled.",
     });
 
     let gate_simulation = serde_json::json!({
