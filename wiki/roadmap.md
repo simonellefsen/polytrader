@@ -544,6 +544,40 @@ immediately re-truncate.
 measured mean being read as complete. Placement now requires `from_live_book`, so the tracker never
 starts following a market it already knows it cannot observe.
 
+### First real sample: n=29 fills over 40h — the aggregate is one observation from reversing
+
+| | 39.9h |
+|---|---|
+| Rewards accrued | +$15.54 |
+| Horizon P&L | −$8.45 |
+| **Net** | **+$7.10** |
+
+| fills | winners | losers | flat | mean | worst | best |
+|---|---|---|---|---|---|---|
+| 29 | 7 | 17 | 5 | **−$0.291** | −$7.50 | **+$15.00** |
+
+**Do not read the positive net as a result.** Leave-one-out:
+
+| | net |
+|---|---|
+| all 29 fills | +$7.10 |
+| drop the single BEST fill | **−$7.90** |
+| drop the single worst fill | +$14.60 |
+
+One fill flips the sign. That fill was a Bid at 0.325 for **200 shares** (4x the usual 50) in
+"Mojtaba Khamenei seen in public by December", where the mid jumped 0.315 → 0.400 within the hour —
+a directional windfall from being long into a jump, not maker edge.
+
+**This corroborates the volatility-ranking finding rather than contradicting it.** Quoting where our
+reward share is highest means quoting in the thinnest books, and thin books produce P&L dominated by
+rare large moves in both directions. The central tendency is squarely negative (mean −$0.291/fill,
+17 losers to 7 winners); the aggregate is a coin flip on tails. A strategy whose expectancy depends
+on winning the tail lottery in illiquid markets is not the "predicts nothing, collects rent" thesis
+the rewards scan was built to test.
+
+Still uncalibrated in both directions: undercounted fills understate adverse selection (optimistic),
+no re-quoting understates rewards (pessimistic). Neither is resolved.
+
 ## 🧹 Operator UI review: three lying instruments, two deletions, one falsified hypothesis — 2026-08-02
 
 Operator asked for a fresh-eyes UI pass (why do the market cards reshuffle on every refresh? do we
