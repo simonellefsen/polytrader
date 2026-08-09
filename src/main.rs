@@ -2237,12 +2237,16 @@ async fn execute_negrisk_opportunity(
         }
     };
 
-    // Shadow first, exactly as the WS feed itself shipped (`POLYTRADER_ENABLE_CLOB_WS=shadow`).
-    // The abort is never worse FOR A GIVEN BASKET — skipping beats holding a broken floor — but its
-    // opportunity cost is unmeasured: a pre-flight that is too strict rejects baskets that would
-    // have filled, and forgoing +$12.78/event costs far more than the -$2.57/event it saves. Shadow
-    // mode journals the counterfactual without changing behaviour so that rate can be read off real
-    // data before it is enforced.
+    // Shipped shadow-first, exactly as the WS feed itself did (`POLYTRADER_ENABLE_CLOB_WS=shadow`),
+    // because the abort is never worse FOR A GIVEN BASKET but its opportunity cost was unmeasured:
+    // a pre-flight that is too strict rejects baskets that would have filled, and forgoing
+    // +$12.78/event costs ~5x the -$2.57/event it saves.
+    //
+    // 2026-08-09: the deployment flipped to `enforce` after that rate was read off real data —
+    // 42 of 43 correct with `would_have_forgone` EMPTY across 22 abort opportunities (see the
+    // deploy yaml for the full table). The code default stays `shadow`: an unset or misspelled
+    // value must fall back to the mode that cannot forgo a profitable basket, never to the one that
+    // can. Enforcement is a deployment decision, not a code default.
     let preflight_mode = std::env::var("POLYTRADER_BASKET_PREFLIGHT")
         .unwrap_or_else(|_| "shadow".to_string())
         .trim()

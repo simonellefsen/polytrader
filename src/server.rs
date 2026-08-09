@@ -1831,11 +1831,32 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     .fetch_all(pool)
     .await
     .unwrap_or_default();
+    // DIRECTIONAL ENTRIES ONLY — the same scoping the gate simulation above already applies, and for
+    // the same reason. Signals govern the 5-min decision-report executor and nothing else; the arb
+    // executors read no signals at all. But a settled arb leg still HAS decision reports (the DR loop
+    // runs over the whole universe), so a signal "fired" in that market and the market later settled,
+    // and the old code counted it.
+    //
+    // Measured 2026-08-09: of everything settled since the reset, **407 (90.4%) came from arb entries
+    // and 43 (9.6%) from directional**. So a column reading "orderbook momentum 117-105 (53%)" was
+    // ~90% a statement about how buy-all-No baskets resolve, presented as signal accuracy — and its
+    // pull toward 50% is arithmetic, not evidence about the signal. The real directional sample is 43.
+    //
+    // Scoped by reusing `fill_rows` (the `autonomous_paper_execution` fills the gate simulation
+    // already loaded) rather than by a second definition of "directional", so the two cards cannot
+    // drift apart in what they count.
+    let directional_markets: std::collections::HashSet<String> = fill_rows
+        .iter()
+        .filter_map(|(m, _, _, _, _)| m.clone())
+        .collect();
     // Net realized P&L per settled market.
     let mut net_by_market: std::collections::HashMap<String, Decimal> =
         std::collections::HashMap::new();
     for (m, pnl) in settled_rows.into_iter() {
         if let (Some(m), Some(pnl)) = (m, pnl) {
+            if !directional_markets.contains(&m) {
+                continue;
+            }
             *net_by_market.entry(m).or_insert(Decimal::ZERO) += pnl;
         }
     }
@@ -2003,7 +2024,16 @@ async fn trades_data_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
                  2026-08-02. Weight (Hermes's learned trust) is still the better read of real \
                  influence. Settled \
                  record = win/loss of settled markets where the signal fired in the final decision \
-                 report (count-based, overlapping). Realized P&L populates at 10 settled.",
+                 report (count-based, overlapping). DIRECTIONAL ENTRIES ONLY, matching the gate \
+                 simulation below and for the same reason: signals govern the 5-min decision-report \
+                 executor and nothing else, while the arb executors read no signals at all. Arb legs \
+                 still GET decision reports (the DR loop runs over the whole universe), so before \
+                 2026-08-09 a signal that merely fired in a basket leg's market was credited with \
+                 that leg's outcome — and measured that day, 407 of 450 settlements (90.4%) were arb. \
+                 The column was therefore ~90% a statement about how buy-all-No baskets resolve, and \
+                 its drift toward 50% was arithmetic rather than evidence. Fire rate, raw score and \
+                 weight are NOT scoped this way — they cover every decision report. Realized P&L \
+                 populates at 10 settled.",
     });
 
     let gate_simulation = serde_json::json!({
@@ -2449,7 +2479,7 @@ function renderSignals(s){
     </tr>`;
   };
   el.innerHTML = `<table>
-    <tr><th>Signal</th><th title="Share of recent decision reports where this signal contributed a non-zero score">Fire rate</th><th title="Average absolute RAW score when it fires. This used to overstate influence for the two advisory signals (news_sentiment, yahoo_finance), whose raw scores ran far above market-internal ones while the domination cap bounded their real contribution — both were retired 2026-08-02, so every signal here is now market-internal and uncapped. Weight (Hermes's learned trust) remains the better read of real sway.">Raw score</th><th title="Hermes's current confidence multiplier (1.00× = neutral)">Weight</th><th title="Win-loss record of settled markets (by net realized P&amp;L) where this signal fired in the final decision report. Available now, independent of Hermes.">Settled record</th><th title="Realized P&amp;L attributed to this signal (Hermes proportional split); populates at 10 settled">Settled P&amp;L</th></tr>
+    <tr><th>Signal</th><th title="Share of recent decision reports where this signal contributed a non-zero score">Fire rate</th><th title="Average absolute RAW score when it fires. This used to overstate influence for the two advisory signals (news_sentiment, yahoo_finance), whose raw scores ran far above market-internal ones while the domination cap bounded their real contribution — both were retired 2026-08-02, so every signal here is now market-internal and uncapped. Weight (Hermes's learned trust) remains the better read of real sway.">Raw score</th><th title="Hermes's current confidence multiplier (1.00× = neutral)">Weight</th><th title="DIRECTIONAL ENTRIES ONLY. Win-loss record of settled markets (by net realized P&amp;L) where this signal fired in the final decision report. Arb/negRisk settlements are excluded — those entries read no signals, and including them made this ~90% a measure of how baskets resolve (407 of 450 settlements on 2026-08-09). Available now, independent of Hermes.">Settled record <span class="pill dir">dir</span></th><th title="Realized P&amp;L attributed to this signal (Hermes proportional split); populates at 10 settled">Settled P&amp;L</th></tr>
     ${s.rows.map(row).join("")}
   </table>
   <div class="t" style="padding:8px 2px;">${s.note||""}</div>`;
@@ -5992,6 +6022,44 @@ mod tests {
         assert!(
             page.contains("not in the decision-report pool"),
             "the no-DR case must survive the priced-out branch"
+        );
+    }
+
+    /// The scorecard's Settled record had the SAME defect the gate simulation was fixed for, and
+    /// sat directly above it looking equally authoritative. Signals govern the 5-min decision-report
+    /// executor only; arb executors read none. But arb legs still get decision reports, so a signal
+    /// that merely fired in a basket leg's market was credited with that leg's outcome — and on
+    /// 2026-08-09, 407 of 450 settlements (90.4%) were arb, making the column ~90% a statement about
+    /// how buy-all-No baskets resolve.
+    #[test]
+    fn the_scorecard_settled_record_declares_its_directional_scope() {
+        let page = render_trades_page("");
+        let header = page
+            .split("Settled record")
+            .next()
+            .and_then(|_| page.split("<th title=\"DIRECTIONAL ENTRIES ONLY.").nth(1))
+            .expect("settled-record header must carry the scope in its tooltip");
+        assert!(
+            header.contains("read no signals"),
+            "the tooltip must say WHY arb is excluded, not just that it is"
+        );
+        // Visible without hovering — a tooltip alone repeats the original mistake of letting the
+        // number be read at face value.
+        assert!(
+            page.contains(r#"Settled record <span class="pill dir">dir</span>"#),
+            "the scope must be visible in the column header itself"
+        );
+        // Fire rate / raw score / weight are NOT directional-scoped (they cover every decision
+        // report), so a blanket card-level pill would be its own lie. Assert the scope is attached
+        // to the settled column rather than the whole scorecard.
+        let scorecard = page
+            .split("<h2>Signal Scorecard")
+            .nth(1)
+            .expect("scorecard heading");
+        let scorecard_heading = &scorecard[..scorecard.find("</h2>").expect("heading end")];
+        assert!(
+            !scorecard_heading.contains("directional only"),
+            "the whole scorecard is NOT directional-only; only its settled columns are"
         );
     }
 

@@ -249,15 +249,34 @@ spec:
             # Difference in means t ~ 3.07. More to the point it is structural, not statistical: a
             # complete basket cannot lose.
             #
-            # "shadow" (default) computes the plan and journals the counterfactual WITHOUT changing
-            # behaviour. "enforce" aborts baskets that fail pre-flight. Shadow comes first because
-            # the abort's opportunity cost is unmeasured and asymmetric: a basket wrongly aborted
-            # forgoes +$12.78 while a partial correctly prevented saves only -$2.57, so enforcement
-            # is right only if `would_have_forgone` is much rarer than `would_have_prevented`. Both
-            # are counted on every autonomous_negrisk_arb_execution event as `preflight_outcome`.
-            # Flip to "enforce" against those counts, not against the theory.
+            # "shadow" computes the plan and journals the counterfactual WITHOUT changing behaviour.
+            # "enforce" aborts baskets that fail pre-flight.
+            #
+            # 2026-08-09: shadow -> ENFORCE, operator-approved, against the counts the shadow run was
+            # deployed to produce (n=43 outcomes over ~21h):
+            #
+            #   predicted_complete     20   $4,923.61 committed
+            #   would_have_prevented   22   $  135.94 committed into already-broken baskets
+            #   preflight_missed        1   $    9.90  (book moved between plan and commit)
+            #   would_have_forgone      0
+            #
+            # 42 of 43 correct. The cell that argues AGAINST enforcing is EMPTY after 22 separate
+            # opportunities to appear — pre-flight aborted 22 baskets and every one of them did come
+            # up short. Break-even on the documented asymmetry (+$2.57 saved vs -$12.78 forgone) is a
+            # ~17% false-abort rate; 0/22 puts a rate that high far outside the plausible range.
+            #
+            # Two supporting observations, both stronger than the raw count. First, the failure mode
+            # is TOTAL rather than marginal: every rejected basket reported worst_fill_ratio 0 — a leg
+            # with no fillable size at our limit, not one slightly short — so pre-flight is
+            # discriminating "unavailable", not making close calls. Second, it preserves the capital
+            # that matters: $4,923.61 passed against $135.94 blocked.
+            #
+            # `preflight_missed` (1 of 21 passing baskets) is the irreducible residual and enforcement
+            # does NOT remove it — the book can still move between plan and commit. Revert to "shadow"
+            # if `would_have_forgone` starts appearing; it is still journaled under enforcement,
+            # because an aborted basket records the plan that would have run.
             - name: POLYTRADER_BASKET_PREFLIGHT
-              value: "shadow"
+              value: "enforce"
             # P6 turnover budget (2026-07-12): max autonomous directional ENTRIES per UTC day.
             # Friction is paid per trade while the directional book runs ~flat gross, so the
             # marginal entry is usually P&L-negative. Exits + risk-free arb are NOT capped. 0 = off.
