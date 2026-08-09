@@ -2335,6 +2335,13 @@ async fn execute_negrisk_opportunity(
 
     let mut filled_legs = 0usize;
     let mut total_filled_cost = dec!(0);
+    // Deferred until every leg has been committed — see the shadow call below the loop for why.
+    let mut to_shadow: Vec<(usize, String, uuid::Uuid, bool)> = Vec::with_capacity(opp.legs.len());
+    // The commit window: first leg submitted to last leg committed. This is the interval over which
+    // the pre-flight's one-instant book read has to remain true, so it is the number that bounds how
+    // well pre-flight can possibly work. Journaled so the effect of moving the exchange round-trip
+    // out of this loop is verifiable rather than assumed.
+    let commit_started = std::time::Instant::now();
     for (leg_index, (leg, order)) in opp.legs.iter().zip(orders).enumerate() {
         // The order is the one the pre-flight actually vetted, not a rebuild of it — a second
         // construction here could drift from the plan (a different limit, a different size) and the
@@ -2359,20 +2366,36 @@ async fn execute_negrisk_opportunity(
             }
         };
 
-        // Shadow the REAL order this leg would send (2026-07-28). Until now the shadow pipeline ran
-        // ONLY off the directional executor, so the one strategy with positive expectancy — and the
-        // only one a real-money switch would be for — had never had a single order validated against
-        // the live exchange. Every leg is shadowed, filled or not: an unfilled leg is itself the
-        // finding, since a basket missing a leg is not an arb. $0 risk (fail-closed sender).
+        to_shadow.push((leg_index, leg.market_id.clone(), order_id, leg_filled));
+    }
+    let commit_window_ms = commit_started.elapsed().as_millis() as u64;
+
+    // Shadow the REAL orders these legs would send (2026-07-28) — AFTER every leg is committed, not
+    // between them (moved 2026-08-09).
+    //
+    // `shadow_real_order` makes a network round-trip to the live exchange (`dry_run_order_intent`)
+    // plus a token lookup and a journal write. Awaiting that BETWEEN legs put it directly in the
+    // window the pre-flight is trying to make instantaneous, and the cost was measured, not
+    // theoretical: over 24h the fill window (first leg to last) averaged **16.4s** for baskets that
+    // completed and **151.6s** for the ones that came up short despite passing pre-flight — a 9x
+    // difference, with a 302s worst case. A pre-flight that reads every book at one instant is
+    // worthless if the commits it authorises then straggle over two and a half minutes.
+    //
+    // Causality is not fully separable here (a struggling leg may be slow BECAUSE it is not filling,
+    // rather than failing because it was slow) and n=2 on the broken side. The change is made anyway
+    // because it is safe in both readings: the shadow is an audit artifact with $0 risk and nothing
+    // downstream of it affects the fill, so there is no reason for it to sit in the critical path.
+    // Every leg is still shadowed, filled or not — an unfilled leg is itself the finding.
+    for (leg_index, market_id, order_id, leg_filled) in to_shadow {
         shadow_real_order(
             pool,
             journal,
-            &leg.market_id,
+            &market_id,
             "No",
             "buy",
             "limit",
             units,
-            leg.ask_no,
+            opp.legs[leg_index].ask_no,
             &order_id.to_string(),
             &ShadowOrderContext {
                 expected_edge_bps: Some(basket_edge_bps),
@@ -2394,7 +2417,7 @@ async fn execute_negrisk_opportunity(
     }
     let complete = filled_legs == opp.legs.len();
     info!(event = %opp.event_id, legs = opp.legs.len(), filled_legs, %units, complete,
-        "autonomous negrisk arb executed (paper-only)");
+        commit_window_ms, "autonomous negrisk arb executed (paper-only)");
 
     // Plan-vs-actual. This is the measurement that decides whether pre-flight is worth enforcing,
     // and it splits four ways:
@@ -2436,6 +2459,12 @@ async fn execute_negrisk_opportunity(
                     .as_ref()
                     .map(|p| p.worst_fill_ratio().round_dp(4).to_string()),
                 "preflight_outcome": preflight_outcome,
+                // First leg submitted to last leg committed. The pre-flight reads every book at one
+                // instant; this is how long that reading has to stay true, so it bounds how well
+                // pre-flight can work at all. Measured over 24h BEFORE the exchange round-trip was
+                // moved out of this loop: 16.4s average for baskets that completed, 151.6s for those
+                // that came up short despite passing, 302s worst case.
+                "commit_window_ms": commit_window_ms,
                 // True when pre-flight wanted to abort and this basket was let through anyway to
                 // keep the measurement alive. Under `enforce`, `would_have_forgone` and
                 // `would_have_prevented` can ONLY come from holdouts — every other would-abort
