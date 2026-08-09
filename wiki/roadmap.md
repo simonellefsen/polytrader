@@ -367,8 +367,53 @@ payout floor was already broken. This is coherent rather than lucky: `units` is 
 thinnest-leg depth, so a small unit count is itself evidence that some leg is nearly empty, and
 pre-flight catches the same condition directly and more precisely.
 
-**Still n=6 and shadow stays on.** `would_have_forgone` is the cell that decides this and it needs
-opportunities to appear before its emptiness means anything.
+### ✅ ENFORCE — 2026-08-09, operator-approved at n=43
+
+| `preflight_outcome` | n | capital |
+|---|---|---|
+| `predicted_complete` | 20 | $4,923.61 |
+| `would_have_prevented` | 22 | $135.94 |
+| `preflight_missed` | 1 | $9.90 |
+| `would_have_forgone` | **0** | — |
+
+42 of 43 correct, and **the cell that argues against enforcing is empty after 22 separate
+opportunities to appear** — pre-flight aborted 22 baskets and every one came up short. Break-even on
+the documented asymmetry (+$2.57 saved vs −$12.78 forgone) is a ~17% false-abort rate; 0/22 puts a
+rate that high far outside the plausible range.
+
+The **code default stays `shadow`** deliberately: an unset or misspelled value must fall back to the
+mode that cannot forgo a profitable basket. Enforcement is a deployment decision, not a code default.
+`preflight_missed` is the irreducible residual and enforcement does **not** remove it. Revert to
+`shadow` if `would_have_forgone` starts appearing — it is still journaled under enforcement, because
+an aborted basket records the plan that would have run.
+
+### The Signal Scorecard had the same defect the gate simulation was fixed for — 2026-08-09
+
+It sat directly ABOVE the fixed card, looking equally authoritative, and nobody had scoped it.
+Signals govern the 5-min decision-report executor and nothing else; the arb executors read none. But
+arb legs still get decision reports (the DR loop covers the whole universe), so a signal that merely
+fired in a basket leg's market was credited with that leg's outcome. Measured: **407 of 450
+settlements (90.4%) were arb**, so "orderbook momentum 117-105 (53%)" was ~90% a statement about how
+buy-all-No baskets resolve, and its drift toward 50% was arithmetic rather than evidence.
+
+Scoped by reusing `fill_rows` — the `autonomous_paper_execution` fills the gate simulation already
+loads — so the two cards cannot drift apart in what they count. Fire rate, raw score and weight are
+deliberately NOT scoped (they cover every decision report), so the marker sits on the settled column
+rather than the card, and a test asserts it is *not* on the card heading.
+
+**The fix exposed a second, pre-existing limitation** that the arb padding had hidden: crediting a
+signal needs the market's decision reports to still exist, and GC prunes them.
+
+| | |
+|---|---|
+| directional markets | 63 |
+| settled markets | 462 |
+| directional **and** settled | 42 |
+| …with surviving decision reports | **5** |
+
+So the column reads 5-0 and 3-0 where it read 117-105 and 113-107. That is the honest number — the
+arb settlements that used to fill it were never evidence about a signal — but it means Settled P&L,
+which needs 10, may not populate for a long time. Said on the page rather than left to look broken.
 
 Also fixed the same day: the settlements table was still rendering bare gamma ids. The 2026-08-07 fix
 had landed on the executions and open-positions tables (loop variable `r`) but not settlements (loop
