@@ -295,6 +295,14 @@ spec:
             # would-abort basket is stopped before it produces an outcome, so including them makes
             # the rate look far better than it is. 0 disables the holdout (pure enforcement, no
             # measurement); 100 is equivalent to shadow for would-abort baskets.
+            #
+            # Selection is deterministic per event (a hash, not an RNG) so retries of one scan cannot
+            # flicker between abort and holdout. That alone was NOT enough: a chronically unfillable
+            # event is re-scanned every 5 minutes and hashes the same way each time, so it was pinned
+            # permanently into the holdout arm — observed 2026-08-10, event 756280 held out 3 times
+            # in 10 minutes, committing $81.13 cumulatively into a basket already known to be broken,
+            # and turning a "0 of 3" false-abort rate into a real 0 of 1. A 6h per-event cooldown
+            # (`recently_held_out`) now bounds both the capital and the fake independence.
             - name: POLYTRADER_BASKET_PREFLIGHT_HOLDOUT_PCT
               value: "10"
             # P6 turnover budget (2026-07-12): max autonomous directional ENTRIES per UTC day.

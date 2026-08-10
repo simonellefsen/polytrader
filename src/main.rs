@@ -2119,8 +2119,16 @@ async fn produce_arb_scan_journal(
 /// risks roughly **$0.31 per 10 hours** to keep the false-abort rate measurable. That is a very
 /// cheap insurance premium against silently running a rule that has stopped being right.
 ///
-/// Selection is a hash of the event id, not an RNG: the same event always gets the same treatment,
-/// so a retried or re-scanned basket cannot flip between abort and holdout and pollute the sample.
+/// Selection is a hash of the event id, not an RNG, so the decision is deterministic rather than
+/// flickering between abort and holdout on retries of the same scan.
+///
+/// **This is necessary but NOT sufficient — see `recently_held_out`.** Determinism across retries is
+/// what we want; determinism across repeated SCANS is not, and the first version of this had no way
+/// to tell them apart. A chronically unfillable event is re-scanned every 5 minutes, hashes the same
+/// way every time, and so was pinned permanently into the holdout arm: observed live 2026-08-10,
+/// event 756280 held out 3 times in 10 minutes, committing $81.13 cumulatively into a basket already
+/// known to be broken. Worse, it corrupted the very sample the holdout exists to protect — those
+/// three observations are one event, so a "0 of 3" false-abort rate was really 0 of 1.
 fn is_preflight_holdout(event_id: &str, holdout_pct: u32) -> bool {
     if holdout_pct == 0 {
         return false;
@@ -2132,6 +2140,36 @@ fn is_preflight_holdout(event_id: &str, holdout_pct: u32) -> bool {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     event_id.hash(&mut h);
     (h.finish() % 100) < holdout_pct as u64
+}
+
+/// How long an event stays ineligible for another holdout after being held out once.
+///
+/// Bounds both failure modes of a purely deterministic selection: the capital repeatedly committed
+/// into one known-broken basket, and the fake independence of counting the same event N times in the
+/// false-abort denominator. Six hours is comfortably longer than the 5-minute scan cadence that
+/// caused the problem, while still letting a genuinely recurring event contribute more than one
+/// observation across a multi-day sample.
+const HOLDOUT_COOLDOWN_HOURS: i64 = 6;
+
+/// Whether this event has already been held out recently, making it ineligible for another.
+///
+/// Fails CLOSED (returns true, i.e. "treat as recently held out, so abort normally") when the query
+/// errors: the safe direction is to enforce, since a failed lookup should not become a licence to
+/// commit capital into a basket pre-flight wants to reject.
+async fn recently_held_out(pool: &sqlx::PgPool, event_id: &str) -> bool {
+    let q = format!(
+        "SELECT EXISTS (
+             SELECT 1 FROM journal.events
+             WHERE event_type = 'autonomous_negrisk_arb_execution'
+               AND (payload->>'preflight_holdout')::bool IS TRUE
+               AND payload->>'event_id' = $1
+               AND created_at > now() - interval '{HOLDOUT_COOLDOWN_HOURS} hours')"
+    );
+    sqlx::query_scalar::<_, bool>(&q)
+        .bind(event_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(true)
 }
 
 fn classify_preflight_outcome(executable: bool, complete: bool) -> &'static str {
@@ -2291,7 +2329,12 @@ async fn execute_negrisk_opportunity(
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(10);
-    let holdout = would_abort && enforcing && is_preflight_holdout(&opp.event_id, holdout_pct);
+    // Both conditions are required: the hash makes the decision deterministic across retries, the
+    // cooldown stops a re-scanned event from being pinned in the holdout arm forever.
+    let holdout = would_abort
+        && enforcing
+        && is_preflight_holdout(&opp.event_id, holdout_pct)
+        && !recently_held_out(pool, &opp.event_id).await;
     if holdout {
         info!(event = %opp.event_id, holdout_pct,
             "negrisk basket would ABORT but is a measurement holdout — executing to keep \
@@ -3032,6 +3075,17 @@ mod tests {
         assert!(
             (200..600).contains(&held),
             "10% holdout over {n} events produced {held}, which is not near 10%"
+        );
+
+        // The property that made this insufficient on its own, pinned so it is not mistaken for a
+        // bug later: determinism means a RE-SCANNED event selects identically every cycle, which is
+        // why `recently_held_out` has to gate it. Live on 2026-08-10 that gap held one event out 3
+        // times in 10 minutes, committing $81.13 into a basket already known to be broken and making
+        // a 0-of-3 false-abort rate really 0 of 1.
+        assert!(
+            is_preflight_holdout("756280", 100) && is_preflight_holdout("756280", 100),
+            "selection is deterministic per event; the cooldown, not the hash, is what stops \
+             a re-scanned event being held out repeatedly"
         );
     }
 
