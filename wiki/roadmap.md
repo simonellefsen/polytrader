@@ -367,6 +367,39 @@ payout floor was already broken. This is coherent rather than lucky: `units` is 
 thinnest-leg depth, so a small unit count is itself evidence that some leg is nearly empty, and
 pre-flight catches the same condition directly and more precisely.
 
+### The "irreducible residual" was mostly self-inflicted latency — 2026-08-09/10
+
+`preflight_missed` had been described (by me, repeatedly) as the irreducible residual: the book
+moving between plan and commit, something no pre-flight can remove. Measuring the window falsified
+that framing.
+
+Fill window, first leg to last, over 24h:
+
+| outcome | baskets | avg window | max |
+|---|---|---|---|
+| `predicted_complete` | 19 | **16.4s** | 302s |
+| `preflight_missed` | 2 | **151.6s** | 302s |
+
+A 9x difference — and a pre-flight that reads every book at one instant is worthless if the commits
+it authorises then straggle over two and a half minutes. Median inter-leg gap was 0.24s, so this was
+a heavy tail rather than a uniform cost.
+
+**Cause:** `shadow_real_order` makes a network round-trip to the live exchange
+(`dry_run_order_intent`) plus a token lookup and journal write, and it was awaited BETWEEN legs —
+inside the very window pre-flight exists to make instantaneous. Moved to after the commit loop. It is
+an audit artifact with $0 risk and nothing downstream of it affects the fill, so it had no business
+in the critical path. Every leg is still shadowed.
+
+**Measured after (n=5): median 0.02s, max 0.04s.** A ~800x reduction, and the arithmetic reconciles —
+16.4s over 3 legs is ~5.5s/leg, almost exactly one HTTP round-trip to the exchange. The round-trip
+was not part of the commit window, it was essentially all of it.
+
+**What this does and does not establish.** The window measurement is direct and unambiguous. Whether
+the *residual rate* falls with it is NOT yet testable: 0 residuals in 5 baskets is unremarkable
+against an ~8% base rate, and needs ~40+ baskets to read. `commit_window_ms` is journaled on every
+execution so a future residual arriving WITH a fast window would falsify the latency explanation
+outright.
+
 ### ✅ ENFORCE — 2026-08-09, operator-approved at n=43
 
 | `preflight_outcome` | n | capital |
