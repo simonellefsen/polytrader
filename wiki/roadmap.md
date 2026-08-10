@@ -661,6 +661,28 @@ Recorded rather than acted on: closing out a strategy line is an operator call, 
 biases (undercounted fills flatter it, no re-quoting penalises it) remain unresolved. But nothing in
 the data now argues for building the resting-order primitive that 3b-2 would need.
 
+### n=41 — the negative survives leave-one-out
+
+| | n=29 | n=36 | n=41 |
+|---|---|---|---|
+| mean/fill | −$0.291 | −$0.860 | **−$0.968** |
+| median | — | −$0.575 | **−$1.000** |
+| net | +$7.10 | −$10.60 | **−$16.93** |
+| drop the worst fill | flips positive | flips positive | **stays −$1.93** |
+| losers : winners | 17 : 7 | 22 : 9 | **26 : 9** |
+
+Rewards +$22.76 against adverse selection −$39.70. It now takes removing the TWO worst fills to flip
+the sign (+$5.57), where at n=29 and n=36 a single fill did it.
+
+Every statistic has moved the same direction as n grew, and the loss rate has been stable at ~71-74%
+throughout. That is the signature of a real effect; noise wanders. Combined with the mechanism
+already established independently (reward ranking IS volatility ranking, n=39 markets, monotonic
+across four depth buckets), **maker quoting is falsified on this venue at this size** — not "needs
+tuning", because the ranking that finds the reward is the ranking that finds the risk.
+
+The two biases still stand and still point opposite ways. Note the one that flatters the result
+(undercounted fills → understated adverse selection) argues the true picture is WORSE, not better.
+
 ## 🧹 Operator UI review: three lying instruments, two deletions, one falsified hypothesis — 2026-08-02
 
 Operator asked for a fresh-eyes UI pass (why do the market cards reshuffle on every refresh? do we
