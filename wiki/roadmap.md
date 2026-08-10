@@ -479,6 +479,48 @@ did, twice, in the other two tables. The test is now scoped to the settlements b
 absence of the bare-id cell. An assertion that cannot fail is worse than no assertion: it reports that
 something was checked.
 
+## ❌ Ladder dutch-book: FALSIFIED in SQL, no code written — 2026-08-10
+
+Run as the cheapest test of the only structural fix identified for the sports concentration below.
+Both forms are dead. Total cost ~15 minutes of queries and zero lines of code.
+
+**Form 1 — dutch-book across mutually-exclusive tiers. Already covered.** The premise was that ladder
+tiers partition a range and so must sum to 1 like a negRisk event, but sit in *separate* events the
+scanner never compares. False: Polymarket tags true partitions itself. Every one of the **278 active
+temperature markets across 46 events** is `neg_risk = t`, as are all the Truth Social post-count
+ladders (events 814063 / 779810 / 746260). The existing scanner already reads them. There is no
+uncovered population.
+
+**Form 2 — nested-implication (monotonicity) arb. Real structure, no opportunities.** The non-negRisk
+multi-member events turn out to be overwhelmingly NESTED rather than partitioned — "Bitcoin dip to
+$40k/$50k/$60k" (19 members), "WTI hit (HIGH) $100" (17), "Israel x Iran ceasefire through Aug 10/15"
+(17, nested by DATE), sports O/U lines. Nesting supports a different and genuinely uncovered arb: if
+A implies B then P(A) <= P(B), so Yes(B) + No(A) pays >= $1 in every state, an arb whenever
+`ask_yes(B) < bid_yes(A)`.
+
+Tested across the whole population: 973 comparable pairs, **25 apparent violations** in mid-price
+(19 higher-is-harder, 6 lower-is-harder). Every one is an artifact:
+
+| harder | easier | oldest book | bid on harder | tradeable |
+|---|---|---|---|---|
+| ETH reach $2,000 | ETH reach $2,200 | 54.1h | none | no |
+| ETH reach $2,000 | ETH reach $2,100 | 56.2h | none | no |
+| ETH above … | ETH above … | 77.6h | none | no |
+
+Books 2-3 days stale, **no bids at all** on the harder side, and prices of 0.0005 against 0.0025 —
+the "violation" is one tick of noise at half a cent in dead markets. The 22 others had no book
+snapshot to check. Zero tradeable.
+
+This should not be surprising in hindsight: monotonicity across a threshold ladder is the single most
+visible relationship in a book, so it is the first thing any participant arbitrages away. The lesson
+worth keeping is that **`last_mid_yes` alone manufactures arbitrage** — a stale mid against a fresh
+one produced 25 false positives, and the freshness + real bid/ask check killed all of them. Any future
+cross-market scanner must gate on book age on BOTH sides before comparing.
+
+**Consequence: the sports concentration below has no identified remedy.** Both candidate fixes are now
+dead (maker quoting falsified at n=41, ladder dutch-book falsified here). That is worth stating
+plainly rather than replacing with a fresh guess.
+
 ## ⚠️ The edge is not "arb" — it is SPORTS arb, and it has a fixture calendar — 2026-08-10
 
 Noticed because the system went quiet: realized moved **+$3.11 in 14 hours** (against +$103 the night
