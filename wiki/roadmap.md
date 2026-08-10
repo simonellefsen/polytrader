@@ -635,6 +635,32 @@ the rewards scan was built to test.
 Still uncalibrated in both directions: undercounted fills understate adverse selection (optimistic),
 no re-quoting understates rewards (pessimistic). Neither is resolved.
 
+### n=36 — the MEDIAN goes negative, which is the statistic that matters
+
+| | |
+|---|---|
+| Rewards | +$20.34 |
+| Adverse selection | **−$30.95** |
+| Net | −$10.60 |
+
+| fills | win | loss | flat | mean | **median** | worst | best |
+|---|---|---|---|---|---|---|---|
+| 36 | 9 | 22 | 5 | −$0.860 | **−$0.575** | −$15.00 | +$15.00 |
+
+At n=29 only the MEAN was negative, which tails alone can produce. A negative **median**, plus 22
+losers to 9 winners, says the TYPICAL fill loses — and that does not depend on the tail.
+
+Held to the same standard applied to the positive result: dropping the worst fill takes net to
+**+$4.40**, so the AGGREGATE is still noise. The distinction is the point. Per-fill economics:
+negative and robust. Total: undetermined and probably will stay that way, because a distribution this
+tail-heavy does not converge quickly — which is itself the volatility-ranking finding restated.
+
+**The pre-registered stop condition for 3b-2 ("if the net comes back negative, maker quoting is
+falsified here and 3b-2 should not be built") is now MET**, and the better statistic agrees with it.
+Recorded rather than acted on: closing out a strategy line is an operator call, and the two known
+biases (undercounted fills flatter it, no re-quoting penalises it) remain unresolved. But nothing in
+the data now argues for building the resting-order primitive that 3b-2 would need.
+
 ## 🧹 Operator UI review: three lying instruments, two deletions, one falsified hypothesis — 2026-08-02
 
 Operator asked for a fresh-eyes UI pass (why do the market cards reshuffle on every refresh? do we
