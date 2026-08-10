@@ -400,6 +400,30 @@ against an ~8% base rate, and needs ~40+ baskets to read. `commit_window_ms` is 
 execution so a future residual arriving WITH a fast window would falsify the latency explanation
 outright.
 
+### The holdout mechanism built a directional position — 2026-08-10
+
+The 10% holdout added to keep enforcement falsifiable selected deterministically per event, so a
+chronically unfillable event re-scanned every 5 minutes was pinned into the holdout arm on every
+cycle. Event 756280:
+
+| execution | legs | filled | units |
+|---|---|---|---|
+| 02:01 | 3 | 2 | 77.21 |
+| 02:06 | 3 | 1 | 5 |
+| 02:11 | 3 | 1 | 5 |
+
+Accumulated holding: **87.21 / 77.21 / 0** — two legs of a three-way event, unevenly sized, third leg
+never filled. That is a DIRECTIONAL position with no payout floor: precisely the failure mode this
+whole increment exists to prevent, manufactured by the mechanism added to measure it.
+
+Two lessons worth keeping. First, a single holdout creating a partial position is INHERENT and
+accepted — that is what letting one through to observe the outcome means, at ~$2.57 expected. What
+was not acceptable was doing it repeatedly to one event and accumulating uneven legs. Second, the
+sample it corrupted was its own: three observations of one event made a "0 of 3" false-abort rate
+really 0 of 1.
+
+Realised cost ~−$4. Fixed by a 6h per-event cooldown; 3 holdouts total, none since.
+
 ### ✅ ENFORCE — 2026-08-09, operator-approved at n=43
 
 | `preflight_outcome` | n | capital |
