@@ -479,6 +479,50 @@ did, twice, in the other two tables. The test is now scoped to the settlements b
 absence of the bare-id cell. An assertion that cannot fail is worse than no assertion: it reports that
 something was checked.
 
+## ⚠️ The edge is not "arb" — it is SPORTS arb, and it has a fixture calendar — 2026-08-10
+
+Noticed because the system went quiet: realized moved **+$3.11 in 14 hours** (against +$103 the night
+before), `fees_paid` did not change AT ALL — meaning zero fills — open positions fell 9 → 3, exposure
+to 0.4%, and the P&L chart went flat for ~20 hours.
+
+Not a bug. The scanner was healthy throughout (11-12 scans/hour, 24-28 events) and
+`best_implied_yes_sum` sat at **~1.0000** (0.9985-1.0002) — precisely the break-even line, below the
+fee-adjusted bar. There was simply nothing to find.
+
+**Cause: universe composition.** Measured in the same window:
+
+| universe | markets | events |
+|---|---|---|
+| other / long-dated | 432 | 33 |
+| **sports (daily-resolving)** | **18** | **6** |
+
+Monday, almost no fixtures. Yesterday the executor ran 2-5 baskets/hour on Nashville, Chicago Fire,
+Orlando City, Botafogo. Long-dated politics events (the ~10-candidate Ethiopia PM ladder, all at
+99%+ NO) price tight because nothing drives flow through them.
+
+**The concentration this exposes has never been named.** P&L by market class since the reset:
+
+| class | settlements | realized | share |
+|---|---|---|---|
+| **sports (daily-resolving)** | 338 | **$1,704.99** | **86.1%** |
+| other / long-dated | 213 | $276.34 | 13.9% |
+
+86.1% matches the strategy attribution (86.2% negRisk baskets) almost exactly, which means **negRisk
+arb IS sports arb**. The roadmap has said "arb is the entire edge" since 2026-07-25; the sharper and
+more actionable statement is that the entire edge is three-way daily-resolving match markets
+(home / away / draw), and it stops when the fixtures stop.
+
+Consequences worth carrying into any real-money plan:
+
+1. **Earnings are gated by a fixture calendar**, not by capital, not by opportunity detection. Daily
+   P&L is lumpy in a *predictable* way, and a quiet day is not a signal that anything is broken.
+2. **The funnel-widening work helped but did not diversify.** The completion pass and MIN_MEMBERS 3→2
+   pulled more baskets out of the same event class.
+3. **This makes the remaining P5 strategy candidates strategically important rather than optional** —
+   dutch-book across ladder tiers, and cross-event arb via a shared underlying, are the only
+   identified paths that do not depend on the fixture list. With 3b (maker) falsified, they are now
+   the highest-value open direction.
+
 ## 📡 P5 increment 3b — shadow maker quotes, tracked through time — 2026-08-08
 
 `scan_rewards` (2026-08-02) is a **snapshot estimator**: it reads one instant, computes our share of
