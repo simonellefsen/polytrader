@@ -2515,6 +2515,21 @@ async fn execute_negrisk_opportunity(
                 // read as (forgone / (forgone + prevented)) over rows where this is true, NOT over
                 // all rows, or it will look far better than it is.
                 "preflight_holdout": holdout,
+                // WHICH BOUND ACTUALLY BINDS. `units` is min(depth bound, collateral bound), and
+                // without recording both there is no way to answer "would raising the cap have
+                // helped?" — the sizing question that matters most on fixture days.
+                //
+                // Why it matters (measured 2026-08-11): the $1500 cap binds on only ~7% of baskets,
+                // which is why it was dismissed on FREQUENCY as "not the constraint". Weighted by
+                // P&L the conclusion inverts — 6 cap-bound baskets produced **$443.99, 23% of all
+                // realized P&L**, because the cap binds precisely on the largest opportunities.
+                // Raising it is still NOT obviously right: units would only grow if depth allowed,
+                // and partial-fill residual risk scales with size (the one $803 `preflight_missed`
+                // was a 779-unit basket). These two fields make that a measurement rather than an
+                // argument — compare `max_units_depth_bound` against `units` on cap-bound rows.
+                "max_units_depth_bound": opp.max_units.to_string(),
+                "collateral_cap_used": basket_collateral_cap.to_string(),
+                "bound_by": if units >= opp.max_units { "depth" } else { "collateral_cap" },
                 // Recorded on the EXECUTION event, not only on the abort event, because the abort
                 // event never fires in shadow mode — and shadow mode is where the learning happens.
                 // Without this the shadow run reports THAT a leg was short but never WHICH, and
