@@ -479,6 +479,52 @@ did, twice, in the other two tables. The test is now scoped to the settlements b
 absence of the bare-id cell. An assertion that cannot fail is worse than no assertion: it reports that
 something was checked.
 
+## 💰 The collateral cap IS the constraint — I dismissed it on the wrong metric — 2026-08-12
+
+On 2026-08-08, asked which parameters to adjust, I answered "none" and dismissed
+`POLYTRADER_ARB_MAX_BASKET_COLLATERAL` because it bound only 3 of 105 baskets. That was measured on
+**frequency**. Weighted by P&L it inverts, and the inversion is large.
+
+**Step 1 — P&L weighting.** Six cap-bound baskets to 2026-08-11:
+
+| day | units | profit/unit | basket profit |
+|---|---|---|---|
+| Aug 3 | 785 | 0.0608 | $47.77 |
+| Aug 8 | 217 | 0.0857 | $18.61 |
+| Aug 8 | 847 | 0.2029 | **$171.93** |
+| Aug 8 | 852 | 0.2090 | **$178.09** |
+| Aug 9 | 769 | 0.0183 | $14.11 |
+| Aug 11 | 765 | 0.0176 | $13.48 |
+
+**$443.99 — 23% of all realized P&L from 7% of baskets.** The cap binds rarely *because* it only
+binds on the largest opportunities, which is exactly where the money is. Frequency was the wrong lens.
+
+**Step 2 — but was DEPTH the real limit?** Unanswerable at the time: `units` is
+`min(depth bound, collateral bound)` and only the result was journaled. Added
+`max_units_depth_bound` / `collateral_cap_used` / `bound_by`. First data:
+
+| bound_by | baskets | profit | depth allowed | units taken |
+|---|---|---|---|---|
+| depth | 5 | $19.35 | 64 | 64 |
+| **collateral_cap** | **1** | **$125.07** | **2,511** | **824** |
+
+**Depth allowed 3.05x what the cap permitted.** That basket (Real Salt Lake / FC Juárez, $1,500.04
+collateral) would have made ~$381 rather than $125 — **~$256 forgone on one basket** — and it alone
+out-earned all five depth-bound baskets 6.5x.
+
+**What is NOT established: n=1 on the decisive measurement.** One cap-bound basket with the new
+diagnostic is not a basis for a parameter change on its own; a couple more fixture days settles it.
+
+**The real counterweight is residual risk, which scales linearly with size.** Enforce aborts baskets
+that cannot fill completely, but `preflight_missed` survives it (3 occurrences in ~70 baskets, ~4%),
+and the largest was $803 committed on a 779-unit basket. At 2,511 units the same event is ~3x the
+exposure. So this is a genuine risk/reward trade, not free money — which is the same warning the
+2026-07-25 entry attached when it raised the cap 750 → 1500 ("residual partial-fill risk DOES scale
+with size").
+
+**Suggested shape when the sample supports it:** a partial raise (1500 → 2500) captures most of the
+observed upside at 1.67x residual exposure rather than 3x. Left as an operator decision.
+
 ## ❌ Ladder dutch-book: FALSIFIED in SQL, no code written — 2026-08-10
 
 Run as the cheapest test of the only structural fix identified for the sports concentration below.
