@@ -44,6 +44,17 @@ const PORTFOLIO_RAW_DAYS: i64 = 7;
 const STALE_LATEST_CAP_DAYS: i64 = 3;
 /// Rows deleted per batch (bounds lock time / WAL per statement).
 const BATCH: i64 = 10_000;
+/// Decision reports kept per directionally-traded market, matched to what the consumer actually
+/// reads.
+///
+/// The Signal Scorecard credits a signal from "the 20 MOST RECENT reports per market"
+/// (`server.rs`, `rn <= 20`), NOT a time window. Exempting a directional market's reports wholesale
+/// therefore over-retains badly: measured immediately after the exemption shipped, **31,635 of
+/// 101,432 reports** were directional, because a market accumulates one report every 5 minutes for
+/// as long as it is in the universe (~63 markets x ~500 reports each). Keeping 20 retains ~1,260
+/// rows instead — the same information the scorecard can use, at 4% of the storage.
+const REPORTS_KEPT_PER_DIRECTIONAL_MARKET: i64 = 20;
+
 /// Keep shadow maker quotes (P5 increment 3b) this long after they finish. They are a measurement
 /// sample, not a ledger — the conclusions get written to the roadmap, and the aggregate lives on in
 /// the `maker_shadow_quotes` journal events. Only FINISHED quotes are eligible: an open quote is
@@ -188,11 +199,20 @@ async fn rollup_signal_daily(pool: &PgPool) -> Result<u64> {
 /// settlements and read no signals, and keeping their reports is what made this column meaningless
 /// before it was scoped (see the 2026-08-09 scorecard entry).
 ///
-/// The exempt set is materialised ONCE rather than left as a correlated subquery, and the difference
-/// is not cosmetic: measured on live data, the correlated form planned a nested-loop anti-join
-/// rescanning the fill set 14,296 times and ran in **1,508 ms**, against **49 ms** for the CTE (a
-/// hash anti-join). GC runs `delete_in_batches` in a loop until a pass clears fewer than BATCH rows,
-/// so the slow form would have multiplied that cost by every batch on the first post-deploy pass.
+/// Both CTEs are materialised rather than left as correlated subqueries, and the difference is not
+/// cosmetic. Measured on live data with `EXPLAIN ANALYZE`:
+///
+/// | form | plan | time |
+/// |---|---|---|
+/// | correlated `NOT EXISTS` over the fill set | nested loop, 14,296 rescans | **1,508 ms** |
+/// | materialised exempt set, whole-market exemption | hash anti-join | 49 ms |
+/// | materialised + 20-per-market ranking (this) | hash anti-join + window | **508 ms** |
+///
+/// The ranking costs ~10x the naive exemption and is still 3x cheaper than the correlated form. It
+/// is worth paying because the naive version grows unboundedly (~1 MB/day of reports retained
+/// forever), which is exactly how `market_data.markets` reached 6,787 rows before it got a retention
+/// pass. GC runs `delete_in_batches` in a loop until a pass clears fewer than BATCH rows, so the
+/// correlated form would have multiplied its cost across every batch of the first post-deploy pass.
 ///
 /// `NOT EXISTS` rather than `NOT IN` deliberately: with `NOT IN`, a single NULL in the subquery makes
 /// the whole predicate NULL and deletes nothing, and a report whose own `market_id` is NULL would
@@ -206,12 +226,19 @@ async fn prune_decision_reports(pool: &PgPool) -> Result<u64> {
              FROM journal.events
              WHERE event_type = 'autonomous_paper_execution'
                AND payload->>'action' = 'filled'
-               AND payload->>'market_id' IS NOT NULL)
+               AND payload->>'market_id' IS NOT NULL),
+           keep AS MATERIALIZED (
+             SELECT id FROM (
+               SELECT r.id, row_number() OVER (
+                        PARTITION BY r.payload->>'market_id' ORDER BY r.created_at DESC) AS rn
+               FROM journal.events r
+               JOIN directional d ON d.market_id = r.payload->>'market_id'
+               WHERE r.event_type = 'decision_report') s
+             WHERE s.rn <= {REPORTS_KEPT_PER_DIRECTIONAL_MARKET})
            SELECT r.id FROM journal.events r
            WHERE r.event_type = 'decision_report'
              AND r.created_at < now() - interval '{REPORT_RAW_DAYS} days'
-             AND NOT EXISTS (
-               SELECT 1 FROM directional d WHERE d.market_id = r.payload->>'market_id')
+             AND NOT EXISTS (SELECT 1 FROM keep k WHERE k.id = r.id)
            LIMIT {BATCH})"
     );
     delete_in_batches(pool, &q).await
