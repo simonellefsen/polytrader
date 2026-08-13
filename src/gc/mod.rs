@@ -171,13 +171,47 @@ async fn rollup_signal_daily(pool: &PgPool) -> Result<u64> {
 
 /// Delete raw decision_reports older than the raw window. Batched. (Active markets always have recent
 /// reports, so the /board's latest-per-market lookup is unaffected; only long-stale reports go.)
+///
+/// EXCEPTION: reports for markets we actually traded DIRECTIONALLY are kept indefinitely.
+///
+/// Without it the Signal Scorecard's settled columns are structurally unable to populate, and on
+/// 2026-08-13 they reached exactly that — **0 of 42 directional settlements still had reports**, so
+/// every signal read "—". The arithmetic is unforgiving: directional is a deliberate control arm at
+/// ~1 entry/day (`MAX_DAILY_ENTRIES=1`), reports expire after `REPORT_RAW_DAYS`, and crediting a
+/// signal needs a market to BOTH settle AND still have its reports. That intersection trends to
+/// empty, which silently killed the one instrument built to answer "is this signal any good?" — the
+/// question the control arm exists to keep answerable.
+///
+/// The exemption is cheap and self-limiting: it covers only markets with an
+/// `autonomous_paper_execution` fill, ~63 of them against ~100k decision reports, and it grows at the
+/// control arm's 1/day. Arb-entered markets are deliberately NOT exempt — they are 90% of
+/// settlements and read no signals, and keeping their reports is what made this column meaningless
+/// before it was scoped (see the 2026-08-09 scorecard entry).
+///
+/// The exempt set is materialised ONCE rather than left as a correlated subquery, and the difference
+/// is not cosmetic: measured on live data, the correlated form planned a nested-loop anti-join
+/// rescanning the fill set 14,296 times and ran in **1,508 ms**, against **49 ms** for the CTE (a
+/// hash anti-join). GC runs `delete_in_batches` in a loop until a pass clears fewer than BATCH rows,
+/// so the slow form would have multiplied that cost by every batch on the first post-deploy pass.
+///
+/// `NOT EXISTS` rather than `NOT IN` deliberately: with `NOT IN`, a single NULL in the subquery makes
+/// the whole predicate NULL and deletes nothing, and a report whose own `market_id` is NULL would
+/// never match and would leak forever. `NOT EXISTS` has neither failure mode.
 async fn prune_decision_reports(pool: &PgPool) -> Result<u64> {
     let q = format!(
         "DELETE FROM journal.events
          WHERE id IN (
-           SELECT id FROM journal.events
-           WHERE event_type = 'decision_report'
-             AND created_at < now() - interval '{REPORT_RAW_DAYS} days'
+           WITH directional AS MATERIALIZED (
+             SELECT DISTINCT payload->>'market_id' AS market_id
+             FROM journal.events
+             WHERE event_type = 'autonomous_paper_execution'
+               AND payload->>'action' = 'filled'
+               AND payload->>'market_id' IS NOT NULL)
+           SELECT r.id FROM journal.events r
+           WHERE r.event_type = 'decision_report'
+             AND r.created_at < now() - interval '{REPORT_RAW_DAYS} days'
+             AND NOT EXISTS (
+               SELECT 1 FROM directional d WHERE d.market_id = r.payload->>'market_id')
            LIMIT {BATCH})"
     );
     delete_in_batches(pool, &q).await

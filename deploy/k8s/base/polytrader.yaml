@@ -181,8 +181,34 @@ spec:
             # the residual partial-fill risk (payout floor degrades to filled_legs−1) DOES scale with
             # size and still needs P5 simultaneous fills before real money. Total exposure stays
             # bounded by POLYTRADER_MAX_TOTAL_EXPOSURE_PCT and each basket by thinnest-leg depth.
+            # 2026-08-13: 1500 → 2500, operator-approved. This reverses a call I made on 2026-08-08,
+            # when asked which parameters to adjust I answered "none" and dismissed this cap because
+            # it bound only 3 of 105 baskets. That measured FREQUENCY. Weighted by P&L it inverts,
+            # because the cap binds rarely precisely BECAUSE it only binds on the largest
+            # opportunities — which is where the money is:
+            #
+            #   bound_by         baskets  profit   per basket
+            #   depth                 11  $ 39.66      $  3.61
+            #   collateral_cap         2  $307.00      $153.50
+            #
+            # 15% of baskets, 88.6% of the profit, 43x more per basket.
+            #
+            # And depth was NOT the real limit. `max_units_depth_bound` (added 2026-08-12 precisely to
+            # answer this) shows both cap-bound baskets had 2.35x and 3.05x more available AT THE BEST
+            # ASK — `depth` is size at the single best price level, not cumulative, so taking it needs
+            # no walking down the book and the per-unit edge holds. Forgone: ~$502 across two baskets
+            # in 17 hours.
+            #
+            # 2500 rather than uncapping: it captures most of the observed upside at 1.67x residual
+            # exposure rather than 3x. The risk is real and unchanged since the 750→1500 raise flagged
+            # it — partial-fill residual scales linearly with size, `preflight_missed` SURVIVES
+            # enforcement (3 in ~70 baskets), and the largest was $803 committed on 779 units.
+            #
+            # Made on n=2, knowingly. Watch `bound_by` and `preflight_missed`: if depth starts binding
+            # instead of the cap, the raise did its job and further raises are pointless; if residual
+            # events grow with size, come back down.
             - name: POLYTRADER_ARB_MAX_BASKET_COLLATERAL
-              value: "1500"
+              value: "2500"
             # Minimum negRisk basket edge, in bps of return on locked collateral (2026-08-01).
             # The scanner's own bar is MIN_NET_PROFIT, an ABSOLUTE $0.002/unit, which admits baskets
             # whose return on collateral is negligible: the first shadowed basket (event 716159) was
