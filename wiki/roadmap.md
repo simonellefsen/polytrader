@@ -400,6 +400,27 @@ against an ~8% base rate, and needs ~40+ baskets to read. `commit_window_ms` is 
 execution so a future residual arriving WITH a fast window would falsify the latency explanation
 outright.
 
+### ✅ READ-OUT — 2026-08-14: residual rate 8.11% → 0%, p ≈ 0.03
+
+| era | passed pre-flight | residuals | rate |
+|---|---|---|---|
+| before the fix | 37 | 3 | **8.11%** |
+| after the fix | **40** | **0** | **0.00%** |
+
+Against an 8.11% base rate, ~3.2 residuals were expected in 40 baskets; seeing zero has probability
+(1 − 0.0811)^40 ≈ 0.033. The prediction made when the fix shipped — window collapses, residuals go
+with it — holds, and it was falsifiable throughout because `commit_window_ms` is stamped on every
+execution (a residual arriving with a 22ms window would have killed the explanation).
+
+**The denominator matters and is easy to get wrong.** Measured against ALL committed baskets the rate
+reads 1.59% → 0% over 46, which at p ≈ 0.48 is nothing. The correct denominator is baskets that
+**passed pre-flight**: a residual is by definition a basket pre-flight approved which then came up
+short, so aborted baskets cannot be in the sample. Same data, opposite verdict.
+
+Alongside it, enforcement has now stopped **49 baskets and $2,472.12 of capital** from entering
+broken positions since 2026-08-09. Increment 3 is doing both halves of its job: refusing baskets that
+cannot complete, and no longer breaking the ones it approves.
+
 ### The holdout mechanism built a directional position — 2026-08-10
 
 The 10% holdout added to keep enforcement falsifiable selected deterministically per event, so a
