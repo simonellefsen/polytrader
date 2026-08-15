@@ -2087,20 +2087,6 @@ async fn produce_arb_scan_journal(
     Ok(())
 }
 
-/// P5 increment 3 — classify a basket's pre-flight prediction against what actually happened.
-///
-/// The four cells are not symmetric and the asymmetry is the whole decision:
-///
-/// - `predicted_complete` — pre-flight passed, basket filled. The plan held; nothing to learn.
-/// - `preflight_missed` — pre-flight passed, basket came up SHORT. The book moved between the plan
-///   and the commit. Irreducible: no pre-flight removes it, and its rate is the honest ceiling on
-///   what this increment can achieve.
-/// - `would_have_prevented` — pre-flight said abort, basket did come up short. The benefit, at the
-///   measured -$2.57/event a partial costs.
-/// - `would_have_forgone` — pre-flight said abort but the basket filled COMPLETELY anyway. The
-///   cost, at +$12.78/event. Because that is ~5x the benefit per event, enforcement is only correct
-///   if this cell is much rarer than `would_have_prevented` — which is exactly what shadow mode is
-///   deployed to find out, and why the default is not `enforce`.
 /// Whether a basket that pre-flight wants to ABORT should be let through anyway, as a measurement
 /// holdout.
 ///
@@ -2172,6 +2158,24 @@ async fn recently_held_out(pool: &sqlx::PgPool, event_id: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// P5 increment 3 — classify a basket's pre-flight prediction against what actually happened.
+///
+/// The four cells are not symmetric and the asymmetry is the whole decision:
+///
+/// - `predicted_complete` — pre-flight passed, basket filled. The plan held; nothing to learn.
+/// - `preflight_missed` — pre-flight passed, basket came up SHORT. **Not irreducible**, though this
+///   doc said so for a week. Most of it was self-inflicted latency: an exchange round-trip sat
+///   inside the commit loop, the window averaged 16.4s for baskets that completed and 151.6s for
+///   those that broke, and moving it out collapsed the window to ~22ms. What survives that fix is
+///   the open question — a residual on 2026-08-14 arrived with a **48 ms** window, which no amount
+///   of book movement explains, so `source_switches` now records whether plan and commit priced
+///   against different books.
+/// - `would_have_prevented` — pre-flight said abort, basket did come up short. The benefit, at the
+///   measured -$2.57/event a partial costs.
+/// - `would_have_forgone` — pre-flight said abort but the basket filled COMPLETELY anyway. The
+///   cost, at +$12.78/event. Because that is ~5x the benefit per event, enforcement is only correct
+///   if this cell is much rarer than `would_have_prevented`. Under `enforce` it can ONLY be observed
+///   through the holdout arm — see `is_preflight_holdout`.
 fn classify_preflight_outcome(executable: bool, complete: bool) -> &'static str {
     match (executable, complete) {
         (true, true) => "predicted_complete",
@@ -2380,6 +2384,8 @@ async fn execute_negrisk_opportunity(
     let mut total_filled_cost = dec!(0);
     // Deferred until every leg has been committed — see the shadow call below the loop for why.
     let mut to_shadow: Vec<(usize, String, uuid::Uuid, bool)> = Vec::with_capacity(opp.legs.len());
+    // Which book each leg's COMMIT actually priced against, read back off the fill provenance.
+    let mut leg_commit_sources: Vec<String> = Vec::with_capacity(opp.legs.len());
     // The commit window: first leg submitted to last leg committed. This is the interval over which
     // the pre-flight's one-instant book read has to remain true, so it is the number that bounds how
     // well pre-flight can possibly work. Journaled so the effect of moving the exchange round-trip
@@ -2397,14 +2403,25 @@ async fn execute_negrisk_opportunity(
                     .iter()
                     .map(|f| f.price * f.size)
                     .sum::<rust_decimal::Decimal>();
+                leg_commit_sources.push(
+                    fills
+                        .first()
+                        .and_then(|f| f.against_book.as_ref())
+                        .and_then(|b| b.get("book_source"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                );
                 true
             }
             Ok(_) => {
                 warn!(event = %opp.event_id, market = %leg.market_id, "negrisk leg unfilled (stale/thin book)");
+                leg_commit_sources.push("unfilled".to_string());
                 false
             }
             Err(e) => {
                 warn!(event = %opp.event_id, market = %leg.market_id, error = %e, "negrisk leg submit failed");
+                leg_commit_sources.push("error".to_string());
                 false
             }
         };
@@ -2412,6 +2429,36 @@ async fn execute_negrisk_opportunity(
         to_shadow.push((leg_index, leg.market_id.clone(), order_id, leg_filled));
     }
     let commit_window_ms = commit_started.elapsed().as_millis() as u64;
+
+    // SOURCE SWITCHING between plan and commit. Pre-flight and `submit_order` resolve the book
+    // independently, so a leg served from the live WS feed at plan time can fall back to the polled
+    // snapshot at commit time — pricing against a DIFFERENT book, which is indistinguishable from
+    // the market moving unless both sources are recorded.
+    //
+    // Motivated by a residual on 2026-08-14 with a commit window of **48 ms** and pre-flight
+    // reporting `worst_fill_ratio: 1`. Nothing moves a book in 48 ms, so the latency explanation
+    // that fit the earlier residuals cannot fit that one. Desynced books rose from 0-2 to 19-25 of
+    // ~700 across the same week, which is exactly the condition that makes `get_fresh` withhold at
+    // commit what it served at plan.
+    let plan_sources: Vec<&str> = plan
+        .as_ref()
+        .map(|p| p.legs.iter().map(|l| l.book_source.as_str()).collect())
+        .unwrap_or_default();
+    let source_switches: Vec<serde_json::Value> = leg_commit_sources
+        .iter()
+        .enumerate()
+        .filter_map(|(i, commit_src)| {
+            let plan_src = plan_sources.get(i)?;
+            (plan_src != commit_src).then(|| {
+                serde_json::json!({
+                    "leg_index": i,
+                    "market_id": opp.legs.get(i).map(|l| l.market_id.clone()),
+                    "plan_source": plan_src,
+                    "commit_source": commit_src,
+                })
+            })
+        })
+        .collect();
 
     // Shadow the REAL orders these legs would send (2026-07-28) — AFTER every leg is committed, not
     // between them (moved 2026-08-09).
@@ -2508,6 +2555,10 @@ async fn execute_negrisk_opportunity(
                 // moved out of this loop: 16.4s average for baskets that completed, 151.6s for those
                 // that came up short despite passing, 302s worst case.
                 "commit_window_ms": commit_window_ms,
+                // Empty when plan and commit agreed on every leg. Non-empty on a residual means the
+                // basket was priced against different books, NOT that the market moved.
+                "source_switches": source_switches,
+                "leg_commit_sources": leg_commit_sources,
                 // True when pre-flight wanted to abort and this basket was let through anyway to
                 // keep the measurement alive. Under `enforce`, `would_have_forgone` and
                 // `would_have_prevented` can ONLY come from holdouts — every other would-abort

@@ -15,7 +15,7 @@ pub use engine::PaperTradingEngine;
 // value rather than by name, so they are re-exported for the module's public surface, not for a
 // current import site — same reason the models below carry the attribute.
 #[allow(unused_imports)]
-pub use engine::{BasketLegPlan, BasketPlan};
+pub use engine::{BasketLegPlan, BasketPlan, BookSource};
 #[allow(unused_imports)]
 pub use models::{
     OrderSide, OrderStatus, OrderType, PaperFill, PaperOrder, PaperPosition, VirtualPortfolio,

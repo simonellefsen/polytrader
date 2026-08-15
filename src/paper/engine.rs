@@ -29,6 +29,29 @@ pub struct PaperTradingEngine {
     live_books: Option<crate::ingester::clob_ws::LiveBookStore>,
 }
 
+/// Which book the matcher priced against.
+///
+/// Recorded because the pre-flight and the commit resolve this INDEPENDENTLY. If a leg is served
+/// from the live WS feed at plan time and falls back to the polled snapshot at commit time, the two
+/// are pricing against different books — indistinguishable from the market moving, but a different
+/// problem with a different fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookSource {
+    Live,
+    Snapshot,
+    None,
+}
+
+impl BookSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BookSource::Live => "live",
+            BookSource::Snapshot => "snapshot",
+            BookSource::None => "none",
+        }
+    }
+}
+
 /// What one leg of a basket would fill right now, per `PaperTradingEngine::plan_basket`.
 #[derive(Debug, Clone)]
 pub struct BasketLegPlan {
@@ -43,6 +66,9 @@ pub struct BasketLegPlan {
     pub cost: Decimal,
     /// False when no book could be loaded at all (market never ingested, or GC'd).
     pub had_book: bool,
+    /// Which book the PLAN priced against. Compared against the commit's source to separate
+    /// source-switching from genuine book movement — see `BookSource`.
+    pub book_source: BookSource,
 }
 
 impl BasketLegPlan {
@@ -111,6 +137,7 @@ impl BasketPlan {
                     "fillable": l.fillable.to_string(),
                     "fill_ratio": l.fill_ratio().round_dp(4).to_string(),
                     "had_book": l.had_book,
+                    "book_source": l.book_source.as_str(),
                 })
             })
             .collect()
@@ -193,11 +220,21 @@ impl PaperTradingEngine {
         self.journal.record_paper_order(&order).await?;
 
         // 2-3. Load + match (read-only snapshot + pure compute)
-        let book = self
+        let (book, book_source) = self
             .load_latest_book_snapshot(&order.market_id, &order.outcome)
             .await
             .context("loading book snapshot")?;
-        let fills = self.match_against_book(&mut order, book.as_ref()).await?;
+        let mut fills = self.match_against_book(&mut order, book.as_ref()).await?;
+        // Stamp the source onto every fill's provenance, so a caller comparing the plan's source
+        // against the commit's does not need a second lookup (and cannot race one).
+        for f in fills.iter_mut() {
+            if let Some(serde_json::Value::Object(m)) = f.against_book.as_mut() {
+                m.insert(
+                    "book_source".to_string(),
+                    serde_json::Value::String(book_source.as_str().to_string()),
+                );
+            }
+        }
 
         if fills.is_empty() {
             order.status = OrderStatus::Rejected;
@@ -397,7 +434,7 @@ impl PaperTradingEngine {
     pub async fn plan_basket(&self, orders: &[PaperOrder]) -> Result<BasketPlan> {
         let mut legs = Vec::with_capacity(orders.len());
         for order in orders {
-            let book = self
+            let (book, book_source) = self
                 .load_latest_book_snapshot(&order.market_id, &order.outcome)
                 .await
                 .context("loading book snapshot for basket pre-flight")?;
@@ -428,17 +465,27 @@ impl PaperTradingEngine {
                 fillable: real.iter().map(|f| f.size).sum(),
                 cost: real.iter().map(|f| f.price * f.size + f.fee).sum(),
                 had_book,
+                book_source,
             });
         }
         Ok(BasketPlan { legs })
     }
 
     /// Map (market_id, "Yes"/"No") -> token_id via DB, fetch latest snapshot row, parse jsonb.
+    /// Load the book the matcher will price against, and report WHICH SOURCE it came from.
+    ///
+    /// The source is returned rather than kept internal because plan and commit call this
+    /// independently, and if the two calls resolve to different sources they are pricing against
+    /// different books — which looks identical to the market moving but is not. A residual observed
+    /// 2026-08-14 had a commit window of **48 ms** and pre-flight reporting every leg fully fillable;
+    /// nothing moves a book in 48 ms, so source-switching is the live hypothesis. Desynced books rose
+    /// from 0-2 to 19-25 of ~700 over the same week, which is exactly what would make `get_fresh`
+    /// withhold a book at commit that it served at plan.
     async fn load_latest_book_snapshot(
         &self,
         market_id: &str,
         outcome: &str,
-    ) -> Result<Option<OrderbookSnapshot>> {
+    ) -> Result<(Option<OrderbookSnapshot>, BookSource)> {
         // Fetch tokens + outcomes ordering from markets
         let row = sqlx::query(
             "SELECT clob_token_ids, outcomes FROM market_data.markets WHERE gamma_id = $1",
@@ -453,7 +500,7 @@ impl PaperTradingEngine {
             let o: Vec<String> = serde_json::from_value(r.get("outcomes")).unwrap_or_default();
             (t, o)
         } else {
-            return Ok(None);
+            return Ok((None, BookSource::None));
         };
 
         // Resolve outcome -> token STRICTLY. The previous `.unwrap_or(0)` silently fell back to the
@@ -483,11 +530,11 @@ impl PaperTradingEngine {
                 "no token matches the requested outcome; refusing to price this order rather than \
                  defaulting to the first token (see load_latest_book_snapshot)"
             );
-            return Ok(None);
+            return Ok((None, BookSource::None));
         };
         let token_id = match tokens.get(idx) {
             Some(t) if !t.is_empty() => t.clone(),
-            _ => return Ok(None),
+            _ => return Ok((None, BookSource::None)),
         };
 
         // Prefer the live book. `get_fresh` withholds anything desynced or on a dead connection,
@@ -506,13 +553,16 @@ impl PaperTradingEngine {
                     .collect::<Vec<_>>()
             };
             let mid = live.mid();
-            return Ok(Some(OrderbookSnapshot {
-                token_id,
-                bids: to_levels(live.bid_levels()),
-                asks: to_levels(live.ask_levels()),
-                mid,
-                fetched_at: chrono::Utc::now(),
-            }));
+            return Ok((
+                Some(OrderbookSnapshot {
+                    token_id,
+                    bids: to_levels(live.bid_levels()),
+                    asks: to_levels(live.ask_levels()),
+                    mid,
+                    fetched_at: chrono::Utc::now(),
+                }),
+                BookSource::Live,
+            ));
         }
 
         // Latest snapshot for that token
@@ -529,15 +579,18 @@ impl PaperTradingEngine {
             let asks: Vec<PriceSize> = serde_json::from_value(r.get("asks")).unwrap_or_default();
             let mid: Option<Decimal> = r.get("mid");
             let fetched_at: chrono::DateTime<chrono::Utc> = r.get("fetched_at");
-            Ok(Some(OrderbookSnapshot {
-                token_id,
-                bids,
-                asks,
-                mid,
-                fetched_at,
-            }))
+            Ok((
+                Some(OrderbookSnapshot {
+                    token_id,
+                    bids,
+                    asks,
+                    mid,
+                    fetched_at,
+                }),
+                BookSource::Snapshot,
+            ))
         } else {
-            Ok(None)
+            Ok((None, BookSource::None))
         }
     }
 
@@ -927,6 +980,7 @@ mod tests {
             fillable: Decimal::from_str(fillable).unwrap(),
             cost: dec!(0),
             had_book: true,
+            book_source: BookSource::Live,
         }
     }
 
@@ -992,6 +1046,31 @@ mod tests {
     /// Only the short legs are journaled, with enough detail to tell a thin book from a missing
     /// one — `had_book` distinguishes "the market has no depth at our limit" from "we never
     /// ingested this market", which need different fixes.
+    /// The whole point of recording the source is to tell source-switching apart from book
+    /// movement, so the label has to survive into the journal. A silently-missing or always-equal
+    /// `book_source` would make `source_switches` permanently empty, which reads as "checked, no
+    /// problem" rather than "not actually checked" — the same failure mode as the settlements test
+    /// that passed while the bug shipped.
+    #[test]
+    fn the_book_source_is_distinguishable_and_reaches_the_journal() {
+        assert_eq!(BookSource::Live.as_str(), "live");
+        assert_eq!(BookSource::Snapshot.as_str(), "snapshot");
+        assert_eq!(BookSource::None.as_str(), "none");
+        assert_ne!(BookSource::Live.as_str(), BookSource::Snapshot.as_str());
+
+        let mut snap_leg = leg("100", "0");
+        snap_leg.book_source = BookSource::Snapshot;
+        let plan = BasketPlan {
+            legs: vec![leg("100", "100"), snap_leg],
+        };
+        let detail = plan.short_leg_detail();
+        assert_eq!(detail.len(), 1);
+        assert_eq!(
+            detail[0]["book_source"], "snapshot",
+            "the plan's book source must reach the journal, or a source switch is invisible"
+        );
+    }
+
     #[test]
     fn short_leg_detail_names_only_the_legs_that_failed() {
         let mut missing = leg("100", "0");
