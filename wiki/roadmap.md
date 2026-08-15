@@ -546,6 +546,28 @@ with size").
 **Suggested shape when the sample supports it:** a partial raise (1500 → 2500) captures most of the
 observed upside at 1.67x residual exposure rather than 3x. Left as an operator decision.
 
+### ✅ VERIFIED — 2026-08-15. Raised to 2500 on 2026-08-13; first three over-ceiling baskets:
+
+| when | units | collateral | depth allowed | profit | window | outcome |
+|---|---|---|---|---|---|---|
+| 13:07 | 1,396.65 | $2,500.00 | 4,951 | **+$248.83** | 16 ms | clean |
+| 15:51 | 1,319.26 | $2,500.00 | 2,567 | **+$126.20** | 15 ms | clean |
+| — | — | $2,500.00 | — | **+$365.28** | 31 ms | clean |
+
+**$740.31 across 3 baskets in ~a day**, against $2,510 realized for the entire preceding week. Under
+the old cap each would have taken ~830 units instead of ~1,350. Same concentration as before: since
+the raise, 2-3 cap-bound baskets earned ~$740 while 30 depth-bound ones earned $199.74.
+
+Depth still allows **2.23x** the new cap on average, so $2,500 is not yet the binding constraint
+either. **A further raise is NOT proposed**: the risk side remains completely untested (0
+`preflight_missed` at this size), each step multiplies residual exposure linearly, and one bad event
+on a 1,400-unit basket commits ~$2,500 into a broken floor against the $803 worst case to date.
+
+The frequency-vs-P&L lesson is the durable one. Every measurement of this parameter by count said
+"not the constraint"; every measurement by profit said the opposite; and the deciding fact
+(`max_units_depth_bound`) was not being recorded at all until it was deliberately added to answer
+the question.
+
 ## ❌ Ladder dutch-book: FALSIFIED in SQL, no code written — 2026-08-10
 
 Run as the cheapest test of the only structural fix identified for the sports concentration below.
