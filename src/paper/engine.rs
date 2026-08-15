@@ -171,7 +171,21 @@ impl PaperTradingEngine {
     /// Produces realistic fills (limit walks book; market applies depth slippage + taker fee).
     /// Journals order + fills + updated portfolio snapshot.
     /// Returns the fills produced (may be partial or multiple levels).
-    pub async fn submit_order(&self, mut order: PaperOrder) -> Result<Vec<PaperFill>> {
+    pub async fn submit_order(&self, order: PaperOrder) -> Result<Vec<PaperFill>> {
+        self.submit_order_with_source(order).await.map(|(f, _)| f)
+    }
+
+    /// As `submit_order`, but also reports WHICH BOOK the commit priced against.
+    ///
+    /// Needed because the interesting case is a leg that does NOT fill. Stamping the source onto the
+    /// fills cannot cover it — there are no fills — so the first version of this instrumentation
+    /// compared the plan's source against the string "unfilled" and flagged every unfilled leg as a
+    /// source switch, which is both a false positive and blind to the actual question. The leg that
+    /// fails is precisely the one whose commit source matters.
+    pub async fn submit_order_with_source(
+        &self,
+        mut order: PaperOrder,
+    ) -> Result<(Vec<PaperFill>, BookSource)> {
         tracing::info!(
             order_id = %order.id,
             market = %order.market_id,
@@ -241,7 +255,7 @@ impl PaperTradingEngine {
             self.journal.record_paper_order(&order).await?;
             tx.commit().await.ok();
             tracing::warn!(order_id = %order.id, "order rejected (no liquidity or limit not crossed)");
-            return Ok(vec![]);
+            return Ok((vec![], book_source));
         }
 
         self.journal.record_paper_fills(&fills).await?;
@@ -396,7 +410,7 @@ impl PaperTradingEngine {
         tx.commit().await.context("commit submit tx")?;
 
         tracing::info!(order_id = %order.id, num_fills = fills.len(), "paper order executed and journaled (full tx + FOR UPDATE delivered)");
-        Ok(fills)
+        Ok((fills, book_source))
     }
 
     /// P5 increment 3 — pre-flight a multi-leg basket against every leg's book AT ONE INSTANT,

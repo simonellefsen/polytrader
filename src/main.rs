@@ -2396,28 +2396,23 @@ async fn execute_negrisk_opportunity(
         // construction here could drift from the plan (a different limit, a different size) and the
         // pre-flight would then be vouching for an order that was never sent.
         let order_id = order.id;
-        let leg_filled = match engine.submit_order(order).await {
-            Ok(fills) if !fills.is_empty() => {
-                filled_legs += 1;
-                total_filled_cost += fills
-                    .iter()
-                    .map(|f| f.price * f.size)
-                    .sum::<rust_decimal::Decimal>();
-                leg_commit_sources.push(
-                    fills
-                        .first()
-                        .and_then(|f| f.against_book.as_ref())
-                        .and_then(|b| b.get("book_source"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                );
-                true
-            }
-            Ok(_) => {
-                warn!(event = %opp.event_id, market = %leg.market_id, "negrisk leg unfilled (stale/thin book)");
-                leg_commit_sources.push("unfilled".to_string());
-                false
+        // `submit_order_with_source` rather than `submit_order`: the commit's book source is needed
+        // even when the leg does NOT fill, which is exactly the case a source switch would explain.
+        let leg_filled = match engine.submit_order_with_source(order).await {
+            Ok((fills, src)) => {
+                leg_commit_sources.push(src.as_str().to_string());
+                if fills.is_empty() {
+                    warn!(event = %opp.event_id, market = %leg.market_id, commit_source = src.as_str(),
+                        "negrisk leg unfilled (stale/thin book)");
+                    false
+                } else {
+                    filled_legs += 1;
+                    total_filled_cost += fills
+                        .iter()
+                        .map(|f| f.price * f.size)
+                        .sum::<rust_decimal::Decimal>();
+                    true
+                }
             }
             Err(e) => {
                 warn!(event = %opp.event_id, market = %leg.market_id, error = %e, "negrisk leg submit failed");
