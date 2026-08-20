@@ -88,17 +88,34 @@ spec:
             # SETTLED (realized P&L exists), so tuning is driven by ground truth not fire-rate noise.
             - name: HERMES_MIN_SETTLED_FOR_TUNING
               value: "10"
-            # LLM synthesis via OpenRouter (OpenAI-compatible). Health journaled as llm_health events
-            # (status/cause) so the dashboards surface failures (out of credits, auth, rate-limit).
+            # === LLM synthesis: DISABLED 2026-08-20, operator decision ===
+            #
+            # Hermes falls back to local synthesis when LLM_API_KEY is absent, which is the same code
+            # path that already ran on every LLM failure. That fallback had been firing ~30% of the
+            # time for hours before anyone noticed, which is the cleanest available evidence that
+            # nothing depends on the LLM output.
+            #
+            # What the layer actually fed:
+            #  - Recommendations went to the journal and NOTHING read them automatically. No
+            #    strategy, gate, or executor consumes them; only a human reading the journal.
+            #  - Weight tuning does reach the trading path (FusionEngine::weight_for), but after
+            #    1,894 tuning events the learned weights were orderbook_momentum 1.003,
+            #    spike_divergence 1.001, theta_convergence 1.001 — all within 0.3% of neutral, with
+            #    per_signal_realized_pnl empty, and nothing written since 2026-08-12. Even at full
+            #    strength it would only move the DIRECTIONAL arm: 6% of P&L, read NO-GO by the
+            #    pre-registered criterion, throttled to ~1 trade/day as a control arm. The arb
+            #    executors producing 94% of P&L read no signals at all.
+            #
+            # Cost removed: ~725k input tokens/day before the 2026-08-20 pruning, ~30k after.
+            #
+            # Hermes itself is deliberately KEPT: local attribution still runs, the reflection
+            # journal still accumulates, and the weight machinery stays wired for whenever
+            # directional stops being a control arm. To re-enable, restore LLM_API_KEY below —
+            # nothing else changes.
             - name: LLM_API_ENDPOINT
               value: "https://openrouter.ai/api/v1/chat/completions"
             - name: LLM_MODEL
               value: "openai/gpt-5.4-mini"
-            - name: LLM_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: polytrader-openrouter
-                  key: OPENROUTER_API_KEY
             # Phase 2: set HERMES_AUTONOMOUS_WIKI_PROPOSALS=lowrisk (via secret or env override) to enable
             # the gated autonomous low-risk wiki proposal behavior (see src/bin/hermes.rs). Default off for safety.
             # No manifest change required; opt-in per AGENTS "human review for high-impact" + smallest viable.
