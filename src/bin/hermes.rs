@@ -52,19 +52,60 @@ async fn main() -> Result<()> {
 
     // Richer reflection loop (periodic; future: also on resolution via Gamma watch)
     // SAFETY: paper-only. All reads append-only inserts to journal. Decimal exclusively.
-    let mut tick: u64 = 0;
-    let interval = Duration::from_secs(300); // 5min; configurable later via env
+    // EVENT-DRIVEN reflection (2026-08-20). Previously every other 5-minute tick, i.e. ~142 LLM
+    // calls a day. The metrics carry `window_hours: 24`, so consecutive prompts described a rolling
+    // 24-hour window sampled every 10 minutes and were ~99% identical by construction — paying to
+    // ask the same question about the same data.
+    //
+    // Now a cycle runs only when something it could actually reason about has happened: a fill, a
+    // settlement, or an autonomous execution since the last reflection. A HEARTBEAT still forces one
+    // every `HEARTBEAT_HOURS` so a quiet stretch cannot silence the loop entirely — the fixture
+    // calendar means genuinely idle days happen (2026-08-10 settled +$3.11 across a whole day), and
+    // "no reflections for 30 hours" should be distinguishable from "hermes is dead".
+    const HEARTBEAT_HOURS: i64 = 6;
+    let interval = Duration::from_secs(300);
+    let mut last_reflection: Option<chrono::DateTime<chrono::Utc>> = None;
     loop {
-        tick += 1;
-        if tick % 2 == 1 {
-            // Run reflection on start + every ~10min (odd ticks with 5m interval for regular cadence)
+        let since = last_reflection;
+        let (trigger, new_events) = match since {
+            // First cycle after boot always reflects: there is no baseline to compare against, and
+            // a fresh process should publish state rather than wait for the next fill.
+            None => ("startup", 0i64),
+            Some(ts) => {
+                let n: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM journal.events
+                      WHERE created_at > $1
+                        AND event_type IN ('paper_position_settled',
+                                           'autonomous_paper_execution',
+                                           'autonomous_negrisk_arb_execution',
+                                           'autonomous_arb_execution')",
+                )
+                .bind(ts)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(0);
+                if n > 0 {
+                    ("new_activity", n)
+                } else if (chrono::Utc::now() - ts).num_hours() >= HEARTBEAT_HOURS {
+                    ("heartbeat", 0)
+                } else {
+                    ("", 0)
+                }
+            }
+        };
+
+        if trigger.is_empty() {
+            tracing::debug!("hermes idle (no fills or settlements since last reflection)");
+        } else {
+            info!(trigger, new_events, "hermes reflection cycle");
             if let Err(e) =
                 do_reflection(&pool, &llm_endpoint, llm_key.as_deref(), &llm_model).await
             {
                 warn!(error = %e, "reflection cycle failed (will retry next interval; robust, no crash)");
             }
-        } else {
-            tracing::debug!("hermes idle (tick {})", tick);
+            // Advance the watermark even on failure, so a persistently failing reflection retries on
+            // the heartbeat rather than on every tick against the same backlog.
+            last_reflection = Some(chrono::Utc::now());
         }
         tokio::time::sleep(interval).await;
     }
@@ -554,21 +595,20 @@ async fn do_reflection(
     // Conditional LLM synthesis (reqwest OpenAI-comp; smallest, configurable, safe)
     // Issue 9 (security) fix: construct llm_metrics by redacting full "recent_decision_reports_sampled" (net edges/ids from DRs; PRIMARY signals) from the cadence sub for LLM prompt only (defense-in-depth; keeps full sample in stored `metrics` + local_summary preview for journaled backtest/attr per goals/AGENTS; additive only; does not affect non-LLM path or reflections).
     // Issue 4 (security) parity: also redact "recent_tax_sample" from tax_journal_skeleton (future may include cost basis/fees/P&L per fees-tax "audit-grade" + goals backtest; defense-in-depth for LLM path; full kept in stored metrics + local_summary count for attr; cross-ref Issue 9 redaction).
-    let llm_metrics = {
-        let mut m = metrics.clone();
-        if let Some(drc) = m.get_mut("decision_report_cadence") {
-            if let Some(obj) = drc.as_object_mut() {
-                obj.remove("recent_decision_reports_sampled");
-            }
-        }
-        if let Some(tax) = m.get_mut("tax_journal_skeleton") {
-            if let Some(obj) = tax.as_object_mut() {
-                obj.remove("recent_tax_sample");
-                obj.remove("recent_paper_fills_sampled"); // Issue 3 fix: parity redaction for new backtest sample (audit-grade fills/fee data per fees-tax + producer wire + goals; defense-in-depth like DR/tax; full kept in stored metrics + local_summary)
-            }
-        }
-        m
-    };
+    let llm_metrics = prune_metrics_for_llm(&metrics);
+    // Before/after in one place so the saving is measured rather than asserted. `metrics` is what
+    // used to be sent (minus the two security redactions, which were the only pruning).
+    let full_chars = metrics.to_string().len();
+    let sent_chars = llm_metrics.to_string().len();
+    info!(
+        full_chars,
+        sent_chars,
+        saved_pct = ((full_chars.saturating_sub(sent_chars)) * 100)
+            .checked_div(full_chars.max(1))
+            .unwrap_or(0),
+        summary_chars = local_summary.len(),
+        "hermes LLM payload pruned"
+    );
     let llm_configured = llm_key.is_some();
     let (model_override, reasoning_effort) = fetch_hermes_config_override(pool).await;
     let effective_model = model_override.as_deref().unwrap_or(llm_model);
@@ -2441,6 +2481,80 @@ async fn journal_llm_health(
 
 /// Minimal reqwest call to OpenAI-compatible chat completions (no extra crates, timeout, error mapped).
 /// Prompt engineered for structured output; parse simple.
+/// Build the metrics copy actually sent to the LLM.
+///
+/// Two jobs. The original one is SECURITY: the raw `metrics` carries per-market net edges and ids
+/// from decision reports, plus tax and fill samples, none of which need to leave the process. Those
+/// redactions are preserved verbatim below.
+///
+/// The second is COST, added 2026-08-20 after an operator asked what the ~5,100-token prompts every
+/// 10 minutes were made of:
+///
+/// - **Dead CLOB blocks.** `clob_safety_loop` and `approval_attribution` describe an approval and
+///   dispatch pipeline that produced **0 events in 24h** — real orders are structurally disabled and
+///   the Console was deleted 2026-08-02. Every counter is zero, and each shipped with a paragraph
+///   explaining what the zero would mean.
+/// - **Placeholder stubs.** `fee_adjusted_attribution` holds literal strings like
+///   "fee_adjusted_contrib_pending_fusion_5min_reports"; `vs_goals_from_wiki` restates wiki targets
+///   that never change.
+/// - **`note` fields, recursively.** 14 of them, 3,332 of 6,681 chars in the metrics block are
+///   string literals >= 60 chars. They are prose explaining the schema to a model that is asked the
+///   same question every cycle and carries nothing between calls.
+///
+/// All of it stays in the STORED metrics for the journal and the wiki loop — this prunes only the
+/// copy that goes over the wire.
+fn prune_metrics_for_llm(metrics: &serde_json::Value) -> serde_json::Value {
+    /// Recursively drop every `note` key at any depth.
+    fn strip_notes(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(map) => {
+                map.remove("note");
+                for (_, child) in map.iter_mut() {
+                    strip_notes(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items.iter_mut() {
+                    strip_notes(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut m = metrics.clone();
+
+    // Security redactions (pre-existing, unchanged).
+    if let Some(obj) = m
+        .get_mut("decision_report_cadence")
+        .and_then(|v| v.as_object_mut())
+    {
+        obj.remove("recent_decision_reports_sampled");
+    }
+    if let Some(obj) = m
+        .get_mut("tax_journal_skeleton")
+        .and_then(|v| v.as_object_mut())
+    {
+        obj.remove("recent_tax_sample");
+        obj.remove("recent_paper_fills_sampled");
+    }
+
+    // Cost pruning: whole blocks that carry no live information.
+    if let Some(obj) = m.as_object_mut() {
+        for dead in [
+            "clob_safety_loop",
+            "approval_attribution",
+            "fee_adjusted_attribution",
+            "vs_goals_from_wiki",
+        ] {
+            obj.remove(dead);
+        }
+    }
+
+    strip_notes(&mut m);
+    m
+}
+
 async fn call_llm_for_reflection(
     endpoint: &str,
     key: &str,
@@ -3169,6 +3283,72 @@ mod tests {
     }
 
     #[test]
+    /// The LLM copy must lose the dead blocks and every `note`, and keep the live numbers. A pruner
+    /// that silently dropped a real metric would degrade the reflection rather than just cheapen it,
+    /// and one that dropped nothing would look like it worked while changing nothing.
+    #[test]
+    fn pruning_removes_dead_blocks_and_prose_but_keeps_live_metrics() {
+        use super::prune_metrics_for_llm;
+        let full = serde_json::json!({
+            "window_hours": 24,
+            "latest_realized_pnl": "4708.45",
+            "note": "top-level prose",
+            "clob_safety_loop": {"approvals_with_snapshots_24h": 0},
+            "approval_attribution": {"hermes_approval_gap": "0"},
+            "fee_adjusted_attribution": {"per_processor_stubs": {"a": "pending"}},
+            "vs_goals_from_wiki": {"weekly_net_target_range_pct": "3-8"},
+            "signal_health": {"orderbook_momentum": {"fire_rate": 0.75, "note": "nested prose"}},
+            "decision_report_cadence": {
+                "recent_decision_reports_sampled": [{"market_id": "x", "net_edge": "0.03"}],
+                "recent_dr_count": "14350",
+                "note": "cadence prose"
+            },
+            "tax_journal_skeleton": {
+                "recent_tax_sample": [{"cost_basis": "1.0"}],
+                "recent_paper_fills_sampled": [{"price": "0.5"}],
+                "tax_snapshots_24h": "28"
+            }
+        });
+        let p = prune_metrics_for_llm(&full);
+
+        // Dead blocks gone.
+        for dead in [
+            "clob_safety_loop",
+            "approval_attribution",
+            "fee_adjusted_attribution",
+            "vs_goals_from_wiki",
+        ] {
+            assert!(p.get(dead).is_none(), "{dead} should be pruned");
+        }
+        // Prose gone at every depth.
+        assert!(p.get("note").is_none());
+        assert!(p["signal_health"]["orderbook_momentum"]
+            .get("note")
+            .is_none());
+        assert!(p["decision_report_cadence"].get("note").is_none());
+        // Security redactions still applied.
+        assert!(p["decision_report_cadence"]
+            .get("recent_decision_reports_sampled")
+            .is_none());
+        assert!(p["tax_journal_skeleton"].get("recent_tax_sample").is_none());
+        assert!(p["tax_journal_skeleton"]
+            .get("recent_paper_fills_sampled")
+            .is_none());
+        // Live numbers survive -- this is the half that makes the reflection worth running.
+        assert_eq!(p["window_hours"], 24);
+        assert_eq!(p["latest_realized_pnl"], "4708.45");
+        assert_eq!(p["signal_health"]["orderbook_momentum"]["fire_rate"], 0.75);
+        assert_eq!(p["decision_report_cadence"]["recent_dr_count"], "14350");
+        assert_eq!(p["tax_journal_skeleton"]["tax_snapshots_24h"], "28");
+        // And it must actually shrink.
+        assert!(
+            p.to_string().len() < full.to_string().len() / 2,
+            "pruning should roughly halve this fixture, got {} from {}",
+            p.to_string().len(),
+            full.to_string().len()
+        );
+    }
+
     fn clob_safety_loop_counts_include_live_order_dispatch_kinds() {
         // F: assert presence of new live dispatch event count keys (added in round 2 for hermes consumption of pre/dispatched/rejected).
         let mock_clob: serde_json::Value = serde_json::json!({
